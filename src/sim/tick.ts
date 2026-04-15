@@ -18,13 +18,13 @@ import { GameOutcome } from './game-over.js';
  *          checkQueenDeath is Phase 9 scope).
  */
 export function tick(world: WorldState, commands: readonly SimCommand[]): GameOutcome {
-  // PRD §5 FIFO silent-drop: cap at MAX_COMMANDS_PER_TICK before any dispatch.
-  const capped: readonly SimCommand[] =
-    commands.length > MAX_COMMANDS_PER_TICK
-      ? commands.slice(0, MAX_COMMANDS_PER_TICK)
-      : commands;
+  // PRD §5 FIFO silent-drop + PRD §tick "No allocation" contract (line 708):
+  // bounded indexed iteration — no slice, no new array, no Array.prototype.values
+  // iterator object. Pure numeric loop counter.
+  const limit = commands.length < MAX_COMMANDS_PER_TICK ? commands.length : MAX_COMMANDS_PER_TICK;
 
-  for (const cmd of capped) {
+  for (let i = 0; i < limit; i++) {
+    const cmd = commands[i]!;
     switch (cmd.type) {
       case 'NoOp':
         // No state change — by definition a no-op.
