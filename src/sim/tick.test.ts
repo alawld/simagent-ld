@@ -66,6 +66,29 @@ describe('command dispatch', () => {
     expect(() => tick(world, [unknown])).not.toThrow();
     expect(world.tick).toBe(1);
   });
+
+  it('does not allocate via .slice() or the array iterator — enforces PRD line 708 "No allocation" contract', () => {
+    const world = createWorldState(42);
+    const cmds: SimCommand[] = Array.from({ length: 100 }, (_, i): SimCommand => ({
+      type: 'NoOp',
+      issuedAtTick: i,
+    }));
+    // Proxy throws if tick() reaches for slice() or for...of's iterator factory.
+    // Indexed access (commands[i]) and .length are permitted and flow through.
+    const guarded = new Proxy(cmds, {
+      get(target, prop, receiver) {
+        if (prop === 'slice') {
+          throw new Error('PRD-708 violation: tick() must not call .slice()');
+        }
+        if (prop === Symbol.iterator) {
+          throw new Error('PRD-708 violation: tick() must not use for...of on commands (allocates iterator object)');
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    expect(() => tick(world, guarded)).not.toThrow();
+    expect(world.tick).toBe(1);
+  });
 });
 
 describe('SCEN-06 determinism', () => {
