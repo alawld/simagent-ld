@@ -86,9 +86,13 @@ const simSafetyConfig = {
     // FNDN-02 — ban float literals and division (both return IEEE 754 doubles)
     "no-restricted-syntax": ["error",
       {
-        // Matches any numeric literal whose source text contains a dot: 3.14, 1.5, 0.5, 1.0
-        selector: "Literal[raw=/^\\d*\\.\\d/]",
-        message: "Float literal in src/sim/ — convert to fixed-point integer (multiply by FP_ONE).",
+        // Matches any numeric literal whose source text signals floating-point intent:
+        //   - decimal point anywhere after leading digits: 3.14, 1.5, 0.5, 1.0, .5, 1.e5
+        //   - scientific notation: 1e3, 1e-3, 2E10, 1.5e2
+        // The ^\d* anchor spares string literals (raw starts with ") and hex/binary/octal
+        // literals (raw starts with 0x, 0b, 0o — the non-digit char after 0 breaks the match).
+        selector: "Literal[raw=/^\\d*(\\.|\\d[eE])/]",
+        message: "Float literal (decimal or scientific notation) in src/sim/ — convert to fixed-point integer (multiply by FP_ONE).",
       },
       {
         // JS integer division still returns IEEE 754 double.
