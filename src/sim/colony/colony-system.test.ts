@@ -406,9 +406,9 @@ describe('tickReconcile', () => {
 
   it('18. recount fixes drift — CLNY-07 Phase 6 SC 7', () => {
     const { world, colony } = setupWorldWithQueen();
-    const id1 = addWorker(world, colony);
+    addWorker(world, colony);
     const id2 = addWorker(world, colony);
-    const id3 = addWorker(world, colony);
+    addWorker(world, colony);
 
     // Manually introduce drift: claim 5 workers but only 3 are in the array
     colony.workerCount = 5;
