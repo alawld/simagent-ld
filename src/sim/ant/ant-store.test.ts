@@ -1,0 +1,210 @@
+// ant-store.test.ts — Vitest tests for AntComponents SoA and lifecycle helpers.
+//
+// Test grouping matches 06-VALIDATION.md "colony-stats" group.
+// All tests run synchronously in < 10ms — no async, no allocations after setup.
+
+import { describe, it, expect } from 'vitest';
+import {
+  createAntComponents,
+  initAnt,
+  killAnt,
+  isAlive,
+} from './ant-store.js';
+import { AntTask, ForagingSubState } from '../enums.js';
+import {
+  MAX_ENTITIES,
+  WORKER_BASE_SPEED,
+  WORKER_LIFESPAN_TICKS,
+} from '../constants.js';
+
+describe('ant-store', () => {
+  // ---------------------------------------------------------------------------
+  // 1. Allocation sizing
+  // ---------------------------------------------------------------------------
+
+  it('createAntComponents(8192) returns 11 Int32Arrays each of length 8192', () => {
+    const ants = createAntComponents(8192);
+    expect(ants.posX).toBeInstanceOf(Int32Array);
+    expect(ants.posX.length).toBe(8192);
+    expect(ants.posY).toBeInstanceOf(Int32Array);
+    expect(ants.posY.length).toBe(8192);
+    expect(ants.colonyId).toBeInstanceOf(Int32Array);
+    expect(ants.colonyId.length).toBe(8192);
+    expect(ants.task).toBeInstanceOf(Int32Array);
+    expect(ants.task.length).toBe(8192);
+    expect(ants.subTask).toBeInstanceOf(Int32Array);
+    expect(ants.subTask.length).toBe(8192);
+    expect(ants.speed).toBeInstanceOf(Int32Array);
+    expect(ants.speed.length).toBe(8192);
+    expect(ants.foodCarrying).toBeInstanceOf(Int32Array);
+    expect(ants.foodCarrying.length).toBe(8192);
+    expect(ants.starvationTimer).toBeInstanceOf(Int32Array);
+    expect(ants.starvationTimer.length).toBe(8192);
+    expect(ants.age).toBeInstanceOf(Int32Array);
+    expect(ants.age.length).toBe(8192);
+    expect(ants.alive).toBeInstanceOf(Int32Array);
+    expect(ants.alive.length).toBe(8192);
+    expect(ants.lifespan).toBeInstanceOf(Int32Array);
+    expect(ants.lifespan.length).toBe(8192);
+  });
+
+  it('all 11 fields are zero-initialized after createAntComponents(8192)', () => {
+    const ants = createAntComponents(8192);
+    // Spot-check a few slots — Int32Array spec guarantees all zeros
+    expect(ants.posX[0]).toBe(0);
+    expect(ants.posY[4000]).toBe(0);
+    expect(ants.alive[8191]).toBe(0);
+    expect(ants.lifespan[1]).toBe(0);
+    expect(ants.task[500]).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 2. Default MAX_ENTITIES
+  // ---------------------------------------------------------------------------
+
+  it('createAntComponents() with no argument uses MAX_ENTITIES (8192)', () => {
+    const ants = createAntComponents();
+    expect(MAX_ENTITIES).toBe(8192); // guard: constant matches expectation
+    expect(ants.posX.length).toBe(MAX_ENTITIES);
+    expect(ants.alive.length).toBe(MAX_ENTITIES);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 3. Field independence (SoA correctness)
+  // ---------------------------------------------------------------------------
+
+  it('writing posX[5] does NOT affect posY[5] (SoA field independence)', () => {
+    const ants = createAntComponents(16);
+    ants.posX[5] = 100;
+    expect(ants.posY[5]).toBe(0);
+    expect(ants.colonyId[5]).toBe(0);
+    expect(ants.task[5]).toBe(0);
+    expect(ants.alive[5]).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 4. Independence across allocations
+  // ---------------------------------------------------------------------------
+
+  it('separate createAntComponents() calls produce independent arrays', () => {
+    const a = createAntComponents(4);
+    const b = createAntComponents(4);
+    a.posX[0] = 7;
+    expect(b.posX[0]).toBe(0); // b is not shared with a
+    b.alive[2] = 1;
+    expect(a.alive[2]).toBe(0); // a not affected by b
+  });
+
+  // ---------------------------------------------------------------------------
+  // 5. initAnt — required fields + defaults
+  // ---------------------------------------------------------------------------
+
+  it('initAnt with required fields sets correct defaults', () => {
+    const ants = createAntComponents(16);
+    const id = 3;
+    initAnt(ants, id, { colonyId: 1, posX: 512, posY: 256 });
+
+    expect(ants.colonyId[id]).toBe(1);
+    expect(ants.posX[id]).toBe(512);
+    expect(ants.posY[id]).toBe(256);
+    // Defaults
+    expect(ants.task[id]).toBe(AntTask.Idle); // 0
+    expect(ants.subTask[id]).toBe(0);
+    expect(ants.speed[id]).toBe(WORKER_BASE_SPEED); // 128
+    expect(ants.lifespan[id]).toBe(WORKER_LIFESPAN_TICKS); // 0x7FFFFFFF
+    // Always-reset fields
+    expect(ants.alive[id]).toBe(1);
+    expect(ants.age[id]).toBe(0);
+    expect(ants.foodCarrying[id]).toBe(0);
+    expect(ants.starvationTimer[id]).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 6. initAnt — with overrides
+  // ---------------------------------------------------------------------------
+
+  it('initAnt with overrides applies the overridden values', () => {
+    const ants = createAntComponents(16);
+    const id = 7;
+    initAnt(ants, id, {
+      colonyId: 1,
+      posX: 0,
+      posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+      speed: 64,
+    });
+
+    expect(ants.task[id]).toBe(AntTask.Foraging);        // 1
+    expect(ants.subTask[id]).toBe(ForagingSubState.SearchingFood); // 0
+    expect(ants.speed[id]).toBe(64);
+    // alive still set to 1
+    expect(ants.alive[id]).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 7. killAnt — flips alive, leaves other fields untouched
+  // ---------------------------------------------------------------------------
+
+  it('killAnt flips alive[id] to 0 and leaves other fields untouched', () => {
+    const ants = createAntComponents(16);
+    const id = 2;
+    initAnt(ants, id, { colonyId: 1, posX: 42, posY: 99 });
+    // Advance age to a non-zero value for the "untouched" check
+    ants.age[id] = 5;
+
+    killAnt(ants, id);
+
+    expect(ants.alive[id]).toBe(0);
+    // Other fields survive
+    expect(ants.posX[id]).toBe(42);
+    expect(ants.posY[id]).toBe(99);
+    expect(ants.age[id]).toBe(5);
+    expect(ants.colonyId[id]).toBe(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 8. isAlive — mirrors alive field
+  // ---------------------------------------------------------------------------
+
+  it('isAlive returns true for initialized ant, false after killAnt, false for uninitialized slot', () => {
+    const ants = createAntComponents(16);
+    const id = 10;
+
+    // Never-initialized slot
+    expect(isAlive(ants, id)).toBe(false);
+
+    // After init
+    initAnt(ants, id, { colonyId: 1, posX: 0, posY: 0 });
+    expect(isAlive(ants, id)).toBe(true);
+
+    // After kill
+    killAnt(ants, id);
+    expect(isAlive(ants, id)).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 9. Repeated initAnt on same id — overwrites, no accumulation
+  // ---------------------------------------------------------------------------
+
+  it('calling initAnt twice on the same id overwrites fields (no accumulation)', () => {
+    const ants = createAntComponents(16);
+    const id = 0;
+
+    initAnt(ants, id, { colonyId: 1, posX: 100, posY: 200, speed: 64 });
+    // Manually age the ant to verify age reset
+    ants.age[id] = 999;
+    ants.foodCarrying[id] = 512;
+
+    // Second init overwrites
+    initAnt(ants, id, { colonyId: 2, posX: 50, posY: 75 });
+
+    expect(ants.colonyId[id]).toBe(2);
+    expect(ants.posX[id]).toBe(50);
+    expect(ants.posY[id]).toBe(75);
+    expect(ants.speed[id]).toBe(WORKER_BASE_SPEED); // back to default
+    expect(ants.age[id]).toBe(0);                   // reset by initAnt
+    expect(ants.foodCarrying[id]).toBe(0);           // reset by initAnt
+    expect(ants.alive[id]).toBe(1);                  // stays 1
+  });
+});
