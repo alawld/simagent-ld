@@ -92,11 +92,19 @@ export function tickQueenEggProduction(world: WorldState, colony: ColonyRecord):
 export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord): void {
   const ants = world.ants;
 
+  // Snapshot bucket lengths before each phase so newly-promoted entities are
+  // not processed in the same tick they are promoted (PRD §4b: one phase-step
+  // per tick per bucket; newly pushed IDs start participating next tick).
+  const eggSnapLen     = colony.eggs.length;
+  const larvaeSnapLen  = colony.larvae.length;
+  const workersSnapLen = colony.workers.length;
+
   // ------------------------------------------------------------------
   // Loop 1: Eggs — age + transition to larva on EGG_HATCH_TICKS
   // Backwards iteration + swap-remove preserves O(1) per promotion.
+  // Iterates only over eggs that existed at the start of this tick.
   // ------------------------------------------------------------------
-  for (let i = colony.eggs.length - 1; i >= 0; i--) {
+  for (let i = eggSnapLen - 1; i >= 0; i--) {
     const id = colony.eggs[i]!;
 
     // Dead egg — defensive swap-remove (primary cleanup handled by Plan 09)
@@ -123,8 +131,10 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
 
   // ------------------------------------------------------------------
   // Loop 2: Larvae — age + transition to worker on LARVA_MATURE_TICKS
+  // Iterates only over larvae that existed at the start of this tick
+  // (excludes larvae just promoted from eggs in Loop 1 above).
   // ------------------------------------------------------------------
-  for (let i = colony.larvae.length - 1; i >= 0; i--) {
+  for (let i = larvaeSnapLen - 1; i >= 0; i--) {
     const id = colony.larvae[i]!;
 
     // Dead larva — defensive swap-remove
@@ -154,7 +164,7 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
   // ------------------------------------------------------------------
   // Loop 3: Workers — age; lifespan check (disabled in Phase 6 via INT32_MAX)
   // ------------------------------------------------------------------
-  for (let i = colony.workers.length - 1; i >= 0; i--) {
+  for (let i = workersSnapLen - 1; i >= 0; i--) {
     const id = colony.workers[i]!;
 
     // Dead worker — defensive swap-remove
