@@ -3,8 +3,8 @@
 // Source: RESEARCH.md Pattern 1, lines 180–316 — verified against ESLint 10 + @typescript-eslint 8 docs.
 //
 // Three config objects, applied in order:
-//   1. baseConfig         — baseline TS rules for all src/**/*.ts
-//   2. simSafetyConfig    — PRD §6 Rule Sets 1 & 2: Phaser ban, wall-clock ban, float+division ban
+//   1. baseConfig         — baseline TS rules for all src/**/*.ts AND bench/**/*.ts
+//   2. simSafetyConfig    — PRD §6 Rule Sets 1 & 2: Phaser ban, wall-clock ban, float+division ban (src/sim/** only)
 //   3. nonSimMutationGuard — FNDN-07 tripwire: catches obvious direct writes to WorldState fields
 //                            from src/render/, src/input/, src/platform/
 //
@@ -17,7 +17,7 @@ import tsParser from "@typescript-eslint/parser";
 
 /** Rules applied to ALL TypeScript source files */
 const baseConfig = {
-  files: ["src/**/*.ts"],
+  files: ["src/**/*.ts", "bench/**/*.ts"],
   languageOptions: {
     parser: tsParser,
     ecmaVersion: 2022,
