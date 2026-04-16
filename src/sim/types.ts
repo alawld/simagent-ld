@@ -1,8 +1,18 @@
 // src/sim/types.ts
 // WorldState snapshot interface, factory, copy, and entity ID allocator.
-// PRD §1/§3 authoritative shape — Phase 5 scope: four fields only.
-// Phase 6 adds ants, colonies, pheromoneGrids. Phase 7 adds terrain.
+// PRD §1/§3 authoritative shape.
+// Phase 5 scope: four fields (tick, rngState, nextEntityId, commandQueue).
+// Phase 6 adds ants (AntComponents), colonies (Record<ColonyId, ColonyRecord>),
+// pheromoneGrids (Record<string, PheromoneGrid>).
+// Phase 7 adds terrain.
 import type { SimCommand } from './commands.js';
+import type { AntComponents } from './ant/ant-store.js';
+import { createAntComponents } from './ant/ant-store.js';
+import type { ColonyId, ColonyRecord } from './colony/colony-store.js';
+import { createColonyRecord } from './colony/colony-store.js';
+import type { PheromoneGrid } from './pheromone/pheromone-store.js';
+import { createPheromoneGrid } from './pheromone/pheromone-store.js';
+import { MAX_ENTITIES } from './constants.js';
 
 export type EntityId = number; // incrementing counter from 0, no recycling per PRD §1/§3
 
@@ -11,23 +21,159 @@ export interface WorldState {
   rngState: number;         // Mulberry32 state (uint32); initialized from seed
   nextEntityId: EntityId;   // starts at 0 (PRD §3); allocateEntityId returns current and post-increments
   commandQueue: SimCommand[]; // staging seam — drained by platform accumulator between ticks
+
+  // Phase 6 additions (PRD §3):
+  ants: AntComponents;                          // SoA ant component storage — 11 parallel Int32Arrays
+  colonies: Record<ColonyId, ColonyRecord>;     // per-colony state keyed by integer ColonyId
+  pheromoneGrids: Record<string, PheromoneGrid>; // pheromone intensity grids keyed by pheromoneGridKey()
 }
 
-export function createWorldState(seed: number): WorldState {
+/**
+ * Create a fresh WorldState with zero-initialised Phase 6 stores.
+ *
+ * @param seed        - Mulberry32 seed (uint32 coerced via >>> 0).
+ * @param maxEntities - Ant entity slot count. Defaults to MAX_ENTITIES (8192).
+ */
+export function createWorldState(seed: number, maxEntities: number = MAX_ENTITIES): WorldState {
   return {
     tick: 0,
     rngState: seed >>> 0, // coerce to uint32
     nextEntityId: 0,      // PRD §3 line 130: starts at 0, no recycling
     commandQueue: [],
+    ants: createAntComponents(maxEntities),
+    colonies: {},
+    pheromoneGrids: {},
   };
 }
 
-/** Copy src into dst in place — buffer swap for render interpolation (PRD §1/§3). */
+/**
+ * Copy src into dst in place — double-buffer swap for render interpolation (PRD §1/§3).
+ *
+ * Steady-state: zero allocations after colonies and grids populated.
+ * Allocation occurs only when the set of colony keys or grid keys grows.
+ *
+ * Ordered operations per PRD §3 line 566:
+ *   1. Scalar fields (tick, rngState, nextEntityId)
+ *   2. commandQueue — slice() (only allocation in the command path per PRD §3)
+ *   3. AntComponents — 11 TypedArray.set calls (zero allocation)
+ *   4. colonies — delete stale dst keys; upsert each src colony field-by-field
+ *   5. pheromoneGrids — delete stale dst keys; upsert each src grid via Int32Array.set
+ */
 export function copyWorldState(src: WorldState, dst: WorldState): void {
+  // --- Phase 5 scalar fields ---
   dst.tick = src.tick;
   dst.rngState = src.rngState;
   dst.nextEntityId = src.nextEntityId;
   dst.commandQueue = src.commandQueue.slice(); // small in practice (user-input rate) — PRD §3 accepts this as the only Phase 1 allocation
+
+  // --- AntComponents: 11 TypedArray.set calls (zero allocation) ---
+  dst.ants.posX.set(src.ants.posX);
+  dst.ants.posY.set(src.ants.posY);
+  dst.ants.colonyId.set(src.ants.colonyId);
+  dst.ants.task.set(src.ants.task);
+  dst.ants.subTask.set(src.ants.subTask);
+  dst.ants.speed.set(src.ants.speed);
+  dst.ants.foodCarrying.set(src.ants.foodCarrying);
+  dst.ants.starvationTimer.set(src.ants.starvationTimer);
+  dst.ants.age.set(src.ants.age);
+  dst.ants.alive.set(src.ants.alive);
+  dst.ants.lifespan.set(src.ants.lifespan);
+
+  // --- colonies: delete stale dst keys; upsert each src colony ---
+  // Remove dst colonies that no longer exist in src
+  for (const key in dst.colonies) {
+    if (!(key in src.colonies)) {
+      delete dst.colonies[key as unknown as ColonyId];
+    }
+  }
+
+  for (const key in src.colonies) {
+    const colonyId = key as unknown as ColonyId;
+    const s = src.colonies[colonyId]!;
+
+    // Create dst colony if absent (allocates once per colony, zero in steady state)
+    if (!(colonyId in dst.colonies)) {
+      dst.colonies[colonyId] = createColonyRecord(s.colonyId, s.queenEntityId);
+    }
+    const d = dst.colonies[colonyId]!;
+
+    // Scalar fields — direct assignment
+    d.colonyId             = s.colonyId;
+    d.queenEntityId        = s.queenEntityId;
+    d.queenStarvationTimer = s.queenStarvationTimer;
+    d.foodStored           = s.foodStored;
+    d.workerCount          = s.workerCount;
+    d.eggCount             = s.eggCount;
+    d.larvaeCount          = s.larvaeCount;
+    d.nurseCount           = s.nurseCount;
+    d.defeated             = s.defeated;
+    d.reconcileCountdown   = s.reconcileCountdown;
+
+    // Bucket arrays — reuse via length truncation + index copy (no new array)
+    d.eggs.length = s.eggs.length;
+    for (let i = 0; i < s.eggs.length; i++) {
+      d.eggs[i] = s.eggs[i]!;
+    }
+
+    d.larvae.length = s.larvae.length;
+    for (let i = 0; i < s.larvae.length; i++) {
+      d.larvae[i] = s.larvae[i]!;
+    }
+
+    d.workers.length = s.workers.length;
+    for (let i = 0; i < s.workers.length; i++) {
+      d.workers[i] = s.workers[i]!;
+    }
+
+    // chambers — nested ChamberRecord objects: pop/push(Object.assign) for reuse
+    while (d.chambers.length > s.chambers.length) {
+      d.chambers.pop();
+    }
+    for (let i = 0; i < s.chambers.length; i++) {
+      if (i < d.chambers.length) {
+        // Reuse existing object — Object.assign preserves object identity for test assertions
+        Object.assign(d.chambers[i]!, s.chambers[i]!);
+      } else {
+        // Grow: push a fresh copy of the source chamber
+        d.chambers.push(Object.assign({}, s.chambers[i]!));
+      }
+    }
+
+    // Nested plain-object fields — field-by-field copy (NOT spread — preserves object identity)
+    d.targetRatio.forage           = s.targetRatio.forage;
+    d.targetRatio.dig              = s.targetRatio.dig;
+    d.targetRatio.fight            = s.targetRatio.fight;
+
+    d.computedAllocation.nurse     = s.computedAllocation.nurse;
+    d.computedAllocation.forage    = s.computedAllocation.forage;
+    d.computedAllocation.dig       = s.computedAllocation.dig;
+    d.computedAllocation.fight     = s.computedAllocation.fight;
+
+    d.taskCensus.nurse             = s.taskCensus.nurse;
+    d.taskCensus.forage            = s.taskCensus.forage;
+    d.taskCensus.dig               = s.taskCensus.dig;
+    d.taskCensus.fight             = s.taskCensus.fight;
+  }
+
+  // --- pheromoneGrids: delete stale dst keys; upsert each src grid ---
+  for (const key in dst.pheromoneGrids) {
+    if (!(key in src.pheromoneGrids)) {
+      delete dst.pheromoneGrids[key];
+    }
+  }
+
+  for (const key in src.pheromoneGrids) {
+    const srcGrid = src.pheromoneGrids[key]!;
+
+    // Create dst grid if absent (allocates once per grid, zero in steady state)
+    if (!(key in dst.pheromoneGrids)) {
+      dst.pheromoneGrids[key] = createPheromoneGrid(srcGrid.width, srcGrid.height);
+    }
+    const dstGrid = dst.pheromoneGrids[key]!;
+
+    // Int32Array.set — zero allocation
+    dstGrid.data.set(srcGrid.data);
+  }
 }
 
 /** Allocate a fresh entity ID. No recycling (PRD §1/§3 incrementing counter). */
