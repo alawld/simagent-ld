@@ -19,6 +19,7 @@ import {
   STARVATION_GRACE_TICKS,
   WORKER_LIFESPAN_TICKS,
   FOOD_TRAIL_DEPOSIT,
+  PHEROMONE_CAP,
 } from './constants.js';
 import { FP_SHIFT } from './fixed.js';
 
@@ -723,5 +724,42 @@ describe('SCEN-06 determinism', () => {
     const world = createWorldState(42);
     for (let i = 0; i < 100; i++) tick(world, []);
     expect(world.tick).toBe(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PHER-02 two-grid integration
+// ---------------------------------------------------------------------------
+
+describe('PHER-02 two-grid integration', () => {
+  it('SC 9: tick() decays DangerTrail faster than FoodTrail via key-parsed dispatch', () => {
+    const { world, colonyId } = makeWorldWithColony(42);
+
+    // Create both grids (64x64) and register in world.pheromoneGrids
+    const foodKey = pheromoneGridKey(colonyId, PheromoneType.FoodTrail, 'surface');
+    const dangerKey = pheromoneGridKey(colonyId, PheromoneType.DangerTrail, 'surface');
+
+    const foodGrid = createPheromoneGrid(64, 64);
+    const dangerGrid = createPheromoneGrid(64, 64);
+
+    // Seed both grids at the same cell with PHEROMONE_CAP
+    phSet(foodGrid, 5, 5, PHEROMONE_CAP);
+    phSet(dangerGrid, 5, 5, PHEROMONE_CAP);
+
+    world.pheromoneGrids[foodKey] = foodGrid;
+    world.pheromoneGrids[dangerKey] = dangerGrid;
+
+    // Run tick() 10 times — routes through the key-parse dispatch in tick.ts lines 242-248
+    for (let i = 0; i < 10; i++) {
+      tick(world, []);
+    }
+
+    const foodVal = phGet(foodGrid, 5, 5);
+    const dangerVal = phGet(dangerGrid, 5, 5);
+
+    // DangerTrail decays faster (DANGER_DECAY_FP=10 > PHEROMONE_DECAY_FP=5)
+    expect(dangerVal).toBeLessThan(foodVal);
+    // FoodTrail has NOT decayed to zero — confirms real differential decay, not both zeroed
+    expect(foodVal).toBeGreaterThan(0);
   });
 });
