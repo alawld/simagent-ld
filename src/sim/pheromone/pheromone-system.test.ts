@@ -15,10 +15,10 @@ import { createPheromoneGrid, phGet, phSet } from './pheromone-store.js';
 import { Rng } from '../rng.js';
 import {
   PHEROMONE_CAP,
-  PHEROMONE_FLOOR,
   PHEROMONE_DECAY_FP,
   DANGER_DECAY_FP,
   FOOD_TRAIL_DEPOSIT,
+  PHEROMONE_FLOOR,
 } from '../constants.js';
 
 // ---------------------------------------------------------------------------
@@ -110,8 +110,11 @@ describe('tickPheromoneDecay (PHER-04)', () => {
     // decayFp = 5
     // decayed = 60 - ((60 * 5) >> 8) = 60 - (300 >> 8) = 60 - 1 = 59
     // 59 < PHEROMONE_FLOOR (64) → snap to 0
+    // Confirm precondition: starting value must be below PHEROMONE_FLOOR
+    const startValue = 60;
+    expect(startValue).toBeLessThan(PHEROMONE_FLOOR); // 60 < 64
     const grid = createPheromoneGrid(5, 5);
-    phSet(grid, 0, 0, 60);
+    phSet(grid, 0, 0, startValue);
     tickPheromoneDecay(grid, 5);
     expect(phGet(grid, 0, 0)).toBe(0);
   });
@@ -144,14 +147,6 @@ describe('tickPheromoneDecay (PHER-04)', () => {
 // ---------------------------------------------------------------------------
 
 describe('sampleGradient (PHER-05)', () => {
-  // Helper: find a seed where rng.nextInt(100) >= 10 (no explore)
-  // We know seed 42 with Mulberry32: just verify empirically
-  function exploitRng(seed: number): Rng {
-    // Brute-force find a seed that produces exploit (not explore) on first call
-    // For convenience, use the Rng we build and verify inline in tests
-    return new Rng(seed);
-  }
-
   it('9. gradient determinism: same seed → same output', () => {
     const grid = createPheromoneGrid(10, 10);
     // Asymmetric gradient
