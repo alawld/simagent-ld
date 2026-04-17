@@ -21,12 +21,13 @@ import {
 import { createWorldState } from '../types.js';
 import { createColonyRecord } from './colony-store.js';
 import { initAnt } from '../ant/ant-store.js';
-import { AntTask } from '../enums.js';
+import { AntTask, ChamberType } from '../enums.js';
 import {
   STARVATION_GRACE_TICKS,
   RECONCILE_INTERVAL_TICKS,
   QUEEN_FOOD_PER_TICK,
   LARVA_FOOD_PER_TICK,
+  FOOD_CHAMBER_CAPACITY,
 } from '../constants.js';
 import type { WorldState } from '../types.js';
 import type { ColonyRecord } from './colony-store.js';
@@ -425,6 +426,79 @@ describe('tickReconcile', () => {
     expect(colony.workers).toHaveLength(2);
     expect(colony.workers).not.toContain(id2);
   });
+
+  it('19. reconcile recomputes allocateWorkers after recount', () => {
+    const { world, colony } = setupWorldWithQueen();
+    // Add 6 workers + 2 larvae (brood for nurse carveout)
+    for (let i = 0; i < 6; i++) addWorker(world, colony);
+    addLarva(world, colony);
+    addLarva(world, colony);
+
+    colony.targetRatio.forage = 8;
+    colony.targetRatio.dig = 2;
+    colony.targetRatio.fight = 0;
+
+    // Zero out allocation to prove reconcile recomputes it
+    colony.computedAllocation.nurse = 0;
+    colony.computedAllocation.forage = 0;
+    colony.computedAllocation.dig = 0;
+    colony.computedAllocation.fight = 0;
+    colony.nurseCount = 0;
+
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+
+    // Allocation must now reflect actual worker/brood counts
+    const total = colony.computedAllocation.nurse + colony.computedAllocation.forage
+                + colony.computedAllocation.dig + colony.computedAllocation.fight;
+    expect(total).toBe(colony.workerCount);
+    expect(colony.nurseCount).toBe(colony.computedAllocation.nurse);
+  });
+
+  it('20. reconcile clamps negative foodStored to 0', () => {
+    const { world, colony } = setupWorldWithQueen();
+    colony.foodStored = -50; // artificially drifted negative
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+    expect(colony.foodStored).toBe(0);
+  });
+
+  it('22. reconcile derives FoodStorage chamber contents from authoritative foodStored', () => {
+    const { world, colony } = setupWorldWithQueen(8000);
+    // Add two FoodStorage chambers and one Nursery (non-food)
+    colony.chambers.push(
+      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+      { chamberId: 101, chamberType: ChamberType.Nursery,     foodStored: 0, posX: 4, posY: 0, width: 3, height: 3 },
+      { chamberId: 102, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 8, posY: 0, width: 3, height: 3 },
+    );
+
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+
+    // Two FoodStorage chambers × FOOD_CHAMBER_CAPACITY = 10240; we have 8000, so:
+    // Chamber 0 gets min(8000, 5120) = 5120; distributed 5120
+    // Chamber 2 gets min(8000-5120, 5120) = 2880
+    // Nursery untouched
+    // colony.foodStored stays 8000 (authoritative — never overwritten)
+    expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
+    expect(colony.chambers[1]!.foodStored).toBe(0); // Nursery — untouched
+    expect(colony.chambers[2]!.foodStored).toBe(8000 - FOOD_CHAMBER_CAPACITY);
+    expect(colony.foodStored).toBe(8000);
+  });
+
+  it('23. reconcile overflow — colony.foodStored unchanged when chambers cannot hold all', () => {
+    const { world, colony } = setupWorldWithQueen(15000);
+    colony.chambers.push(
+      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+    );
+
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+
+    // Chamber gets FOOD_CHAMBER_CAPACITY (5120); colony.foodStored stays authoritative
+    expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
+    expect(colony.foodStored).toBe(15000);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -432,7 +506,7 @@ describe('tickReconcile', () => {
 // ---------------------------------------------------------------------------
 
 describe('CLNY-07 cached fields — integration', () => {
-  it('19. steady-state foodStored decrements by QUEEN_FOOD_PER_TICK + larvaeCount * LARVA_FOOD_PER_TICK per tick', () => {
+  it('21. steady-state foodStored decrements by QUEEN_FOOD_PER_TICK + larvaeCount * LARVA_FOOD_PER_TICK per tick', () => {
     const { world, colony } = setupWorldWithQueen(10_000);
     const larvaCount = 3;
     for (let i = 0; i < larvaCount; i++) {

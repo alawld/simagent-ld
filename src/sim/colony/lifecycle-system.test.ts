@@ -18,6 +18,7 @@ import {
   EGG_HATCH_TICKS,
   LARVA_MATURE_TICKS,
   WORKER_BASE_SPEED,
+  STARVATION_GRACE_TICKS,
 } from '../constants.js';
 import type { WorldState } from '../types.js';
 import type { ColonyRecord } from './colony-store.js';
@@ -254,6 +255,44 @@ describe('tickLifecycleTransitions — CLNY-03 larva mature', () => {
     expect(world.ants.age[larvaId]).toBe(0);               // age reset on transition
     expect(world.ants.task[larvaId]).toBe(AntTask.Idle);
     expect(world.ants.speed[larvaId]).toBe(WORKER_BASE_SPEED);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Starvation timer reset on promotion (PRD §4b)
+// ---------------------------------------------------------------------------
+
+describe('tickLifecycleTransitions — starvation timer reset on promotion', () => {
+  it('15. egg→larva promotion resets starvationTimer to STARVATION_GRACE_TICKS', () => {
+    const { world, colony } = setupWorldWithQueen();
+
+    const eggId = world.nextEntityId++;
+    initAnt(world.ants, eggId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.age[eggId] = EGG_HATCH_TICKS - 1; // one tick to hatch
+    world.ants.starvationTimer[eggId] = 0; // worst case — should be reset
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+
+    tickLifecycleTransitions(world, colony);
+
+    expect(colony.larvae).toContain(eggId);
+    expect(world.ants.starvationTimer[eggId]).toBe(STARVATION_GRACE_TICKS);
+  });
+
+  it('16. larva→worker promotion resets starvationTimer to STARVATION_GRACE_TICKS', () => {
+    const { world, colony } = setupWorldWithQueen();
+
+    const larvaId = world.nextEntityId++;
+    initAnt(world.ants, larvaId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.age[larvaId] = LARVA_MATURE_TICKS - 1; // one tick to mature
+    world.ants.starvationTimer[larvaId] = 5; // low timer — should be reset
+    colony.larvae.push(larvaId);
+    colony.larvaeCount = 1;
+
+    tickLifecycleTransitions(world, colony);
+
+    expect(colony.workers).toContain(larvaId);
+    expect(world.ants.starvationTimer[larvaId]).toBe(STARVATION_GRACE_TICKS);
   });
 });
 

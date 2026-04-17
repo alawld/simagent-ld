@@ -28,6 +28,7 @@ import {
   LARVA_MATURE_TICKS,
   WORKER_BASE_SPEED,
   WORKER_LIFESPAN_TICKS,
+  STARVATION_GRACE_TICKS,
 } from '../constants.js';
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,7 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
       colony.eggs.pop();
       colony.eggCount -= 1;
       ants.age[id] = 0;         // reset age for larva phase
+      ants.starvationTimer[id] = STARVATION_GRACE_TICKS;
       colony.larvae.push(id);
       colony.larvaeCount += 1;
     }
@@ -154,6 +156,7 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
       colony.larvae.pop();
       colony.larvaeCount -= 1;
       ants.age[id] = 0;         // reset age for worker phase
+      ants.starvationTimer[id] = STARVATION_GRACE_TICKS;
       ants.task[id] = AntTask.Idle;
       ants.speed[id] = WORKER_BASE_SPEED;
       colony.workers.push(id);

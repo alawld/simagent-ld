@@ -29,7 +29,10 @@ import {
   LARVA_FOOD_PER_TICK,
   STARVATION_GRACE_TICKS,
   RECONCILE_INTERVAL_TICKS,
+  FOOD_CHAMBER_CAPACITY,
 } from '../constants.js';
+import { ChamberType } from '../enums.js';
+import { allocateWorkers } from '../behavior/allocation-system.js';
 
 // ---------------------------------------------------------------------------
 // withdrawFood — chamberless food withdrawal helper (PRD §4c)
@@ -250,6 +253,33 @@ export function tickReconcile(world: WorldState, colony: ColonyRecord): void {
     }
   }
   colony.workerCount = workerCount;
+
+  // Food validation (PRD §2 reconcile contract):
+  // colony.foodStored is the authoritative pooled total — never overwritten here.
+  // When FoodStorage chambers exist, derive their contents from the authoritative
+  // total (each capped at FOOD_CHAMBER_CAPACITY). colony.foodStored stays unchanged.
+  if (colony.foodStored < 0) colony.foodStored = 0;
+
+  if (colony.chambers.length > 0) {
+    let distributed = 0;
+    for (let i = 0; i < colony.chambers.length; i++) {
+      const ch = colony.chambers[i]!;
+      if (ch.chamberType !== ChamberType.FoodStorage) continue;
+      const available = colony.foodStored - distributed;
+      const fill = available < FOOD_CHAMBER_CAPACITY ? (available > 0 ? available : 0) : FOOD_CHAMBER_CAPACITY;
+      ch.foodStored = fill;
+      distributed += fill;
+    }
+  }
+
+  // Recompute allocation with corrected counts (PRD §2 reconcile contract)
+  const brood = colony.eggCount + colony.larvaeCount;
+  const alloc = allocateWorkers(colony.workerCount, brood, colony.targetRatio);
+  colony.computedAllocation.nurse  = alloc.nurse;
+  colony.computedAllocation.forage = alloc.forage;
+  colony.computedAllocation.dig    = alloc.dig;
+  colony.computedAllocation.fight  = alloc.fight;
+  colony.nurseCount = alloc.nurse;
 
   colony.reconcileCountdown = RECONCILE_INTERVAL_TICKS;
 }
