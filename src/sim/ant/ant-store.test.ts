@@ -207,4 +207,96 @@ describe('ant-store', () => {
     expect(ants.foodCarrying[id]).toBe(0);           // reset by initAnt
     expect(ants.alive[id]).toBe(1);                  // stays 1
   });
+
+  // ---------------------------------------------------------------------------
+  // 10. Phase 7 — 17-field allocation verification
+  // ---------------------------------------------------------------------------
+
+  it('createAntComponents(64) returns object with all 17 keys, each Int32Array of length 64', () => {
+    const ants = createAntComponents(64);
+    const fields: Array<keyof typeof ants> = [
+      'posX', 'posY', 'colonyId', 'task', 'subTask', 'speed',
+      'foodCarrying', 'starvationTimer', 'age', 'alive', 'lifespan',
+      'zone', 'digTileX', 'digTileY', 'digTicksRemaining', 'targetPosX', 'targetPosY',
+    ];
+    expect(fields.length).toBe(17);
+    for (const field of fields) {
+      expect(ants[field], `${field} should be Int32Array`).toBeInstanceOf(Int32Array);
+      expect(ants[field].length, `${field}.length should be 64`).toBe(64);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 11. Phase 7 — correct default values after createAntComponents
+  // ---------------------------------------------------------------------------
+
+  it('Phase 7 fields have correct defaults after createAntComponents(64)', () => {
+    const ants = createAntComponents(64);
+    const indices = [0, 31, 63];
+    for (const i of indices) {
+      expect(ants.zone[i],              `zone[${i}] should be 0 (Surface)`).toBe(0);
+      expect(ants.digTileX[i],          `digTileX[${i}] should be -1`).toBe(-1);
+      expect(ants.digTileY[i],          `digTileY[${i}] should be -1`).toBe(-1);
+      expect(ants.digTicksRemaining[i], `digTicksRemaining[${i}] should be 0`).toBe(0);
+      expect(ants.targetPosX[i],        `targetPosX[${i}] should be -1`).toBe(-1);
+      expect(ants.targetPosY[i],        `targetPosY[${i}] should be -1`).toBe(-1);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // 12. Phase 7 — initAnt Phase 7 defaults (no zone override)
+  // ---------------------------------------------------------------------------
+
+  it('initAnt with minimal spec sets Phase 7 field defaults', () => {
+    const ants = createAntComponents(16);
+    const id = 5;
+    initAnt(ants, id, { colonyId: 1, posX: 100, posY: 200 });
+
+    expect(ants.zone[id]).toBe(0);              // Surface
+    expect(ants.digTileX[id]).toBe(-1);         // no claimed tile
+    expect(ants.digTileY[id]).toBe(-1);         // no claimed tile
+    expect(ants.digTicksRemaining[id]).toBe(0); // not digging
+    expect(ants.targetPosX[id]).toBe(-1);       // no target
+    expect(ants.targetPosY[id]).toBe(-1);       // no target
+  });
+
+  // ---------------------------------------------------------------------------
+  // 13. Phase 7 — initAnt zone override
+  // ---------------------------------------------------------------------------
+
+  it('initAnt with zone: 1 sets zone to Underground', () => {
+    const ants = createAntComponents(16);
+    const id = 8;
+    initAnt(ants, id, { colonyId: 1, posX: 0, posY: 0, zone: 1 });
+
+    expect(ants.zone[id]).toBe(1); // Underground
+    // Other Phase 7 fields still correct
+    expect(ants.digTileX[id]).toBe(-1);
+    expect(ants.targetPosX[id]).toBe(-1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 14. Phase 7 — field independence for Phase 7 fields
+  // ---------------------------------------------------------------------------
+
+  it('writing zone[5] does not affect digTileX[5] or posX[5]', () => {
+    const ants = createAntComponents(16);
+    // digTileX and posX start at -1 and 0 respectively (no initAnt needed)
+    ants.zone[5] = 1;
+    expect(ants.digTileX[5]).toBe(-1); // still sentinel
+    expect(ants.posX[5]).toBe(0);      // unchanged
+  });
+
+  // ---------------------------------------------------------------------------
+  // 15. Phase 7 — cross-allocation independence for Phase 7 fields
+  // ---------------------------------------------------------------------------
+
+  it('two createAntComponents() results have independent Phase 7 arrays', () => {
+    const a = createAntComponents(4);
+    const b = createAntComponents(4);
+    a.zone[0] = 1;
+    expect(b.zone[0]).toBe(0); // b.zone not affected
+    a.digTileX[0] = 99;
+    expect(b.digTileX[0]).toBe(-1); // b.digTileX not affected
+  });
 });
