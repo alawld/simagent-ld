@@ -16,26 +16,35 @@ import {
   antPickupFood,
   antDepositFood,
   getTaskDirection,
+  tickDigExecution,
+  routeForagerPriority,
   tickPheromoneDeposit,
   tickAntMovement,
 } from './ant-system.js';
 import { createWorldState, allocateEntityId } from '../types.js';
 import { createColonyRecord } from '../colony/colony-store.js';
 import { initAnt } from './ant-store.js';
-import { AntTask, ForagingSubState, PheromoneType } from '../enums.js';
+import { AntTask, ForagingSubState, DiggingSubState, ChamberType, PheromoneType } from '../enums.js';
 import { createPheromoneGrid, phGet, phSet, pheromoneGridKey } from '../pheromone/pheromone-store.js';
 import { Rng } from '../rng.js';
 import {
   WORKER_CARRY_CAPACITY,
   FOOD_PICKUP_AMOUNT,
+  FOOD_CHAMBER_CAPACITY,
   FOOD_TRAIL_DEPOSIT,
   PHEROMONE_CAP,
   SURFACE_GRID_WIDTH,
   SURFACE_GRID_HEIGHT,
+  UNDERGROUND_GRID_WIDTH,
+  UNDERGROUND_GRID_HEIGHT,
+  DIG_TICKS_PER_TILE,
 } from '../constants.js';
 import { FP_SHIFT } from '../fixed.js';
+import { Zone, UndergroundTileState, ugGet, ugSet, createUndergroundGrid } from '../terrain.js';
+import { createDigFlowFields, computeDigFlowField } from '../dig-system.js';
 import type { WorldState } from '../types.js';
 import type { ColonyRecord } from '../colony/colony-store.js';
+import type { FoodPile } from '../food.js';
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -297,8 +306,9 @@ describe('tickAntMovement', () => {
     // Mulberry32 seed 42: first nextInt(100) value — we test exploit behavior
     // We scan with seed 999 which reliably gives exploit for our test assertions
     const rng = new Rng(999);
+    const digFlowFields = createDigFlowFields();
 
-    tickAntMovement(world, rng);
+    tickAntMovement(world, rng, digFlowFields);
 
     const posYAfter = world.ants.posY[antId]!;
     // Ant should have moved downward (+dy direction, toward tile (5,5))
@@ -332,6 +342,9 @@ describe('tickAntMovement', () => {
   it('12. non-forager stays put (getTaskDirection returns {0,0})', () => {
     const world = createWorldState(42, MAX_TEST_ENTITIES);
     const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances        = [];
+    colony.rallyPoint       = null;
+    colony.digFlowFieldDirty = false;
     world.colonies[COLONY_ID] = colony;
 
     const antId = allocateEntityId(world);
@@ -340,15 +353,19 @@ describe('tickAntMovement', () => {
       posX: 10 << FP_SHIFT,
       posY: 10 << FP_SHIFT,
       task: AntTask.Digging, // non-forager
+      zone: Zone.Underground,
+      subTask: DiggingSubState.Excavating, // Excavating → stays put per getTaskDirection
     });
+    world.ants.digTicksRemaining[antId] = 5; // has ticks left, so tickDigExecution won't open
 
     const posXBefore = world.ants.posX[antId]!;
     const posYBefore = world.ants.posY[antId]!;
 
+    const digFlowFields = createDigFlowFields();
     const rng = new Rng(42);
-    tickAntMovement(world, rng);
+    tickAntMovement(world, rng, digFlowFields);
 
-    // Non-forager must not move (getTaskDirection returns {0,0})
+    // Non-forager in Excavating must not move (getTaskDirection returns {0,0})
     expect(world.ants.posX[antId]).toBe(posXBefore);
     expect(world.ants.posY[antId]).toBe(posYBefore);
   });
@@ -371,7 +388,8 @@ describe('tickAntMovement', () => {
 
     // Use seed 0 — exploit branch likely, moves toward strong neighbor
     const rng = new Rng(0);
-    tickAntMovement(world, rng);
+    const digFlowFields = createDigFlowFields();
+    tickAntMovement(world, rng, digFlowFields);
 
     // Key invariant: posX must be clamped and never exceed maxX
     expect(world.ants.posX[antId]).toBeLessThanOrEqual(maxX);
@@ -389,7 +407,8 @@ describe('tickAntMovement', () => {
     const posYBefore = world.ants.posY[antId]!;
 
     const rng = new Rng(42);
-    tickAntMovement(world, rng);
+    const digFlowFields = createDigFlowFields();
+    tickAntMovement(world, rng, digFlowFields);
 
     expect(world.ants.posX[antId]).toBe(posXBefore);
     expect(world.ants.posY[antId]).toBe(posYBefore);
@@ -466,9 +485,26 @@ describe('CLNY-06 forage cycle — Phase 6 SC 6 integration', () => {
 // ---------------------------------------------------------------------------
 
 describe('getTaskDirection', () => {
-  it('returns {dx:0, dy:0} for all task/subTask values (Phase 6 placeholder)', () => {
-    for (const task of [AntTask.Idle, AntTask.Digging, AntTask.Fighting, AntTask.Nursing]) {
-      const dir = getTaskDirection(task, 0);
+  it('returns {dx:0, dy:0} for Idle and Fighting tasks (no pathfinding needed)', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances        = [];
+    colony.rallyPoint       = null;
+    colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    const digFlowFields = createDigFlowFields();
+
+    for (const task of [AntTask.Idle, AntTask.Fighting]) {
+      initAnt(world.ants, antId, {
+        colonyId: COLONY_ID,
+        posX: 5 << FP_SHIFT,
+        posY: 5 << FP_SHIFT,
+        task,
+        subTask: 0,
+      });
+      const dir = getTaskDirection(world, antId, digFlowFields);
       expect(dir.dx).toBe(0);
       expect(dir.dy).toBe(0);
     }
