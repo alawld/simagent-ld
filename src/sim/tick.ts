@@ -19,6 +19,8 @@ import {
   ENTRANCE_SHAFT_DEPTH,
   UNDERGROUND_GRID_WIDTH,
   UNDERGROUND_GRID_HEIGHT,
+  SURFACE_GRID_WIDTH,
+  SURFACE_GRID_HEIGHT,
 } from './constants.js';
 import { FP_SHIFT } from './fixed.js';
 import { allocateWorkers } from './behavior/allocation-system.js';
@@ -167,19 +169,47 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         break;
       }
       case 'PlaceChamber': {
-        // PRD §3e — place a chamber footprint; marks Solid tiles; creates PendingChamber.
+        // PRD §3c — place a chamber footprint at a tunnel end; marks Solid tiles; creates PendingChamber.
         const underground = world.undergroundGrids[cmd.colonyId];
         if (!underground) break;
         const dims = CHAMBER_DIMENSIONS[cmd.chamberType];
         if (!dims) break;
-        // Bounds check (T-07-11 first guard)
+        // (a)(b) Bounds check (T-07-11 first guard)
         if (cmd.anchorTileX < 0 || cmd.anchorTileX + dims.width > UNDERGROUND_GRID_WIDTH) break;
         if (cmd.anchorTileY < 0 || cmd.anchorTileY + dims.height > UNDERGROUND_GRID_HEIGHT) break;
-        // Overlap check: verify no existing chamber or pendingChamber overlaps (T-07-11)
         const colony3 = world.colonies[cmd.colonyId];
         if (!colony3) break;
+        // (c) Anchor tile must be Open (tunnel-end check, UNDR-04)
+        if (ugGet(underground, cmd.anchorTileX, cmd.anchorTileY) !== UndergroundTileState.Open) break;
+        // (d) At least one 4-connected neighbor of the anchor must be Solid (tunnel-end check)
+        {
+          let hasAdjacentSolid = false;
+          const ax = cmd.anchorTileX;
+          const ay = cmd.anchorTileY;
+          if (ax - 1 >= 0                        && ugGet(underground, ax - 1, ay) === UndergroundTileState.Solid) hasAdjacentSolid = true;
+          if (!hasAdjacentSolid && ax + 1 < UNDERGROUND_GRID_WIDTH  && ugGet(underground, ax + 1, ay) === UndergroundTileState.Solid) hasAdjacentSolid = true;
+          if (!hasAdjacentSolid && ay - 1 >= 0                      && ugGet(underground, ax,     ay - 1) === UndergroundTileState.Solid) hasAdjacentSolid = true;
+          if (!hasAdjacentSolid && ay + 1 < UNDERGROUND_GRID_HEIGHT && ugGet(underground, ax,     ay + 1) === UndergroundTileState.Solid) hasAdjacentSolid = true;
+          if (!hasAdjacentSolid) break;
+        }
+        // (e) No footprint tile may be BeingDug (conflict with active excavation)
+        {
+          let conflictsBeingDug = false;
+          for (let dy = 0; dy < dims.height && !conflictsBeingDug; dy++) {
+            for (let dx = 0; dx < dims.width; dx++) {
+              if (ugGet(underground, cmd.anchorTileX + dx, cmd.anchorTileY + dy) === UndergroundTileState.BeingDug) {
+                conflictsBeingDug = true;
+                break;
+              }
+            }
+          }
+          if (conflictsBeingDug) break;
+        }
+        // (h) pendingChambers key at this anchor must not already exist
+        const newPcKey = `${cmd.colonyId}:${cmd.anchorTileX}:${cmd.anchorTileY}`;
+        if (Object.hasOwn(world.pendingChambers, newPcKey)) break;
+        // (g) Overlap with existing ChamberRecord footprint
         let overlaps = false;
-        // Check existing chambers — ChamberRecord.posX/posY are FIXED-POINT, shift back to tile coords
         for (const ch of colony3.chambers) {
           const chTileX = ch.posX >> FP_SHIFT;
           const chTileY = ch.posY >> FP_SHIFT;
@@ -189,7 +219,7 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
           }
         }
         if (overlaps) break;
-        // Check pending chambers (Record iteration — anchorTileX/Y are tile coords)
+        // (f) Overlap with same-colony PendingChamber footprint
         for (const pcKey in world.pendingChambers) {
           if (!Object.hasOwn(world.pendingChambers, pcKey)) continue;
           const pc = world.pendingChambers[pcKey]!;
@@ -200,7 +230,7 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
           }
         }
         if (overlaps) break;
-        // Mark footprint tiles as Marked (only Solid tiles) and create PendingChamber
+        // All checks passed — mark footprint Solid tiles and create PendingChamber
         for (let dy = 0; dy < dims.height; dy++) {
           for (let dx = 0; dx < dims.width; dx++) {
             const tx = cmd.anchorTileX + dx;
@@ -210,8 +240,6 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
             }
           }
         }
-        // Key format per PRD: `${colonyId}:${anchorTileX}:${anchorTileY}`
-        const newPcKey = `${cmd.colonyId}:${cmd.anchorTileX}:${cmd.anchorTileY}`;
         world.pendingChambers[newPcKey] = {
           colonyId:    cmd.colonyId,
           chamberType: cmd.chamberType,
@@ -227,13 +255,59 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         // PRD §3g — designate a new nest entrance; auto-marks shaft tiles.
         const colony4 = world.colonies[cmd.colonyId];
         if (!colony4) break;
-        // T-07-12: cap check (mitigate tamper — prevent unbounded entrance creation)
-        if (colony4.entrances.length >= MAX_ENTRANCES_PER_COLONY) break;
-        // Reject duplicates (same surfaceTileX/Y)
-        const alreadyExists = colony4.entrances.some(e => e.surfaceTileX === cmd.surfaceTileX && e.surfaceTileY === cmd.surfaceTileY);
-        if (alreadyExists) break;
         const underground = world.undergroundGrids[cmd.colonyId];
         if (!underground) break;
+        // Surface-coord bounds (PRD §3g silent-drop first bullet)
+        if (cmd.surfaceTileX < 0 || cmd.surfaceTileX >= SURFACE_GRID_WIDTH) break;
+        if (cmd.surfaceTileY < 0 || cmd.surfaceTileY >= SURFACE_GRID_HEIGHT) break;
+        // T-07-12: cap check (mitigate tamper — prevent unbounded entrance creation)
+        if (colony4.entrances.length >= MAX_ENTRANCES_PER_COLONY) break;
+        // Column uniqueness — same surfaceTileX collapses in underground view (PRD §3g)
+        {
+          let duplicateColumn = false;
+          for (let e = 0; e < colony4.entrances.length; e++) {
+            if (colony4.entrances[e]!.surfaceTileX === cmd.surfaceTileX) {
+              duplicateColumn = true;
+              break;
+            }
+          }
+          if (duplicateColumn) break;
+        }
+        // Food-pile collision (PRD §3g — commands are authoritative)
+        {
+          let onFoodPile = false;
+          for (let p = 0; p < world.foodPiles.length; p++) {
+            const pile = world.foodPiles[p]!;
+            if (pile.tileX === cmd.surfaceTileX && pile.tileY === cmd.surfaceTileY) {
+              onFoodPile = true;
+              break;
+            }
+          }
+          if (onFoodPile) break;
+        }
+        // Colony rally-point collision
+        if (colony4.rallyPoint !== null &&
+            colony4.rallyPoint.tileX === cmd.surfaceTileX &&
+            colony4.rallyPoint.tileY === cmd.surfaceTileY) break;
+        // Another colony's entrance already occupies this surface tile
+        {
+          let occupiedByOther = false;
+          for (const otherKey in world.colonies) {
+            if (!Object.hasOwn(world.colonies, otherKey)) continue;
+            const other = world.colonies[otherKey as unknown as ColonyId]!;
+            if (other.colonyId === cmd.colonyId) continue;
+            if (!other.entrances) continue;
+            for (let e = 0; e < other.entrances.length; e++) {
+              const oe = other.entrances[e]!;
+              if (oe.surfaceTileX === cmd.surfaceTileX && oe.surfaceTileY === cmd.surfaceTileY) {
+                occupiedByOther = true;
+                break;
+              }
+            }
+            if (occupiedByOther) break;
+          }
+          if (occupiedByOther) break;
+        }
         // Create entrance (not yet open)
         colony4.entrances.push({
           entranceId:   allocateEntityId(world),

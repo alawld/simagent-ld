@@ -541,21 +541,84 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
 
     const task = ants.task[id]!;
     const zone = ants.zone[id]!;
+    const foodCarrying = ants.foodCarrying[id]!;
     let dx: number;
     let dy: number;
 
-    if (task === AntTask.Foraging) {
-      // Check for priority target (set by routeForagerPriority at step 13)
+    // --- PRD §5c entrance targeting (zone-transitioning ants) ---
+    // Surface→Underground: Digging, Nursing, or Foraging+CarryingFood.
+    // Underground→Surface: Foraging+SearchingFood (foodCarrying=0), or Fighting.
+    // Target the nearest OPEN entrance (Manhattan; lower entranceId breaks ties).
+    // Step overrides any priority target set by routeForagerPriority (step 13) —
+    // only SearchingFood surface foragers (non-transitioning) keep that target.
+    let entranceTargetX = -1;
+    let entranceTargetY = -1;
+    {
+      let needsTransition = false;
+      if (zone === Zone.Surface) {
+        needsTransition =
+          task === AntTask.Digging ||
+          task === AntTask.Nursing ||
+          (task === AntTask.Foraging && foodCarrying > 0);
+      } else {
+        // Zone.Underground
+        needsTransition =
+          (task === AntTask.Foraging && foodCarrying === 0) ||
+          task === AntTask.Fighting;
+      }
+
+      if (needsTransition) {
+        const colonyId = ants.colonyId[id]!;
+        const colony = world.colonies[colonyId];
+        if (colony && colony.entrances && colony.entrances.length > 0) {
+          const antTileX = ants.posX[id]! >> FP_SHIFT;
+          const antTileY = ants.posY[id]! >> FP_SHIFT;
+          let bestDist = -1;
+          let bestId = -1;
+          for (let e = 0; e < colony.entrances.length; e++) {
+            const ent = colony.entrances[e]!;
+            if (!ent.isOpen) continue;
+            const entDistY = zone === Zone.Surface ? ent.surfaceTileY : 0;
+            const dist =
+              Math.abs(ent.surfaceTileX - antTileX) + Math.abs(entDistY - antTileY);
+            if (
+              bestDist < 0 ||
+              dist < bestDist ||
+              (dist === bestDist && ent.entranceId < bestId)
+            ) {
+              bestDist = dist;
+              bestId = ent.entranceId;
+              entranceTargetX = ent.surfaceTileX << FP_SHIFT;
+              entranceTargetY = entDistY << FP_SHIFT;
+            }
+          }
+        }
+      }
+    }
+
+    if (entranceTargetX !== -1) {
+      // Zone-transitioning ant — move toward nearest open entrance.
+      const posX = ants.posX[id]!;
+      const posY = ants.posY[id]!;
+      const rawDx = entranceTargetX - posX;
+      const rawDy = entranceTargetY - posY;
+      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+        dy = 0;
+      } else {
+        dx = 0;
+        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+      }
+    } else if (task === AntTask.Foraging) {
+      // Non-transitioning forager — priority target (step 13) or pheromone gradient.
       const targetX = ants.targetPosX[id]!;
       const targetY = ants.targetPosY[id]!;
 
       if (targetX !== -1 && targetY !== -1) {
-        // Move toward priority target
         const posX = ants.posX[id]!;
         const posY = ants.posY[id]!;
         const rawDx = targetX - posX;
         const rawDy = targetY - posY;
-        // Unit step toward target
         if (Math.abs(rawDx) >= Math.abs(rawDy)) {
           dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
           dy = 0;
@@ -564,7 +627,6 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
           dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
         }
       } else {
-        // No priority target — use pheromone gradient
         const colonyId = ants.colonyId[id]!;
         const tileX = ants.posX[id]! >> FP_SHIFT;
         const tileY = ants.posY[id]! >> FP_SHIFT;
@@ -580,7 +642,7 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         }
       }
     } else {
-      // Non-forager: pure direction lookup (NO state mutations)
+      // Non-forager, non-transitioning: pure direction lookup (no state mutations).
       const dir = getTaskDirection(world, id, digFlowFields);
       dx = dir.dx;
       dy = dir.dy;
@@ -632,9 +694,12 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         }
       }
     } else if (zone === Zone.Underground) {
-      // Underground → Surface: ant at tileY=0 at an open entrance, task requires surface
+      // Underground → Surface: ant at tileY=0 at an open entrance, task requires surface (PRD §5d).
+      // Idle kept as defensive allowance: a post-deposit ant still at an entrance tile transits
+      // immediately rather than lingering underground until step-10a reassigns it next tick.
       const needsSurface =
         task === AntTask.Idle ||
+        task === AntTask.Fighting ||
         (task === AntTask.Foraging && ants.subTask[id] === ForagingSubState.SearchingFood);
 
       if (needsSurface) {

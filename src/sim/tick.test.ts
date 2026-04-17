@@ -868,6 +868,9 @@ describe('Phase 7: MarkDigTile command processing', () => {
   // Test P7-7: PlaceChamber creates PendingChamber with correct dimensions; footprint tiles marked
   it('Test P7-7: PlaceChamber creates PendingChamber with correct dims; tiles marked', () => {
     const { world, colonyId } = makeWorldWithUnderground();
+    // PRD §3c tunnel-end: anchor tile must be Open; surrounding Solid tiles give adjacency.
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
     const cmd: SimCommand = {
       type: 'PlaceChamber',
       colonyId,
@@ -884,11 +887,13 @@ describe('Phase 7: MarkDigTile command processing', () => {
     expect(pc.width).toBe(dims.width);
     expect(pc.height).toBe(dims.height);
     expect(pc.chamberType).toBe(ChamberType.Queen);
-    // Footprint tiles should be Marked (were Solid before)
-    const underground = world.undergroundGrids[colonyId]!;
+    // Footprint tiles (were Solid before) are now Marked. Anchor tile was Open → stays Open.
     for (let dy = 0; dy < dims.height; dy++) {
       for (let dx = 0; dx < dims.width; dx++) {
-        expect(ugGet(underground, 10 + dx, 10 + dy)).toBe(UndergroundTileState.Marked);
+        const expected = (dx === 0 && dy === 0)
+          ? UndergroundTileState.Open
+          : UndergroundTileState.Marked;
+        expect(ugGet(underground, 10 + dx, 10 + dy)).toBe(expected);
       }
     }
   });
@@ -896,6 +901,9 @@ describe('Phase 7: MarkDigTile command processing', () => {
   // Test P7-8: PlaceChamber rejected if overlapping existing pendingChamber
   it('Test P7-8: PlaceChamber rejected if overlapping existing pendingChamber', () => {
     const { world, colonyId } = makeWorldWithUnderground();
+    // PRD §3c tunnel-end: open the anchor tile for each placement attempt.
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
     // Place first chamber
     const cmd1: SimCommand = {
       type: 'PlaceChamber', colonyId,
@@ -904,7 +912,8 @@ describe('Phase 7: MarkDigTile command processing', () => {
     tick(world, [cmd1]);
     expect(world.pendingChambers[`${colonyId}:10:10`]).toBeDefined();
 
-    // Try to place second chamber that overlaps
+    // Open anchor (12,10) too so only the overlap rule (not the tunnel-end rule) rejects cmd2.
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 12] = UndergroundTileState.Open;
     const cmd2: SimCommand = {
       type: 'PlaceChamber', colonyId,
       chamberType: ChamberType.FoodStorage, anchorTileX: 12, anchorTileY: 10, issuedAtTick: 1,
@@ -1273,6 +1282,11 @@ describe('Phase 7: Integration tests', () => {
     const dims = CHAMBER_DIMENSIONS[chamberType]!;
     const ax = 30, ay = 10;
 
+    // PRD §3c tunnel-end: open anchors for both placements; surrounding Solid gives adjacency.
+    const undergroundSc6 = world.undergroundGrids[colonyId]!;
+    undergroundSc6.data[ay * UNDERGROUND_GRID_WIDTH + ax] = UndergroundTileState.Open;
+    undergroundSc6.data[ay * UNDERGROUND_GRID_WIDTH + (ax + 1)] = UndergroundTileState.Open;
+
     const cmd1: SimCommand = {
       type: 'PlaceChamber',
       colonyId,
@@ -1328,5 +1342,204 @@ describe('Phase 7: Integration tests', () => {
 
     // world1's enemy underground grid should also be unaffected
     expect(world1.undergroundGrids[colonyId2]!.data[100]).toBe(UndergroundTileState.Solid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: reviewer P1 fixes
+//   - Entrance-seeking movement (PRD §5c)
+//   - PlaceChamber tunnel-end validation (PRD §3c)
+//   - DesignateEntrance validation (PRD §3g)
+// ---------------------------------------------------------------------------
+
+describe('Regression: reviewer P1 fixes', () => {
+  function makeWorldWithUnderground(seed = 42) {
+    const world = createWorldState(seed);
+    const queenId = allocateEntityId(world);
+    initAnt(world.ants, queenId, { colonyId: 1, posX: 1024, posY: 1024, task: AntTask.Idle, subTask: 0 });
+    world.colonies[1] = createColonyRecord(1, queenId);
+    world.colonies[1]!.foodStored = 10000;
+    world.colonies[1]!.entrances = [];
+    world.colonies[1]!.rallyPoint = null;
+    world.colonies[1]!.digFlowFieldDirty = false;
+    world.undergroundGrids[1] = createUndergroundGrid(UNDERGROUND_GRID_WIDTH, UNDERGROUND_GRID_HEIGHT);
+    return { world, colonyId: 1 as ColonyId };
+  }
+
+  // --- Entrance-seeking movement ---
+  it('surface CarryingFood ant paths toward open entrance (PRD §5c)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    colony.entrances.push({ entranceId: 99, surfaceTileX: 50, surfaceTileY: 10, isOpen: true });
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId, posX: 20 << FP_SHIFT, posY: 10 << FP_SHIFT,
+      task: AntTask.Foraging, subTask: ForagingSubState.CarryingFood, speed: 1,
+    });
+    world.ants.foodCarrying[antId] = 5;
+    const x0 = world.ants.posX[antId]!;
+    tickAntMovement(world, new Rng(world.rngState), createDigFlowFields());
+    expect(world.ants.posX[antId]!).toBeGreaterThan(x0); // moved toward entrance (+x)
+  });
+
+  it('underground SearchingFood ant paths toward open entrance at (x,0)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    colony.entrances.push({ entranceId: 7, surfaceTileX: 40, surfaceTileY: 10, isOpen: true });
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId, posX: 10 << FP_SHIFT, posY: 5 << FP_SHIFT,
+      task: AntTask.Foraging, subTask: ForagingSubState.SearchingFood, speed: 1,
+    });
+    world.ants.zone[antId] = 1; // Underground
+    const x0 = world.ants.posX[antId]!;
+    const y0 = world.ants.posY[antId]!;
+    tickAntMovement(world, new Rng(world.rngState), createDigFlowFields());
+    // Should move either in +x (toward column 40) or -y (toward tileY=0)
+    const moved = world.ants.posX[antId]! !== x0 || world.ants.posY[antId]! !== y0;
+    expect(moved).toBe(true);
+  });
+
+  it('no open entrances → zone-transitioning ant does not move toward nothing', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    // No entrances at all
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId, posX: 20 << FP_SHIFT, posY: 10 << FP_SHIFT,
+      task: AntTask.Nursing, subTask: 0, speed: 1,
+    });
+    const x0 = world.ants.posX[antId]!;
+    const y0 = world.ants.posY[antId]!;
+    tickAntMovement(world, new Rng(world.rngState), createDigFlowFields());
+    // Nursing with no chambers and no entrance → stays put
+    expect(world.ants.posX[antId]!).toBe(x0);
+    expect(world.ants.posY[antId]!).toBe(y0);
+  });
+
+  // --- PlaceChamber tunnel-end validation (PRD §3c) ---
+  it('PlaceChamber rejected: anchor tile is Solid (not a tunnel end)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    // Everything is Solid by default — anchor (10,10) is Solid
+    const cmd: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBeUndefined();
+  });
+
+  it('PlaceChamber rejected: no adjacent Solid (anchor in wide-open cavern)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    // Open a 3×3 region around (10,10) — no adjacent Solid
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        underground.data[(10 + dy) * UNDERGROUND_GRID_WIDTH + (10 + dx)] = UndergroundTileState.Open;
+      }
+    }
+    const cmd: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBeUndefined();
+  });
+
+  it('PlaceChamber rejected: footprint contains BeingDug tile', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open; // anchor
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 11] = UndergroundTileState.BeingDug; // footprint conflict
+    const cmd: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBeUndefined();
+  });
+
+  it('PlaceChamber rejected: pendingChambers key already exists at anchor', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
+    const cmd: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBeDefined();
+    // Second command at the same anchor must be dropped
+    const before = world.pendingChambers[`${colonyId}:10:10`];
+    tick(world, [cmd]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBe(before); // not overwritten
+  });
+
+  // --- DesignateEntrance validation (PRD §3g) ---
+  it('DesignateEntrance rejected: surfaceTileX out of bounds', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: -1, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.colonies[colonyId]!.entrances.length).toBe(0);
+  });
+
+  it('DesignateEntrance rejected: same-column duplicate (different surfaceTileY)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd1: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd1]);
+    expect(world.colonies[colonyId]!.entrances.length).toBe(1);
+    // Same column, different surfaceTileY — PRD §3g column uniqueness rejects this
+    const cmd2: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 5, issuedAtTick: 1,
+    };
+    tick(world, [cmd2]);
+    expect(world.colonies[colonyId]!.entrances.length).toBe(1);
+  });
+
+  it('DesignateEntrance rejected: food pile at surface tile', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    world.foodPiles.push({ foodPileId: 0, tileX: 50, tileY: 0, isMarkedPriority: false });
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.colonies[colonyId]!.entrances.length).toBe(0);
+  });
+
+  it('DesignateEntrance rejected: colony rally point at surface tile', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    world.colonies[colonyId]!.rallyPoint = { tileX: 50, tileY: 0 };
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.colonies[colonyId]!.entrances.length).toBe(0);
+  });
+
+  it('DesignateEntrance rejected: another colony already has an entrance there', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    // Add a second colony with an entrance at (50,0)
+    const queen2 = allocateEntityId(world);
+    initAnt(world.ants, queen2, { colonyId: 2, posX: 0, posY: 0, task: AntTask.Idle, subTask: 0 });
+    world.colonies[2] = createColonyRecord(2, queen2);
+    world.colonies[2]!.entrances = [{ entranceId: 999, surfaceTileX: 50, surfaceTileY: 0, isOpen: true }];
+    world.colonies[2]!.rallyPoint = null;
+    world.colonies[2]!.digFlowFieldDirty = false;
+    world.undergroundGrids[2] = createUndergroundGrid(UNDERGROUND_GRID_WIDTH, UNDERGROUND_GRID_HEIGHT);
+
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.colonies[colonyId]!.entrances.length).toBe(0);
   });
 });
