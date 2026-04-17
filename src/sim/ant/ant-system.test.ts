@@ -510,3 +510,758 @@ describe('getTaskDirection', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Helper: create world with colony + underground grid for dig/zone tests
+// ---------------------------------------------------------------------------
+
+function setupWorldWithUnderground(
+  ugWidth = 16,
+  ugHeight = 16,
+): {
+  world: WorldState;
+  colony: ColonyRecord;
+  underground: ReturnType<typeof createUndergroundGrid>;
+  colonyId: number;
+} {
+  const world = createWorldState(42, MAX_TEST_ENTITIES);
+  const colonyId = COLONY_ID;
+  const colony = createColonyRecord(colonyId, 0);
+  colony.entrances        = [];
+  colony.rallyPoint       = null;
+  colony.digFlowFieldDirty = false;
+  world.colonies[colonyId] = colony;
+
+  const underground = createUndergroundGrid(ugWidth, ugHeight);
+  world.undergroundGrids[colonyId] = underground;
+
+  return { world, colony, underground, colonyId };
+}
+
+// ---------------------------------------------------------------------------
+// getTaskDirection — dig direction lookup (UNDR-02 purity checks)
+// ---------------------------------------------------------------------------
+
+describe('getTaskDirection — dig direction lookup (purity checks)', () => {
+  it('D-1. dig worker at Open tile adjacent to Marked tile → returns correct dx/dy; no state mutation', () => {
+    // Grid: ant at (0,0)=Open, (1,0)=Marked → flow-field should point East (dx=1, dy=0)
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 0, 0, UndergroundTileState.Open);
+    ugSet(underground, 1, 0, UndergroundTileState.Marked);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0 << FP_SHIFT,
+      posY: 0 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.MovingToTile,
+      zone: Zone.Underground,
+    });
+
+    const tileStateBefore = ugGet(underground, 1, 0);
+    const subTaskBefore = world.ants.subTask[antId];
+    const dirtyBefore = colony.digFlowFieldDirty;
+
+    const dir = getTaskDirection(world, antId, digFlowFields);
+
+    // Direction: from (0,0) the nearest Marked tile is East → dx=1, dy=0
+    expect(dir.dx).toBe(1);
+    expect(dir.dy).toBe(0);
+
+    // Purity: nothing mutated
+    expect(ugGet(underground, 1, 0)).toBe(tileStateBefore); // tile unchanged
+    expect(world.ants.subTask[antId]).toBe(subTaskBefore);   // subTask unchanged
+    expect(colony.digFlowFieldDirty).toBe(dirtyBefore);      // dirty flag unchanged
+  });
+
+  it('D-2. dig worker ON Marked tile (flow-field dir=-1) → returns {0,0}; tile still Marked (not claimed)', () => {
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 2, 2, UndergroundTileState.Marked);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 2 << FP_SHIFT,
+      posY: 2 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.MovingToTile,
+      zone: Zone.Underground,
+    });
+
+    const subTaskBefore = world.ants.subTask[antId];
+
+    const dir = getTaskDirection(world, antId, digFlowFields);
+
+    // Returns {0,0} — claim happens in tickDigExecution at step 10
+    expect(dir.dx).toBe(0);
+    expect(dir.dy).toBe(0);
+
+    // Purity: tile still Marked (NOT BeingDug), subTask unchanged
+    expect(ugGet(underground, 2, 2)).toBe(UndergroundTileState.Marked);
+    expect(world.ants.subTask[antId]).toBe(subTaskBefore);
+    expect(colony.digFlowFieldDirty).toBe(false);
+  });
+
+  it('D-3. dig worker in Excavating → returns {0,0}; digTicksRemaining unchanged (purity check)', () => {
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 1, 1, UndergroundTileState.BeingDug);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 1 << FP_SHIFT,
+      posY: 1 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+      zone: Zone.Underground,
+    });
+    world.ants.digTicksRemaining[antId] = DIG_TICKS_PER_TILE;
+    world.ants.digTileX[antId] = 1;
+    world.ants.digTileY[antId] = 1;
+
+    const ticksBefore = world.ants.digTicksRemaining[antId];
+
+    const dir = getTaskDirection(world, antId, digFlowFields);
+
+    // Stationary while digging
+    expect(dir.dx).toBe(0);
+    expect(dir.dy).toBe(0);
+
+    // Purity: digTicksRemaining NOT decremented (decrement happens in tickDigExecution)
+    expect(world.ants.digTicksRemaining[antId]).toBe(ticksBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tickDigExecution — state machine transitions (UNDR-02)
+// ---------------------------------------------------------------------------
+
+describe('tickDigExecution — state machine transitions', () => {
+  it('3a. dig worker ON Marked tile → claims it (Marked→BeingDug, sets claim fields, digFlowFieldDirty)', () => {
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 2, 2, UndergroundTileState.Marked);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 2 << FP_SHIFT,
+      posY: 2 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.MovingToTile,
+      zone: Zone.Underground,
+    });
+
+    tickDigExecution(world, digFlowFields);
+
+    // Tile: Marked → BeingDug
+    expect(ugGet(underground, 2, 2)).toBe(UndergroundTileState.BeingDug);
+    // Ant claim fields set
+    expect(world.ants.digTileX[antId]).toBe(2);
+    expect(world.ants.digTileY[antId]).toBe(2);
+    expect(world.ants.digTicksRemaining[antId]).toBe(DIG_TICKS_PER_TILE);
+    // Transitioned to Excavating
+    expect(world.ants.subTask[antId]).toBe(DiggingSubState.Excavating);
+    // Flow-field dirty flag set
+    expect(colony.digFlowFieldDirty).toBe(true);
+  });
+
+  it('3b. dig worker Excavating with digTicksRemaining>1 → decrements by 1; tile still BeingDug; still Excavating', () => {
+    const { world, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 1, 1, UndergroundTileState.BeingDug);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 1 << FP_SHIFT,
+      posY: 1 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+      zone: Zone.Underground,
+    });
+    world.ants.digTileX[antId] = 1;
+    world.ants.digTileY[antId] = 1;
+    world.ants.digTicksRemaining[antId] = 5; // > 1
+
+    tickDigExecution(world, digFlowFields);
+
+    expect(world.ants.digTicksRemaining[antId]).toBe(4); // decremented
+    expect(ugGet(underground, 1, 1)).toBe(UndergroundTileState.BeingDug); // still BeingDug
+    expect(world.ants.subTask[antId]).toBe(DiggingSubState.Excavating); // still Excavating
+  });
+
+  it('3c. dig worker Excavating with digTicksRemaining=1 → tile BeingDug→Open, claim cleared, back to MovingToTile', () => {
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 3, 3, UndergroundTileState.BeingDug);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 3 << FP_SHIFT,
+      posY: 3 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+      zone: Zone.Underground,
+    });
+    world.ants.digTileX[antId] = 3;
+    world.ants.digTileY[antId] = 3;
+    world.ants.digTicksRemaining[antId] = 1; // final tick
+
+    tickDigExecution(world, digFlowFields);
+
+    // Tile opens
+    expect(ugGet(underground, 3, 3)).toBe(UndergroundTileState.Open);
+    // Claim fields cleared
+    expect(world.ants.digTileX[antId]).toBe(-1);
+    expect(world.ants.digTileY[antId]).toBe(-1);
+    // Back to MovingToTile
+    expect(world.ants.subTask[antId]).toBe(DiggingSubState.MovingToTile);
+    // Flow-field dirty
+    expect(colony.digFlowFieldDirty).toBe(true);
+  });
+
+  it('3d. dig worker MovingToTile on Open tile (not on Marked) → tickDigExecution no-ops', () => {
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    // No Marked tiles — all solid by default
+    ugSet(underground, 1, 1, UndergroundTileState.Open);
+
+    const digFlowFields = createDigFlowFields();
+    const flowField = new Int32Array(4 * 4);
+    const queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 1 << FP_SHIFT,
+      posY: 1 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.MovingToTile,
+      zone: Zone.Underground,
+    });
+
+    tickDigExecution(world, digFlowFields);
+
+    // No claim, no mutation
+    expect(world.ants.digTileX[antId]).toBe(-1);
+    expect(world.ants.digTileY[antId]).toBe(-1);
+    expect(world.ants.subTask[antId]).toBe(DiggingSubState.MovingToTile);
+    expect(colony.digFlowFieldDirty).toBe(false);
+  });
+
+  it('3e. ordering/integration: after DIG_TICKS_PER_TILE+1 calls, tile is Open and ant is MovingToTile', () => {
+    // Ant starts ON a Marked tile; simulate full claim→excavate→open sequence
+    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    ugSet(underground, 0, 0, UndergroundTileState.Marked);
+
+    const digFlowFields = createDigFlowFields();
+
+    // Initial flow-field (with Marked tile seeded)
+    let flowField = new Int32Array(4 * 4);
+    let queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0,  // posX=0 → tileX=0
+      posY: 0,  // posY=0 → tileY=0
+      task: AntTask.Digging,
+      subTask: DiggingSubState.MovingToTile,
+      zone: Zone.Underground,
+    });
+
+    // Tick 1: claim happens (Marked → BeingDug, subTask → Excavating)
+    tickDigExecution(world, digFlowFields);
+    expect(ugGet(underground, 0, 0)).toBe(UndergroundTileState.BeingDug);
+    expect(world.ants.subTask[antId]).toBe(DiggingSubState.Excavating);
+    expect(world.ants.digTicksRemaining[antId]).toBe(DIG_TICKS_PER_TILE);
+
+    // Recompute flow-field after claim (now BeingDug; no Marked tiles left)
+    flowField = new Int32Array(4 * 4);
+    queue = new Int32Array(4 * 4);
+    computeDigFlowField(underground, flowField, queue);
+    digFlowFields.fields[COLONY_ID] = flowField;
+    digFlowFields.queues[COLONY_ID] = queue;
+
+    // Ticks 2..DIG_TICKS_PER_TILE: countdown
+    for (let t = 0; t < DIG_TICKS_PER_TILE - 1; t++) {
+      tickDigExecution(world, digFlowFields);
+    }
+    expect(world.ants.digTicksRemaining[antId]).toBe(1);
+
+    // Final tick: tile opens
+    tickDigExecution(world, digFlowFields);
+
+    expect(ugGet(underground, 0, 0)).toBe(UndergroundTileState.Open);
+    expect(world.ants.subTask[antId]).toBe(DiggingSubState.MovingToTile);
+    expect(world.ants.digTileX[antId]).toBe(-1);
+    expect(world.ants.digTileY[antId]).toBe(-1);
+    expect(colony.digFlowFieldDirty).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// routeForagerPriority — forager priority routing (SURF-03)
+// ---------------------------------------------------------------------------
+
+describe('routeForagerPriority', () => {
+  function makeMarkedPile(id: number, tileX: number, tileY: number): FoodPile {
+    return { foodPileId: id, tileX, tileY, isMarkedPriority: true };
+  }
+  function makeUnmarkedPile(id: number, tileX: number, tileY: number): FoodPile {
+    return { foodPileId: id, tileX, tileY, isMarkedPriority: false };
+  }
+
+  it('4. no marked food piles → routeForagerPriority sets targetPosX/Y = -1', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    world.foodPiles.push(makeUnmarkedPile(1, 10, 10));
+    world.foodPiles.push(makeUnmarkedPile(2, 20, 20));
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 5 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+    });
+    world.ants.targetPosX[antId] = 99; // pre-set to something
+
+    routeForagerPriority(world);
+
+    expect(world.ants.targetPosX[antId]).toBe(-1);
+    expect(world.ants.targetPosY[antId]).toBe(-1);
+  });
+
+  it('5. one marked pile → targetPosX/Y set to that pile\'s fixed-point tile position', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    world.foodPiles.push(makeMarkedPile(1, 15, 20));
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0,
+      posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+    });
+
+    routeForagerPriority(world);
+
+    expect(world.ants.targetPosX[antId]).toBe(15 << FP_SHIFT);
+    expect(world.ants.targetPosY[antId]).toBe(20 << FP_SHIFT);
+  });
+
+  it('6. two marked piles, ant closer to pile B → targets pile B; lower foodPileId wins tie', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    // Ant at tile (5,5); pile A at (10,5) → distance 5; pile B at (6,5) → distance 1
+    world.foodPiles.push(makeMarkedPile(10, 10, 5));  // pile A, farther
+    world.foodPiles.push(makeMarkedPile(20, 6, 5));   // pile B, closer
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 5 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+    });
+
+    routeForagerPriority(world);
+
+    // Should target pile B (closer)
+    expect(world.ants.targetPosX[antId]).toBe(6 << FP_SHIFT);
+    expect(world.ants.targetPosY[antId]).toBe(5 << FP_SHIFT);
+
+    // Tie-break: put two piles at equal distance (ant at 5,5; pileX at 3,5 dist=2; pileY at 7,5 dist=2)
+    // Lower foodPileId wins
+    const world2 = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony2 = createColonyRecord(COLONY_ID, 0);
+    colony2.entrances = []; colony2.rallyPoint = null; colony2.digFlowFieldDirty = false;
+    world2.colonies[COLONY_ID] = colony2;
+    world2.foodPiles.push(makeMarkedPile(5, 7, 5));   // id=5, dist=2
+    world2.foodPiles.push(makeMarkedPile(3, 3, 5));   // id=3, dist=2; lower id → wins
+    const antId2 = allocateEntityId(world2);
+    initAnt(world2.ants, antId2, {
+      colonyId: COLONY_ID,
+      posX: 5 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+    });
+    routeForagerPriority(world2);
+    // Lower foodPileId=3 (at tile 3,5) wins
+    expect(world2.ants.targetPosX[antId2]).toBe(3 << FP_SHIFT);
+    expect(world2.ants.targetPosY[antId2]).toBe(5 << FP_SHIFT);
+  });
+
+  it('7. ant not in SearchingFood sub-state → targetPosX/Y unchanged', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    world.foodPiles.push(makeMarkedPile(1, 10, 10));
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0,
+      posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.CarryingFood, // NOT SearchingFood
+    });
+    world.ants.targetPosX[antId] = 77;
+    world.ants.targetPosY[antId] = 88;
+
+    routeForagerPriority(world);
+
+    // CarryingFood ant must not be modified
+    expect(world.ants.targetPosX[antId]).toBe(77);
+    expect(world.ants.targetPosY[antId]).toBe(88);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tickAntMovement — zone transition tests (SURF-05)
+// ---------------------------------------------------------------------------
+
+describe('tickAntMovement — zone transitions', () => {
+  it('8. surface ant at open entrance, task=Digging → swaps to Underground zone, posY=0', () => {
+    const { world, colony } = setupWorldWithUnderground();
+    // Add an open entrance at surface tile (10, 5)
+    colony.entrances.push({
+      entranceId: 1,
+      surfaceTileX: 10,
+      surfaceTileY: 5,
+      isOpen: true,
+    });
+    setupSurfaceGrid(world); // register pheromone grid (not needed for digging but prevents missing-grid path)
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 10 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating, // Excavating → {0,0} direction, stays on tile
+      zone: Zone.Surface,
+      speed: 0, // zero speed so position doesn't change from movement
+    });
+    world.ants.digTicksRemaining[antId] = 5;
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    tickAntMovement(world, rng, digFlowFields);
+
+    expect(world.ants.zone[antId]).toBe(Zone.Underground);
+    expect(world.ants.posY[antId]).toBe(0);
+    expect(world.ants.posX[antId]).toBe(10 << FP_SHIFT); // X unchanged
+  });
+
+  it('9. underground ant at tileY=0, open entrance, task=Foraging+SearchingFood → swaps to Surface', () => {
+    const { world, colony } = setupWorldWithUnderground();
+    colony.entrances.push({
+      entranceId: 2,
+      surfaceTileX: 8,
+      surfaceTileY: 64,
+      isOpen: true,
+    });
+    setupSurfaceGrid(world);
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 8 << FP_SHIFT,
+      posY: 0,  // tileY=0 (already at top of underground)
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+      zone: Zone.Underground,
+      speed: 0,
+    });
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    tickAntMovement(world, rng, digFlowFields);
+
+    expect(world.ants.zone[antId]).toBe(Zone.Surface);
+    expect(world.ants.posY[antId]).toBe(64 << FP_SHIFT); // entrance.surfaceTileY
+    expect(world.ants.posX[antId]).toBe(8 << FP_SHIFT);
+  });
+
+  it('10. surface ant at entrance but entrance.isOpen=false → no zone swap', () => {
+    const { world, colony } = setupWorldWithUnderground();
+    colony.entrances.push({
+      entranceId: 3,
+      surfaceTileX: 5,
+      surfaceTileY: 5,
+      isOpen: false, // closed
+    });
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 5 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+      zone: Zone.Surface,
+      speed: 0,
+    });
+    world.ants.digTicksRemaining[antId] = 5;
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    tickAntMovement(world, rng, digFlowFields);
+
+    // Closed entrance — stays on surface
+    expect(world.ants.zone[antId]).toBe(Zone.Surface);
+  });
+
+  it('11. surface ant at entrance but task=Foraging+SearchingFood → no zone swap (stays surface)', () => {
+    const { world, colony } = setupWorldWithUnderground();
+    colony.entrances.push({
+      entranceId: 4,
+      surfaceTileX: 7,
+      surfaceTileY: 7,
+      isOpen: true,
+    });
+    setupSurfaceGrid(world);
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 7 << FP_SHIFT,
+      posY: 7 << FP_SHIFT,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood, // needs surface → no transition
+      zone: Zone.Surface,
+      speed: 0,
+    });
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    tickAntMovement(world, rng, digFlowFields);
+
+    // SearchingFood requires surface — no transition
+    expect(world.ants.zone[antId]).toBe(Zone.Surface);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tickAntMovement — zone-aware bounds tests (SURF-05)
+// ---------------------------------------------------------------------------
+
+describe('tickAntMovement — zone-aware bounds', () => {
+  it('12. underground ant moved past grid edge → clamped to underground bounds', () => {
+    const { world, colony } = setupWorldWithUnderground();
+    colony.entrances = []; // no entrances to avoid zone transition
+
+    const antId = allocateEntityId(world);
+    // Place ant at far right edge of underground, then trigger movement rightward
+    // Use Digging+Excavating → {0,0} direction, but give large posX to test clamp
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: (UNDERGROUND_GRID_WIDTH << FP_SHIFT) + 100, // beyond right edge
+      posY: (UNDERGROUND_GRID_HEIGHT << FP_SHIFT) + 100, // beyond bottom edge
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+      zone: Zone.Underground,
+      speed: 0,
+    });
+    world.ants.digTicksRemaining[antId] = 5;
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    tickAntMovement(world, rng, digFlowFields);
+
+    const maxX = (UNDERGROUND_GRID_WIDTH << FP_SHIFT) - 1;
+    const maxY = (UNDERGROUND_GRID_HEIGHT << FP_SHIFT) - 1;
+    expect(world.ants.posX[antId]).toBeLessThanOrEqual(maxX);
+    expect(world.ants.posY[antId]).toBeLessThanOrEqual(maxY);
+    expect(world.ants.posX[antId]).toBeGreaterThanOrEqual(0);
+    expect(world.ants.posY[antId]).toBeGreaterThanOrEqual(0);
+  });
+
+  it('13. surface ant moved past grid edge → clamped to surface bounds', () => {
+    const { world, colony } = setupWorldWithUnderground();
+    colony.entrances = [];
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: (SURFACE_GRID_WIDTH << FP_SHIFT) + 500, // beyond right edge
+      posY: (SURFACE_GRID_HEIGHT << FP_SHIFT) + 500, // beyond bottom edge
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+      zone: Zone.Surface,
+      speed: 0,
+    });
+    world.ants.digTicksRemaining[antId] = 5;
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    tickAntMovement(world, rng, digFlowFields);
+
+    const maxX = (SURFACE_GRID_WIDTH << FP_SHIFT) - 1;
+    const maxY = (SURFACE_GRID_HEIGHT << FP_SHIFT) - 1;
+    expect(world.ants.posX[antId]).toBeLessThanOrEqual(maxX);
+    expect(world.ants.posY[antId]).toBeLessThanOrEqual(maxY);
+    expect(world.ants.posX[antId]).toBeGreaterThanOrEqual(0);
+    expect(world.ants.posY[antId]).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// antDepositFood — chamber-aware deposit tests (UNDR-07)
+// ---------------------------------------------------------------------------
+
+describe('antDepositFood — chamber-aware deposit (UNDR-07)', () => {
+  function makeFoodStorageChamber(id: number, stored = 0): ColonyRecord['chambers'][number] {
+    return {
+      chamberId: id,
+      chamberType: ChamberType.FoodStorage,
+      foodStored: stored,
+      posX: 0,
+      posY: 0,
+      width: 4,
+      height: 3,
+    };
+  }
+
+  it('14. colony has food storage chamber → antDepositFood adds food to chamber.foodStored', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    colony.chambers.push(makeFoodStorageChamber(1, 0));
+    colony.foodStored = 0;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.CarryingFood,
+    });
+    world.ants.foodCarrying[antId] = 500;
+
+    antDepositFood(world, colony, antId);
+
+    // Food goes to chamber, not colony pool
+    expect(colony.chambers[0]!.foodStored).toBe(500);
+    expect(colony.foodStored).toBe(0);
+    expect(world.ants.foodCarrying[antId]).toBe(0);
+    expect(world.ants.task[antId]).toBe(AntTask.Idle);
+  });
+
+  it('15. colony has no food storage chamber → antDepositFood falls back to colony.foodStored', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    // No chambers at all (Phase 6 chamberless behavior preserved)
+    colony.foodStored = 0;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.CarryingFood,
+    });
+    world.ants.foodCarrying[antId] = 512;
+
+    antDepositFood(world, colony, antId);
+
+    expect(colony.foodStored).toBe(512);
+    expect(world.ants.foodCarrying[antId]).toBe(0);
+    expect(world.ants.task[antId]).toBe(AntTask.Idle);
+  });
+
+  it('16. food storage chamber full → overflow goes to colony.foodStored', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    // Chamber already at capacity
+    colony.chambers.push(makeFoodStorageChamber(1, FOOD_CHAMBER_CAPACITY));
+    colony.foodStored = 0;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.CarryingFood,
+    });
+    world.ants.foodCarrying[antId] = 300;
+
+    antDepositFood(world, colony, antId);
+
+    // Chamber full: all 300 overflows to colony pool
+    expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY); // unchanged
+    expect(colony.foodStored).toBe(300); // overflow to pool
+    expect(world.ants.foodCarrying[antId]).toBe(0);
+    expect(world.ants.task[antId]).toBe(AntTask.Idle);
+  });
+});
