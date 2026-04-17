@@ -1,11 +1,14 @@
 // colony-system.ts — PRD §4c food economy, starvation, death cleanup, reconcile
 //
-// Implements five exported tick-step functions:
-//   withdrawFood          — chamberless food withdrawal helper (PRD §4c)
-//   tickFoodConsumption   — PRD §8a steps 3 AND 4 combined (CLNY-04, CLNY-05)
-//   tickStarvationCheck   — Phase 6 intentional no-op (PRD §8a step 4 slot)
-//   tickDeathCleanup      — swap-remove dead entities from colony buckets (PRD §4b step 5)
-//   tickReconcile         — drift-correction recount pass (PRD §2, CLNY-07)
+// Implements eight exported tick-step functions:
+//   withdrawFood             — chamberless food withdrawal helper (PRD §4c)
+//   tickFoodConsumption      — PRD §8a steps 3 AND 4 combined (CLNY-04, CLNY-05)
+//   tickStarvationCheck      — Phase 6 intentional no-op (PRD §8a step 4 slot)
+//   tickDeathCleanup         — swap-remove dead entities from colony buckets (PRD §4b step 5)
+//   tickReconcile            — drift-correction recount pass (PRD §2, CLNY-07)
+//   checkPendingChambers     — promote fully-excavated PendingChambers to ChamberRecords (PRD §4c tick step 11)
+//   checkEntranceCompletion  — enable entrance when shaft tiles are Open (PRD §5e tick step 12)
+//   tickDeadDiggerCleanup    — revert BeingDug tiles of dead diggers back to Marked (tick step 5 post-pass)
 //
 // Key semantic invariant (PRD §4c lines 1052-1085):
 //   tickFoodConsumption IS the concrete implementation of PRD §8a steps 3 AND 4.
@@ -23,7 +26,9 @@
 // No Math.floor, no floats, no division operator.
 
 import type { WorldState } from '../types.js';
+import { allocateEntityId } from '../types.js';
 import type { ColonyRecord } from './colony-store.js';
+import type { ColonyId } from './colony-store.js';
 import {
   QUEEN_FOOD_PER_TICK,
   LARVA_FOOD_PER_TICK,
@@ -33,6 +38,8 @@ import {
 } from '../constants.js';
 import { ChamberType } from '../enums.js';
 import { allocateWorkers } from '../behavior/allocation-system.js';
+import { ugGet, ugSet, UndergroundTileState } from '../terrain.js';
+import { FP_SHIFT } from '../fixed.js';
 
 // ---------------------------------------------------------------------------
 // withdrawFood — chamberless food withdrawal helper (PRD §4c)
@@ -282,4 +289,135 @@ export function tickReconcile(world: WorldState, colony: ColonyRecord): void {
   colony.nurseCount = alloc.nurse;
 
   colony.reconcileCountdown = RECONCILE_INTERVAL_TICKS;
+}
+
+// ---------------------------------------------------------------------------
+// checkPendingChambers — promote fully-excavated PendingChambers (PRD §4c tick step 11)
+//
+// Iterates world.pendingChambers Record. For each PendingChamber, checks whether
+// ALL footprint tiles in the colony's underground grid are Open. If yes, creates
+// a ChamberRecord in colony.chambers and deletes the entry from pendingChambers.
+// If no, leaves the PendingChamber for the next tick.
+//
+// This is the ONLY place ChamberRecord is created (two-phase invariant, T-07-06).
+// posX/posY are fixed-point (anchorTileX/Y << FP_SHIFT) per Phase 2 PRD ChamberRecord contract.
+// ---------------------------------------------------------------------------
+
+/**
+ * For each PendingChamber in the Record, check if ALL footprint tiles in the colony's
+ * underground grid are Open. If yes: create a ChamberRecord in colony.chambers,
+ * delete from world.pendingChambers. If no: leave the PendingChamber for next tick.
+ *
+ * pendingChambers is Record<string, PendingChamber> keyed by `${colonyId}:${anchorTileX}:${anchorTileY}`.
+ */
+export function checkPendingChambers(world: WorldState): void {
+  for (const key in world.pendingChambers) {
+    if (!Object.hasOwn(world.pendingChambers, key)) continue;
+    const pc = world.pendingChambers[key]!;
+    const underground = world.undergroundGrids[pc.colonyId];
+    if (!underground) continue;
+
+    // Check all footprint tiles
+    let allOpen = true;
+    for (let dy = 0; dy < pc.height && allOpen; dy++) {
+      for (let dx = 0; dx < pc.width && allOpen; dx++) {
+        if (ugGet(underground, pc.anchorTileX + dx, pc.anchorTileY + dy) !== UndergroundTileState.Open) {
+          allOpen = false;
+        }
+      }
+    }
+
+    if (allOpen) {
+      const colony = world.colonies[pc.colonyId];
+      if (!colony) continue;
+
+      // Create ChamberRecord — the ONLY place ChamberRecord is created (two-phase invariant)
+      // posX/posY are FIXED-POINT per Phase 2 PRD ChamberRecord contract (FP_SHIFT=8)
+      colony.chambers.push({
+        chamberId:   allocateEntityId(world),
+        chamberType: pc.chamberType,
+        foodStored:  0,
+        posX:        pc.anchorTileX << FP_SHIFT,
+        posY:        pc.anchorTileY << FP_SHIFT,
+        width:       pc.width,
+        height:      pc.height,
+      });
+
+      // Remove PendingChamber by key (safe during for-in iteration — delete is allowed)
+      delete world.pendingChambers[key];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// checkEntranceCompletion — detect open shafts and enable entrances (PRD §5e tick step 12)
+//
+// For each colony entrance that is not yet open, checks shaft tiles
+// (tileY=0 and tileY=1 at the entrance's surfaceTileX). If both are Open,
+// sets entrance.isOpen = true.
+// ---------------------------------------------------------------------------
+
+/**
+ * For each colony entrance that is not yet open, check if the shaft tiles
+ * (tileY=0 and tileY=1 at the entrance's surfaceTileX) are both Open.
+ * If yes: set entrance.isOpen = true.
+ *
+ * colony.entrances is a typed required field on ColonyRecord (Plan 03 Task 1,
+ * accepted Phase 3 PRD schema) — always present, default [].
+ */
+export function checkEntranceCompletion(world: WorldState): void {
+  for (const key in world.colonies) {
+    if (!Object.hasOwn(world.colonies, key)) continue;
+    const colony = world.colonies[key as unknown as ColonyId]!;
+    const underground = world.undergroundGrids[colony.colonyId];
+    if (!underground) continue;
+
+    for (const entrance of colony.entrances) {
+      if (entrance.isOpen) continue;
+      // Check shaft tiles: tileY=0 and tileY=1 at entrance.surfaceTileX
+      const shaftX = entrance.surfaceTileX;
+      const allShaftOpen =
+        ugGet(underground, shaftX, 0) === UndergroundTileState.Open &&
+        ugGet(underground, shaftX, 1) === UndergroundTileState.Open;
+      if (allShaftOpen) {
+        entrance.isOpen = true;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// tickDeadDiggerCleanup — revert dead digger BeingDug tiles to Marked (tick step 5 post-pass)
+//
+// Global pass (not per-colony) — runs after the per-colony tickDeathCleanup loop.
+// Reverts BeingDug tiles claimed by dead diggers back to Marked so other diggers
+// can claim them. Sets colony.digFlowFieldDirty when a tile is reverted.
+//
+// The existing tickDeathCleanup(world, colony) is UNCHANGED — it remains the
+// per-colony entity list cleanup function (PRD §4b step 5).
+// ---------------------------------------------------------------------------
+
+/**
+ * Revert BeingDug tiles owned by dead diggers back to Marked.
+ * Global pass (not per-colony) — runs after per-colony tickDeathCleanup loop in tick step 5.
+ * This allows other diggers to claim the abandoned tile. Sets digFlowFieldDirty.
+ */
+export function tickDeadDiggerCleanup(world: WorldState): void {
+  for (let id = 0; id < world.ants.alive.length; id++) {
+    if (world.ants.alive[id] !== 0) continue; // only process dead ants
+    const dtx = world.ants.digTileX[id]!;
+    const dty = world.ants.digTileY[id]!;
+    if (dtx === -1 || dty === -1) continue; // no claimed tile
+    const cid = world.ants.colonyId[id]! as ColonyId;
+    const ug = world.undergroundGrids[cid];
+    if (!ug) continue;
+    if (ugGet(ug, dtx, dty) === UndergroundTileState.BeingDug) {
+      ugSet(ug, dtx, dty, UndergroundTileState.Marked);
+      world.colonies[cid]!.digFlowFieldDirty = true;   // typed field (Plan 03 Task 1)
+    }
+    // Clear the dead ant's dig claim
+    world.ants.digTileX[id] = -1;
+    world.ants.digTileY[id] = -1;
+    world.ants.digTicksRemaining[id] = 0;
+  }
 }
