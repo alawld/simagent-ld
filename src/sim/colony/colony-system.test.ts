@@ -1,14 +1,17 @@
 // colony-system.test.ts — CLNY-04, CLNY-05, CLNY-07 + supporting helpers
 //
 // Test coverage:
-//   withdrawFood:          success, insufficient, exact-amount
-//   tickFoodConsumption:   queen fed/unfed, larva fed/unfed, queen-priority ordering
-//   CLNY-04:               queen starvation cascade (SC 2) + stay-alive-when-fed
-//   tickStarvationCheck:   Phase 6 no-op isolation (regression guard — test 10)
-//   CLNY-05:               larva starvation + stay-alive-when-fed
-//   tickDeathCleanup:      dead worker swap-remove, queen death sets defeated, all-bucket cleanup
-//   tickReconcile:         countdown decrement, recount on zero, drift-correction (CLNY-07 SC 7)
-//   CLNY-07 integration:   steady-state foodStored decrement per tick
+//   withdrawFood:               success, insufficient, exact-amount
+//   tickFoodConsumption:        queen fed/unfed, larva fed/unfed, queen-priority ordering
+//   CLNY-04:                    queen starvation cascade (SC 2) + stay-alive-when-fed
+//   tickStarvationCheck:        Phase 6 no-op isolation (regression guard — test 10)
+//   CLNY-05:                    larva starvation + stay-alive-when-fed
+//   tickDeathCleanup:           dead worker swap-remove, queen death sets defeated, all-bucket cleanup
+//   tickReconcile:              countdown decrement, recount on zero, drift-correction (CLNY-07 SC 7)
+//   CLNY-07 integration:        steady-state foodStored decrement per tick
+//   checkPendingChambers:       chamber promotion, partial excavation stays, multiple pending
+//   checkEntranceCompletion:    shaft-open detection, partial shaft stays, idempotent, multi-entrance
+//   tickDeadDiggerCleanup:      BeingDug revert, no-claim skip, Open tile skip, tickDeathCleanup isolation
 
 import { describe, it, expect } from 'vitest';
 import {
@@ -17,6 +20,9 @@ import {
   tickStarvationCheck,
   tickDeathCleanup,
   tickReconcile,
+  checkPendingChambers,
+  checkEntranceCompletion,
+  tickDeadDiggerCleanup,
 } from './colony-system.js';
 import { createWorldState } from '../types.js';
 import { createColonyRecord } from './colony-store.js';
@@ -29,6 +35,8 @@ import {
   LARVA_FOOD_PER_TICK,
   FOOD_CHAMBER_CAPACITY,
 } from '../constants.js';
+import { createUndergroundGrid, ugSet, UndergroundTileState } from '../terrain.js';
+import { FP_SHIFT } from '../fixed.js';
 import type { WorldState } from '../types.js';
 import type { ColonyRecord } from './colony-store.js';
 
@@ -526,5 +534,368 @@ describe('CLNY-07 cached fields — integration', () => {
     for (const larvaId of colony.larvae) {
       expect(world.ants.alive[larvaId]).toBe(1);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkPendingChambers
+// ---------------------------------------------------------------------------
+
+/**
+ * Set up a minimal world with one colony and an underground grid.
+ * Assigns Phase 3 defaults (entrances, rallyPoint, digFlowFieldDirty) per PRD §2a.
+ * Returns world, colony, and the colonyId used.
+ */
+function setupWorldWithColonyAndUnderground(gridW = 20, gridH = 20): {
+  world: WorldState;
+  colony: ColonyRecord;
+  colonyId: number;
+} {
+  const world = createWorldState(42, 128);
+  const colonyId = 1;
+
+  const queenId = world.nextEntityId;
+  world.nextEntityId += 1;
+  initAnt(world.ants, queenId, { colonyId, posX: 256, posY: 256, task: AntTask.Idle });
+
+  const colony = createColonyRecord(colonyId, queenId);
+  // Phase 3 caller-side init contract (PRD §2a):
+  colony.entrances         = [];
+  colony.rallyPoint        = null;
+  colony.digFlowFieldDirty = false;
+
+  world.colonies[colonyId] = colony;
+
+  // Attach an underground grid
+  const ug = createUndergroundGrid(gridW, gridH);
+  world.undergroundGrids[colonyId] = ug;
+
+  return { world, colony, colonyId };
+}
+
+describe('checkPendingChambers', () => {
+  it('1. all footprint tiles Open → PendingChamber deleted, ChamberRecord created with correct fields', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Mark a 2×2 footprint at anchor (3,4) as Open
+    ugSet(ug, 3, 4, UndergroundTileState.Open);
+    ugSet(ug, 4, 4, UndergroundTileState.Open);
+    ugSet(ug, 3, 5, UndergroundTileState.Open);
+    ugSet(ug, 4, 5, UndergroundTileState.Open);
+
+    const key = `${colonyId}:3:4`;
+    world.pendingChambers[key] = {
+      colonyId,
+      chamberType: ChamberType.Nursery,
+      anchorTileX: 3,
+      anchorTileY: 4,
+      width:       2,
+      height:      2,
+    };
+
+    const entityIdBefore = world.nextEntityId;
+    checkPendingChambers(world);
+
+    // PendingChamber entry deleted
+    expect(world.pendingChambers[key]).toBeUndefined();
+
+    // ChamberRecord created in colony.chambers
+    expect(colony.chambers).toHaveLength(1);
+    const ch = colony.chambers[0]!;
+    expect(ch.chamberId).toBe(entityIdBefore); // allocateEntityId returns pre-increment value
+    expect(ch.chamberType).toBe(ChamberType.Nursery);
+    expect(ch.foodStored).toBe(0);
+    // posX/posY are fixed-point (anchorTile << FP_SHIFT)
+    expect(ch.posX).toBe(3 << FP_SHIFT);
+    expect(ch.posY).toBe(4 << FP_SHIFT);
+    expect(ch.width).toBe(2);
+    expect(ch.height).toBe(2);
+  });
+
+  it('2. some footprint tiles still Solid → PendingChamber remains, no ChamberRecord', () => {
+    const { world, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Only open one of the four tiles
+    ugSet(ug, 3, 4, UndergroundTileState.Open);
+    // (4,4), (3,5), (4,5) remain Solid
+
+    const key = `${colonyId}:3:4`;
+    world.pendingChambers[key] = {
+      colonyId,
+      chamberType: ChamberType.FoodStorage,
+      anchorTileX: 3,
+      anchorTileY: 4,
+      width:       2,
+      height:      2,
+    };
+
+    checkPendingChambers(world);
+
+    expect(world.pendingChambers[key]).toBeDefined();
+    expect(world.colonies[colonyId]!.chambers).toHaveLength(0);
+  });
+
+  it('3. some footprint tiles BeingDug → PendingChamber remains (BeingDug is NOT Open)', () => {
+    const { world, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    ugSet(ug, 3, 4, UndergroundTileState.Open);
+    ugSet(ug, 4, 4, UndergroundTileState.Open);
+    ugSet(ug, 3, 5, UndergroundTileState.Open);
+    ugSet(ug, 4, 5, UndergroundTileState.BeingDug); // NOT Open
+
+    const key = `${colonyId}:3:4`;
+    world.pendingChambers[key] = {
+      colonyId,
+      chamberType: ChamberType.Nursery,
+      anchorTileX: 3,
+      anchorTileY: 4,
+      width:       2,
+      height:      2,
+    };
+
+    checkPendingChambers(world);
+
+    expect(world.pendingChambers[key]).toBeDefined();
+    expect(world.colonies[colonyId]!.chambers).toHaveLength(0);
+  });
+
+  it('4. multiple PendingChambers: completed one deleted, incomplete one remains', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Chamber A (1×1 at 2,2) — fully open
+    ugSet(ug, 2, 2, UndergroundTileState.Open);
+    const keyA = `${colonyId}:2:2`;
+    world.pendingChambers[keyA] = {
+      colonyId, chamberType: ChamberType.Nursery,
+      anchorTileX: 2, anchorTileY: 2, width: 1, height: 1,
+    };
+
+    // Chamber B (1×1 at 5,5) — still Solid
+    const keyB = `${colonyId}:5:5`;
+    world.pendingChambers[keyB] = {
+      colonyId, chamberType: ChamberType.FoodStorage,
+      anchorTileX: 5, anchorTileY: 5, width: 1, height: 1,
+    };
+
+    checkPendingChambers(world);
+
+    expect(world.pendingChambers[keyA]).toBeUndefined(); // completed — deleted
+    expect(world.pendingChambers[keyB]).toBeDefined();   // incomplete — remains
+    expect(colony.chambers).toHaveLength(1);
+    expect(colony.chambers[0]!.chamberType).toBe(ChamberType.Nursery);
+  });
+
+  it('5. UNDR-06: ChamberRecord dimensions match PendingChamber; posX/posY are fixed-point', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Open a 3×2 footprint at anchor (1,2)
+    for (let dy = 0; dy < 2; dy++) {
+      for (let dx = 0; dx < 3; dx++) {
+        ugSet(ug, 1 + dx, 2 + dy, UndergroundTileState.Open);
+      }
+    }
+
+    const key = `${colonyId}:1:2`;
+    world.pendingChambers[key] = {
+      colonyId, chamberType: ChamberType.FoodStorage,
+      anchorTileX: 1, anchorTileY: 2, width: 3, height: 2,
+    };
+
+    checkPendingChambers(world);
+
+    expect(colony.chambers).toHaveLength(1);
+    const ch = colony.chambers[0]!;
+    expect(ch.width).toBe(3);
+    expect(ch.height).toBe(2);
+    expect(ch.posX).toBe(1 << FP_SHIFT);
+    expect(ch.posY).toBe(2 << FP_SHIFT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// checkEntranceCompletion
+// ---------------------------------------------------------------------------
+
+describe('checkEntranceCompletion', () => {
+  it('6. shaft tiles (y=0, y=1) both Open → entrance.isOpen set to true', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    ugSet(ug, 5, 0, UndergroundTileState.Open);
+    ugSet(ug, 5, 1, UndergroundTileState.Open);
+
+    colony.entrances.push({
+      entranceId:   1,
+      surfaceTileX: 5,
+      surfaceTileY: 0,
+      isOpen:       false,
+    });
+
+    checkEntranceCompletion(world);
+
+    expect(colony.entrances[0]!.isOpen).toBe(true);
+  });
+
+  it('7. only y=0 Open, y=1 still Solid → entrance remains closed', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    ugSet(ug, 5, 0, UndergroundTileState.Open);
+    // (5,1) stays Solid
+
+    colony.entrances.push({
+      entranceId:   1,
+      surfaceTileX: 5,
+      surfaceTileY: 0,
+      isOpen:       false,
+    });
+
+    checkEntranceCompletion(world);
+
+    expect(colony.entrances[0]!.isOpen).toBe(false);
+  });
+
+  it('8. entrance already open → not re-checked (idempotent)', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Shaft tiles remain Solid (normally would keep entrance closed)
+    // but entrance is already marked open
+    colony.entrances.push({
+      entranceId:   1,
+      surfaceTileX: 5,
+      surfaceTileY: 0,
+      isOpen:       true, // already open
+    });
+
+    // Confirm ug tiles are Solid (default)
+    expect(ug.data[0 * ug.width + 5]).toBe(UndergroundTileState.Solid);
+
+    checkEntranceCompletion(world);
+
+    // Still open (function skipped already-open entrances)
+    expect(colony.entrances[0]!.isOpen).toBe(true);
+  });
+
+  it('9. multiple entrances: one opens, other stays closed', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Entrance A at x=3 — shaft fully open
+    ugSet(ug, 3, 0, UndergroundTileState.Open);
+    ugSet(ug, 3, 1, UndergroundTileState.Open);
+
+    // Entrance B at x=7 — shaft only partially open
+    ugSet(ug, 7, 0, UndergroundTileState.Open);
+    // (7,1) stays Solid
+
+    colony.entrances.push(
+      { entranceId: 1, surfaceTileX: 3, surfaceTileY: 0, isOpen: false },
+      { entranceId: 2, surfaceTileX: 7, surfaceTileY: 0, isOpen: false },
+    );
+
+    checkEntranceCompletion(world);
+
+    expect(colony.entrances[0]!.isOpen).toBe(true);  // entrance A opened
+    expect(colony.entrances[1]!.isOpen).toBe(false); // entrance B still closed
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tickDeadDiggerCleanup (new global function — separate from tickDeathCleanup)
+// ---------------------------------------------------------------------------
+
+describe('tickDeadDiggerCleanup', () => {
+  it('10. dead ant with BeingDug claimed tile → tile reverts to Marked, digFlowFieldDirty=true, dig fields cleared', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    // Allocate a worker ant and immediately kill it
+    const antId = world.nextEntityId;
+    world.nextEntityId += 1;
+    initAnt(world.ants, antId, { colonyId, posX: 0, posY: 0, task: AntTask.Idle });
+    world.ants.alive[antId] = 0; // dead
+    world.ants.digTileX[antId] = 4;
+    world.ants.digTileY[antId] = 6;
+    world.ants.digTicksRemaining[antId] = 10;
+
+    // Set the claimed tile to BeingDug
+    ugSet(ug, 4, 6, UndergroundTileState.BeingDug);
+    colony.digFlowFieldDirty = false;
+
+    tickDeadDiggerCleanup(world);
+
+    expect(ug.data[6 * ug.width + 4]).toBe(UndergroundTileState.Marked);
+    expect(colony.digFlowFieldDirty).toBe(true);
+    expect(world.ants.digTileX[antId]).toBe(-1);
+    expect(world.ants.digTileY[antId]).toBe(-1);
+    expect(world.ants.digTicksRemaining[antId]).toBe(0);
+  });
+
+  it('11. dead ant with digTileX=-1 (no claimed tile) → no tile changes', () => {
+    const { world, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    const antId = world.nextEntityId;
+    world.nextEntityId += 1;
+    initAnt(world.ants, antId, { colonyId, posX: 0, posY: 0, task: AntTask.Idle });
+    world.ants.alive[antId] = 0; // dead
+    // digTileX/digTileY default to -1 from initAnt
+
+    const snapshot = new Uint8Array(ug.data);
+    tickDeadDiggerCleanup(world);
+
+    // Grid unchanged
+    expect(ug.data).toEqual(snapshot);
+  });
+
+  it('12. dead ant whose tile is already Open → no reversion (only reverts BeingDug)', () => {
+    const { world, colony, colonyId } = setupWorldWithColonyAndUnderground();
+    const ug = world.undergroundGrids[colonyId]!;
+
+    const antId = world.nextEntityId;
+    world.nextEntityId += 1;
+    initAnt(world.ants, antId, { colonyId, posX: 0, posY: 0, task: AntTask.Idle });
+    world.ants.alive[antId] = 0;
+    world.ants.digTileX[antId] = 2;
+    world.ants.digTileY[antId] = 3;
+
+    // Tile is already Open (excavation completed before death was processed)
+    ugSet(ug, 2, 3, UndergroundTileState.Open);
+    colony.digFlowFieldDirty = false;
+
+    tickDeadDiggerCleanup(world);
+
+    // Tile should remain Open (not reverted to Marked)
+    expect(ug.data[3 * ug.width + 2]).toBe(UndergroundTileState.Open);
+    // digFlowFieldDirty not set (no tile was changed)
+    expect(colony.digFlowFieldDirty).toBe(false);
+    // Dig claim still cleared
+    expect(world.ants.digTileX[antId]).toBe(-1);
+    expect(world.ants.digTileY[antId]).toBe(-1);
+  });
+
+  it('13. tickDeathCleanup(world, colony) signature still per-colony, handles entity list cleanup only', () => {
+    const { world, colony } = setupWorldWithColonyAndUnderground();
+
+    const workerId = world.nextEntityId;
+    world.nextEntityId += 1;
+    initAnt(world.ants, workerId, { colonyId: 1, posX: 0, posY: 0, task: AntTask.Idle });
+    colony.workers.push(workerId);
+    colony.workerCount += 1;
+
+    // Kill the worker
+    world.ants.alive[workerId] = 0;
+
+    // tickDeathCleanup still takes (world, colony) — per-colony signature
+    tickDeathCleanup(world, colony);
+
+    expect(colony.workers).toHaveLength(0);
+    expect(colony.workerCount).toBe(0);
   });
 });
