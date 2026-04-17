@@ -1,6 +1,7 @@
 // src/sim/determinism.test.ts
 // SCEN-06 proof — two runs from the same seed produce byte-identical serialized WorldState
 // after N ticks. Phase 6 SCs 1-4 end-to-end integration proofs.
+// Phase 7 adds: createScenario + MarkDigTile determinism proof.
 //
 // All constant assertions reference imported symbols from constants.ts — never hardcoded
 // PRD §9c literals. If balance constants change, these tests adapt automatically.
@@ -16,11 +17,13 @@ import {
   WORKER_LIFESPAN_TICKS,
   WORKER_BASE_SPEED,
   STARVATION_GRACE_TICKS,
+  PLAYER_COLONY_ID,
 } from './constants.js';
 import { FP_SHIFT } from './fixed.js';
 import type { WorldState } from './types.js';
 import type { SimCommand } from './commands.js';
 import type { ColonyId } from './colony/colony-store.js';
+import { createScenario } from './scenario.js';
 
 // ---------------------------------------------------------------------------
 // Helper: deterministic serialization
@@ -44,6 +47,13 @@ function serializeWorldState(w: WorldState): string {
       colonyId:        Array.from(w.ants.colonyId),
       foodCarrying:    Array.from(w.ants.foodCarrying),
       starvationTimer: Array.from(w.ants.starvationTimer),
+      // Phase 7 ant fields:
+      zone:               Array.from(w.ants.zone),
+      digTileX:           Array.from(w.ants.digTileX),
+      digTileY:           Array.from(w.ants.digTileY),
+      digTicksRemaining:  Array.from(w.ants.digTicksRemaining),
+      targetPosX:         Array.from(w.ants.targetPosX),
+      targetPosY:         Array.from(w.ants.targetPosY),
     },
     colonies: Object.keys(w.colonies).sort().reduce((acc, k) => {
       const c = w.colonies[Number(k) as ColonyId]!;
@@ -58,10 +68,12 @@ function serializeWorldState(w: WorldState): string {
         nurseCount:           c.nurseCount,
         defeated:             c.defeated,
         reconcileCountdown:   c.reconcileCountdown,
+        digFlowFieldDirty:    c.digFlowFieldDirty,
         eggs:                 [...c.eggs],
         larvae:               [...c.larvae],
         workers:              [...c.workers],
         chambers:             c.chambers.map(ch => ({ ...ch })),
+        entrances:            c.entrances.map(e => ({ ...e })),
         targetRatio:          { ...c.targetRatio },
         computedAllocation:   { ...c.computedAllocation },
         taskCensus:           { ...c.taskCensus },
@@ -71,6 +83,18 @@ function serializeWorldState(w: WorldState): string {
     pheromoneGrids: Object.keys(w.pheromoneGrids).sort().reduce((acc, k) => {
       const g = w.pheromoneGrids[k]!;
       acc[k] = { width: g.width, height: g.height, data: Array.from(g.data) };
+      return acc;
+    }, {} as Record<string, unknown>),
+    // Phase 7: underground grids
+    undergroundGrids: Object.keys(w.undergroundGrids).sort().reduce((acc, k) => {
+      const g = w.undergroundGrids[Number(k) as ColonyId]!;
+      acc[k] = { width: g.width, height: g.height, data: Array.from(g.data) };
+      return acc;
+    }, {} as Record<string, unknown>),
+    // Phase 7: food piles and pending chambers
+    foodPiles: w.foodPiles.map(p => ({ ...p })),
+    pendingChambers: Object.keys(w.pendingChambers).sort().reduce((acc, k) => {
+      acc[k] = { ...w.pendingChambers[k]! };
       return acc;
     }, {} as Record<string, unknown>),
   });
@@ -94,6 +118,10 @@ function buildWorld(seed: number): { world: WorldState; queenId: number; colonyI
   });
   world.colonies[1] = createColonyRecord(1, queenId);
   world.colonies[1]!.foodStored = 100000;
+  // Phase 3 PRD §2a caller-side extension fields (factory does not set these):
+  world.colonies[1]!.entrances         = [];
+  world.colonies[1]!.rallyPoint        = null;
+  world.colonies[1]!.digFlowFieldDirty = false;
   world.pheromoneGrids[pheromoneGridKey(1, PheromoneType.FoodTrail, 'surface')] =
     createPheromoneGrid(64, 64);
   return { world, queenId, colonyId: 1 as ColonyId };
@@ -346,6 +374,41 @@ describe('Phase 6 SC 4: CTRL-04 one-tick immediate allocation', () => {
 // ---------------------------------------------------------------------------
 // No-allocation invariant (object-identity proof)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Phase 7: createScenario determinism proof
+// ---------------------------------------------------------------------------
+
+describe('Phase 7: createScenario determinism with MarkDigTile commands', () => {
+  // Test 11: createScenario(42) + 100 ticks with MarkDigTile commands → byte-identical across two runs
+  it('Test 11: createScenario(42) × 100 ticks with MarkDigTile — byte-for-byte identical', () => {
+    const colonyId = PLAYER_COLONY_ID as ColonyId;
+
+    // Build a fixed command schedule: mark several tiles at specific ticks
+    const cmds: SimCommand[][] = [];
+    cmds[0]  = [{ type: 'MarkDigTile', colonyId, tileX: 10, tileY: 5, issuedAtTick: 0 }];
+    cmds[10] = [{ type: 'MarkDigTile', colonyId, tileX: 15, tileY: 8, issuedAtTick: 10 }];
+    cmds[20] = [{ type: 'MarkDigTile', colonyId, tileX: 20, tileY: 10, issuedAtTick: 20 }];
+    cmds[30] = [{ type: 'CancelDigMark', colonyId, tileX: 10, tileY: 5, issuedAtTick: 30 }];
+    cmds[50] = [{
+      type: 'SetBehaviorRatio', colonyId,
+      ratio: { forage: 0, dig: 10, fight: 0 },
+      issuedAtTick: 50,
+    }];
+
+    function runScenario(): string {
+      const world = createScenario(42);
+      for (let t = 0; t < 100; t++) {
+        tick(world, cmds[t] ?? []);
+      }
+      return serializeWorldState(world);
+    }
+
+    const r1 = runScenario();
+    const r2 = runScenario();
+    expect(r1).toBe(r2);
+  });
+});
 
 describe('No-allocation invariant: object identity in steady state', () => {
   // Test 10: targetRatio, computedAllocation, taskCensus are mutated in-place (not replaced)
