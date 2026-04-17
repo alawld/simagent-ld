@@ -126,3 +126,89 @@ export const DEFAULT_BEHAVIOR_RATIO = {
   dig:    0,
   fight:  0,
 } as const;
+
+// ---------------------------------------------------------------------------
+// Phase 7: Excavation & Terrain
+// ---------------------------------------------------------------------------
+
+/** Phase 7 PRD §2d — Ticks required to excavate one underground tile. 0.5s at 20 Hz. */
+export const DIG_TICKS_PER_TILE = 10;
+
+/** Phase 7 PRD §3 — Number of shaft tiles (tileY=0 and tileY=1) that must be Open for an entrance to open. */
+export const ENTRANCE_SHAFT_DEPTH = 2;
+
+/** Phase 7 PRD §3 — Maximum number of entrances a single colony may have. */
+export const MAX_ENTRANCES_PER_COLONY = 4;
+
+// ---------------------------------------------------------------------------
+// Phase 7: Scenario Generation
+// ---------------------------------------------------------------------------
+
+/** Phase 7 PRD §6a — ColonyId for the player's colony. */
+export const PLAYER_COLONY_ID = 1;
+
+/** Phase 7 PRD §6a — ColonyId for the enemy colony. */
+export const ENEMY_COLONY_ID = 2;
+
+/** Phase 7 PRD §6b — Player colony starting tile X on the surface grid. */
+export const PLAYER_START_X = 24;
+
+/** Phase 7 PRD §6b — Player colony starting tile Y on the surface grid. */
+export const PLAYER_START_Y = 64;
+
+/** Phase 7 PRD §6b — Enemy colony starting tile X on the surface grid. */
+export const ENEMY_START_X = 104;
+
+/** Phase 7 PRD §6b — Enemy colony starting tile Y on the surface grid. */
+export const ENEMY_START_Y = 64;
+
+/** Phase 7 PRD §6b — Starting food units (FP) for each colony. */
+export const STARTING_FOOD = 500;
+
+/** Phase 7 PRD §6b — Number of worker ants each colony starts with. */
+export const STARTING_WORKERS = 3;
+
+// ---------------------------------------------------------------------------
+// Phase 7: Food Pile Scatter
+// ---------------------------------------------------------------------------
+
+/** Phase 7 PRD §6a — Total number of food piles placed at world generation. */
+export const FOOD_PILE_COUNT = 15;
+
+/** Phase 7 PRD §6a — Minimum Manhattan tile distance between a food pile and any colony start. */
+export const FOOD_PILE_MIN_COLONY_DISTANCE = 8;
+
+/** Phase 7 PRD §6a — Minimum Manhattan tile distance between any two food piles. */
+export const FOOD_PILE_MIN_SEPARATION = 12;
+
+/** Phase 7 PRD §6a — Maximum placement attempts before giving up on a food pile. */
+export const FOOD_PILE_MAX_ATTEMPTS = 1000;
+
+// ---------------------------------------------------------------------------
+// Phase 7: Surface Scatter
+// ---------------------------------------------------------------------------
+
+/** Phase 7 PRD §6a — Dirt coverage ratio in 1/256 units (~15% = 38/256). */
+export const DIRT_SCATTER_RATIO_FP = 38;
+
+// ---------------------------------------------------------------------------
+// Phase 7: Chamber dimension constants (canonical values also in chamber.ts CHAMBER_DIMENSIONS)
+// ---------------------------------------------------------------------------
+
+/** Phase 7 PRD §2d — Queen chamber tile width. */
+export const CHAMBER_QUEEN_WIDTH = 5;
+
+/** Phase 7 PRD §2d — Queen chamber tile height. */
+export const CHAMBER_QUEEN_HEIGHT = 3;
+
+/** Phase 7 PRD §2d — Nursery chamber tile width. */
+export const CHAMBER_NURSERY_WIDTH = 4;
+
+/** Phase 7 PRD §2d — Nursery chamber tile height. */
+export const CHAMBER_NURSERY_HEIGHT = 3;
+
+/** Phase 7 PRD §2d — FoodStorage chamber tile width. */
+export const CHAMBER_FOOD_WIDTH = 4;
+
+/** Phase 7 PRD §2d — FoodStorage chamber tile height. */
+export const CHAMBER_FOOD_HEIGHT = 3;
