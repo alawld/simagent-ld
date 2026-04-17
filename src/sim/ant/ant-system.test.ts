@@ -618,7 +618,7 @@ describe('getTaskDirection — dig direction lookup (purity checks)', () => {
   });
 
   it('D-3. dig worker in Excavating → returns {0,0}; digTicksRemaining unchanged (purity check)', () => {
-    const { world, colony, underground } = setupWorldWithUnderground(4, 4);
+    const { world, underground } = setupWorldWithUnderground(4, 4);
     ugSet(underground, 1, 1, UndergroundTileState.BeingDug);
 
     const digFlowFields = createDigFlowFields();

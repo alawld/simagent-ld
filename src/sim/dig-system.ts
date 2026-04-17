@@ -130,6 +130,7 @@ export function computeDigFlowField(
   // Step 3: BFS expansion
   while (head < tail) {
     const idx = queue[head++]!;
+    // eslint-disable-next-line no-restricted-syntax -- integer division via `| 0` truncation; BFS index-to-row conversion, not fixed-point math
     const row = (idx / width) | 0;
     const col = idx % width;
 

@@ -106,9 +106,9 @@ describe('Phase 3 PRD §2a caller-side init contract', () => {
   it('(12) factory returns object where Phase 3 extension fields are undefined before caller assigns', () => {
     const colony = createColonyRecord(1, 42);
     // The factory intentionally does NOT set these — per PRD §2a extension contract
-    expect((colony as Record<string, unknown>)['entrances']).toBeUndefined();
-    expect((colony as Record<string, unknown>)['rallyPoint']).toBeUndefined();
-    expect((colony as Record<string, unknown>)['digFlowFieldDirty']).toBeUndefined();
+    expect((colony as unknown as Record<string, unknown>)['entrances']).toBeUndefined();
+    expect((colony as unknown as Record<string, unknown>)['rallyPoint']).toBeUndefined();
+    expect((colony as unknown as Record<string, unknown>)['digFlowFieldDirty']).toBeUndefined();
   });
 
   it('(13) caller-side assignment: independent entrances arrays and rallyPoint across colonies', () => {

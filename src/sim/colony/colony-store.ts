@@ -159,9 +159,9 @@ export function createColonyRecord(colonyId: ColonyId, queenEntityId: EntityId):
   // intentionally does NOT initialize entrances / rallyPoint / digFlowFieldDirty.
   // Callers MUST assign those three fields immediately after this factory call
   // (see createScenario in Plan 07, and the new-colony fallback in copyWorldState
-  // in Task 2 below). The `as ColonyRecord` assertion reflects that the object is
-  // complete only after the caller assigns the Phase 3 defaults.
-  return {
+  // in Task 2 below). The `as unknown as ColonyRecord` assertion reflects that the
+  // object is complete only after the caller assigns the Phase 3 defaults.
+  return ({
     colonyId,
     queenEntityId,
     queenStarvationTimer:  STARVATION_GRACE_TICKS,
@@ -179,7 +179,7 @@ export function createColonyRecord(colonyId: ColonyId, queenEntityId: EntityId):
     taskCensus:            { nurse: 0, forage: 0, dig: 0, fight: 0 },
     defeated:              false,
     reconcileCountdown:    RECONCILE_INTERVAL_TICKS,
-  } as ColonyRecord;
+  }) as unknown as ColonyRecord;
 }
 
 // ---------------------------------------------------------------------------

@@ -308,7 +308,7 @@ describe('createScenario', () => {
       const player = world.colonies[PLAYER_COLONY_ID]!;
       const enemy  = world.colonies[ENEMY_COLONY_ID]!;
       // Push into player entrances; enemy must remain empty
-      player.entrances.push({ entranceId: 99, tileX: 0, tileY: 0 } as any);
+      player.entrances.push({ entranceId: 99, surfaceTileX: 0, surfaceTileY: 0, isOpen: false });
       expect(enemy.entrances.length).toBe(0);
     });
   });

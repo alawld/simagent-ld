@@ -30,7 +30,7 @@
 
 import type { WorldState } from '../types.js';
 import type { ColonyRecord } from '../colony/colony-store.js';
-import { AntTask, ForagingSubState, DiggingSubState, NursingSubState, ChamberType, PheromoneType } from '../enums.js';
+import { AntTask, ForagingSubState, DiggingSubState, ChamberType, PheromoneType } from '../enums.js';
 import {
   WORKER_CARRY_CAPACITY,
   FOOD_PICKUP_AMOUNT,
@@ -46,7 +46,7 @@ import { Rng } from '../rng.js';
 import { depositFoodTrail, sampleGradient } from '../pheromone/pheromone-system.js';
 import { pheromoneGridKey } from '../pheromone/pheromone-store.js';
 import type { DigFlowFields } from '../dig-system.js';
-import { Zone, UndergroundTileState, ugGet, ugSet } from '../terrain.js';
+import { Zone, UndergroundTileState, ugSet } from '../terrain.js';
 
 // ---------------------------------------------------------------------------
 // Direction tables for dig flow-field to dx/dy conversion
