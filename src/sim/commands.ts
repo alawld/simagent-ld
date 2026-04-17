@@ -1,8 +1,10 @@
 // src/sim/commands.ts
 // SimCommand discriminated union and command queue constants.
 // Phase 5 union is NoOpCommand only; Phase 6 expands to 4-variant union.
+// Phase 7 adds 3 variants: CancelDigMark, PlaceChamber, DesignateEntrance.
 
 import type { ColonyId, BehaviorRatio } from './colony/colony-store.js';
+import type { ChamberType } from './enums.js';
 
 export interface SimCommandBase {
   readonly issuedAtTick: number; // tick-stamped per PRD §5
@@ -35,10 +37,38 @@ export interface MarkFoodPileCommand extends SimCommandBase {
   readonly tileY: number;
 }
 
+/** PRD §3b — player cancels a previously-marked dig tile. */
+export interface CancelDigMarkCommand extends SimCommandBase {
+  readonly type: 'CancelDigMark';
+  readonly colonyId: ColonyId;
+  readonly tileX: number;
+  readonly tileY: number;
+}
+
+/** PRD §3e — player places a chamber at a tunnel end. */
+export interface PlaceChamberCommand extends SimCommandBase {
+  readonly type: 'PlaceChamber';
+  readonly colonyId: ColonyId;
+  readonly chamberType: ChamberType;
+  readonly anchorTileX: number;  // top-left tile X (accepted Phase 3 PRD command shape)
+  readonly anchorTileY: number;  // top-left tile Y
+}
+
+/** PRD §3g — player designates a new nest entrance from the surface. */
+export interface DesignateEntranceCommand extends SimCommandBase {
+  readonly type: 'DesignateEntrance';
+  readonly colonyId: ColonyId;
+  readonly surfaceTileX: number;
+  readonly surfaceTileY: number;
+}
+
 export type SimCommand =
   | NoOpCommand
   | SetBehaviorRatioCommand
   | MarkDigTileCommand
-  | MarkFoodPileCommand;
+  | MarkFoodPileCommand
+  | CancelDigMarkCommand
+  | PlaceChamberCommand
+  | DesignateEntranceCommand;
 
 export const MAX_COMMANDS_PER_TICK = 64; // PRD §5 line 680 — FIFO silent-drop beyond cap

@@ -5,8 +5,12 @@ import {
   type SetBehaviorRatioCommand,
   type MarkDigTileCommand,
   type MarkFoodPileCommand,
+  type CancelDigMarkCommand,
+  type PlaceChamberCommand,
+  type DesignateEntranceCommand,
   MAX_COMMANDS_PER_TICK,
 } from './commands.js';
+import { ChamberType } from './enums.js';
 
 describe('SimCommand', () => {
   describe('NoOpCommand assignability', () => {
@@ -106,10 +110,97 @@ describe('SimCommand', () => {
     });
   });
 
+  describe('CancelDigMarkCommand', () => {
+    it('can be constructed with correct type literal and fields', () => {
+      const cmd: CancelDigMarkCommand = {
+        type: 'CancelDigMark',
+        colonyId: 1,
+        tileX: 15,
+        tileY: 25,
+        issuedAtTick: 20,
+      };
+      expect(cmd.type).toBe('CancelDigMark');
+      expect(cmd.colonyId).toBe(1);
+      expect(cmd.tileX).toBe(15);
+      expect(cmd.tileY).toBe(25);
+      expect(cmd.issuedAtTick).toBe(20);
+    });
+
+    it('is assignable to SimCommand union', () => {
+      const cmd: SimCommand = {
+        type: 'CancelDigMark',
+        colonyId: 2,
+        tileX: 10,
+        tileY: 20,
+        issuedAtTick: 5,
+      };
+      expect(cmd.type).toBe('CancelDigMark');
+    });
+  });
+
+  describe('PlaceChamberCommand', () => {
+    it('can be constructed with correct type literal and fields', () => {
+      const cmd: PlaceChamberCommand = {
+        type: 'PlaceChamber',
+        colonyId: 1,
+        chamberType: ChamberType.Nursery,
+        anchorTileX: 8,
+        anchorTileY: 12,
+        issuedAtTick: 30,
+      };
+      expect(cmd.type).toBe('PlaceChamber');
+      expect(cmd.colonyId).toBe(1);
+      expect(cmd.chamberType).toBe(ChamberType.Nursery);
+      expect(cmd.anchorTileX).toBe(8);
+      expect(cmd.anchorTileY).toBe(12);
+      expect(cmd.issuedAtTick).toBe(30);
+    });
+
+    it('is assignable to SimCommand union', () => {
+      const cmd: SimCommand = {
+        type: 'PlaceChamber',
+        colonyId: 1,
+        chamberType: ChamberType.FoodStorage,
+        anchorTileX: 5,
+        anchorTileY: 10,
+        issuedAtTick: 7,
+      };
+      expect(cmd.type).toBe('PlaceChamber');
+    });
+  });
+
+  describe('DesignateEntranceCommand', () => {
+    it('can be constructed with correct type literal and fields', () => {
+      const cmd: DesignateEntranceCommand = {
+        type: 'DesignateEntrance',
+        colonyId: 1,
+        surfaceTileX: 24,
+        surfaceTileY: 64,
+        issuedAtTick: 50,
+      };
+      expect(cmd.type).toBe('DesignateEntrance');
+      expect(cmd.colonyId).toBe(1);
+      expect(cmd.surfaceTileX).toBe(24);
+      expect(cmd.surfaceTileY).toBe(64);
+      expect(cmd.issuedAtTick).toBe(50);
+    });
+
+    it('is assignable to SimCommand union', () => {
+      const cmd: SimCommand = {
+        type: 'DesignateEntrance',
+        colonyId: 2,
+        surfaceTileX: 104,
+        surfaceTileY: 64,
+        issuedAtTick: 12,
+      };
+      expect(cmd.type).toBe('DesignateEntrance');
+    });
+  });
+
   describe('discriminated union type narrowing', () => {
-    it('switch-case on cmd.type narrows to each variant correctly', () => {
+    it('7-variant exhaustive switch: all variants handled, default never arm compiles', () => {
       // This function's type correctness is validated by TypeScript at compile time.
-      // The runtime test verifies the discriminant values are correct.
+      // The runtime test verifies the discriminant values are correct for all 7 variants.
       function handleCommand(cmd: SimCommand): string {
         switch (cmd.type) {
           case 'NoOp':
@@ -120,6 +211,12 @@ describe('SimCommand', () => {
             return `dig:${cmd.tileX},${cmd.tileY}`;
           case 'MarkFoodPile':
             return `food:${cmd.tileX},${cmd.tileY}`;
+          case 'CancelDigMark':
+            return `cancel:${cmd.tileX},${cmd.tileY}`;
+          case 'PlaceChamber':
+            return `chamber:${cmd.anchorTileX},${cmd.anchorTileY}:type${cmd.chamberType}`;
+          case 'DesignateEntrance':
+            return `entrance:${cmd.surfaceTileX},${cmd.surfaceTileY}`;
           default: {
             // Exhaustive check — TypeScript will error here if a variant is unhandled
             const _exhaustive: never = cmd;
@@ -132,6 +229,9 @@ describe('SimCommand', () => {
       expect(handleCommand({ type: 'SetBehaviorRatio', colonyId: 1, ratio: { forage: 5, dig: 3, fight: 2 }, issuedAtTick: 1 })).toBe('ratio:1');
       expect(handleCommand({ type: 'MarkDigTile', colonyId: 1, tileX: 4, tileY: 8, issuedAtTick: 2 })).toBe('dig:4,8');
       expect(handleCommand({ type: 'MarkFoodPile', colonyId: 1, tileX: 12, tileY: 16, issuedAtTick: 3 })).toBe('food:12,16');
+      expect(handleCommand({ type: 'CancelDigMark', colonyId: 1, tileX: 5, tileY: 9, issuedAtTick: 4 })).toBe('cancel:5,9');
+      expect(handleCommand({ type: 'PlaceChamber', colonyId: 1, chamberType: ChamberType.Queen, anchorTileX: 3, anchorTileY: 7, issuedAtTick: 5 })).toBe('chamber:3,7:type0');
+      expect(handleCommand({ type: 'DesignateEntrance', colonyId: 1, surfaceTileX: 20, surfaceTileY: 64, issuedAtTick: 6 })).toBe('entrance:20,64');
     });
   });
 
