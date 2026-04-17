@@ -4,7 +4,7 @@
 // Phase 5 scope: four fields (tick, rngState, nextEntityId, commandQueue).
 // Phase 6 adds ants (AntComponents), colonies (Record<ColonyId, ColonyRecord>),
 // pheromoneGrids (Record<string, PheromoneGrid>).
-// Phase 7 adds terrain.
+// Phase 7 adds terrain (surface, undergroundGrids), foodPiles, pendingChambers.
 import type { SimCommand } from './commands.js';
 import type { AntComponents } from './ant/ant-store.js';
 import { createAntComponents } from './ant/ant-store.js';
@@ -12,7 +12,11 @@ import type { ColonyId, ColonyRecord } from './colony/colony-store.js';
 import { createColonyRecord } from './colony/colony-store.js';
 import type { PheromoneGrid } from './pheromone/pheromone-store.js';
 import { createPheromoneGrid } from './pheromone/pheromone-store.js';
-import { MAX_ENTITIES } from './constants.js';
+import type { SurfaceGrid, UndergroundGrid } from './terrain.js';
+import { createSurfaceGrid, createUndergroundGrid } from './terrain.js';
+import type { FoodPile } from './food.js';
+import type { PendingChamber } from './colony/chamber.js';
+import { MAX_ENTITIES, SURFACE_GRID_WIDTH, SURFACE_GRID_HEIGHT } from './constants.js';
 
 export type EntityId = number; // incrementing counter from 0, no recycling per PRD §1/§3
 
@@ -23,9 +27,15 @@ export interface WorldState {
   commandQueue: SimCommand[]; // staging seam — drained by platform accumulator between ticks
 
   // Phase 6 additions (PRD §3):
-  ants: AntComponents;                          // SoA ant component storage — 11 parallel Int32Arrays
+  ants: AntComponents;                          // SoA ant component storage — 17 parallel Int32Arrays
   colonies: Record<ColonyId, ColonyRecord>;     // per-colony state keyed by integer ColonyId
   pheromoneGrids: Record<string, PheromoneGrid>; // pheromone intensity grids keyed by pheromoneGridKey()
+
+  // Phase 7 additions (PRD §2e):
+  surface: SurfaceGrid;                                    // shared surface terrain (SURF-01)
+  undergroundGrids: Record<ColonyId, UndergroundGrid>;     // per-colony underground (UNDR-08)
+  foodPiles: FoodPile[];                                   // static food sources on surface (SURF-02)
+  pendingChambers: Record<string, PendingChamber>;         // keyed by `${colonyId}:${anchorTileX}:${anchorTileY}` (PRD §2d)
 }
 
 /**
@@ -43,6 +53,11 @@ export function createWorldState(seed: number, maxEntities: number = MAX_ENTITIE
     ants: createAntComponents(maxEntities),
     colonies: {},
     pheromoneGrids: {},
+    // Phase 7 defaults:
+    surface: createSurfaceGrid(SURFACE_GRID_WIDTH, SURFACE_GRID_HEIGHT),
+    undergroundGrids: {},
+    foodPiles: [],
+    pendingChambers: {},    // empty Record; PlaceChamberCommand creates entries
   };
 }
 
@@ -66,7 +81,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   dst.nextEntityId = src.nextEntityId;
   dst.commandQueue = src.commandQueue.slice(); // small in practice (user-input rate) — PRD §3 accepts this as the only Phase 1 allocation
 
-  // --- AntComponents: 11 TypedArray.set calls (zero allocation) ---
+  // --- AntComponents: 17 TypedArray.set calls (zero allocation) ---
   dst.ants.posX.set(src.ants.posX);
   dst.ants.posY.set(src.ants.posY);
   dst.ants.colonyId.set(src.ants.colonyId);
@@ -78,6 +93,13 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   dst.ants.age.set(src.ants.age);
   dst.ants.alive.set(src.ants.alive);
   dst.ants.lifespan.set(src.ants.lifespan);
+  // Phase 7 ant fields:
+  dst.ants.zone.set(src.ants.zone);
+  dst.ants.digTileX.set(src.ants.digTileX);
+  dst.ants.digTileY.set(src.ants.digTileY);
+  dst.ants.digTicksRemaining.set(src.ants.digTicksRemaining);
+  dst.ants.targetPosX.set(src.ants.targetPosX);
+  dst.ants.targetPosY.set(src.ants.targetPosY);
 
   // --- colonies: delete stale dst keys; upsert each src colony ---
   // Remove dst colonies that no longer exist in src
@@ -94,6 +116,11 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
     // Create dst colony if absent (allocates once per colony, zero in steady state)
     if (!(colonyId in dst.colonies)) {
       dst.colonies[colonyId] = createColonyRecord(s.colonyId, s.queenEntityId);
+      // Phase 3 PRD §2a caller-side extension defaults (factory does not set these):
+      const fresh = dst.colonies[colonyId]!;
+      fresh.entrances         = [];
+      fresh.rallyPoint        = null;
+      fresh.digFlowFieldDirty = false;
     }
     const d = dst.colonies[colonyId]!;
 
@@ -153,6 +180,31 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
     d.taskCensus.forage            = s.taskCensus.forage;
     d.taskCensus.dig               = s.taskCensus.dig;
     d.taskCensus.fight             = s.taskCensus.fight;
+
+    // Phase 3 extension fields — typed copies (no `as any` — fields are required on interface)
+
+    // entrances — reuse dst array, truncate/extend, field-by-field copy each NestEntrance
+    while (d.entrances.length > s.entrances.length) d.entrances.pop();
+    for (let i = 0; i < s.entrances.length; i++) {
+      if (i < d.entrances.length) {
+        Object.assign(d.entrances[i]!, s.entrances[i]!);
+      } else {
+        d.entrances.push(Object.assign({}, s.entrances[i]!));
+      }
+    }
+
+    // rallyPoint — null-aware copy (avoid object churn when both sides are already null or both are objects)
+    if (s.rallyPoint === null) {
+      d.rallyPoint = null;
+    } else if (d.rallyPoint === null) {
+      d.rallyPoint = { tileX: s.rallyPoint.tileX, tileY: s.rallyPoint.tileY };
+    } else {
+      d.rallyPoint.tileX = s.rallyPoint.tileX;
+      d.rallyPoint.tileY = s.rallyPoint.tileY;
+    }
+
+    // digFlowFieldDirty — boolean assignment
+    d.digFlowFieldDirty = s.digFlowFieldDirty;
   }
 
   // --- pheromoneGrids: delete stale dst keys; upsert each src grid ---
@@ -173,6 +225,49 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
 
     // Int32Array.set — zero allocation
     dstGrid.data.set(srcGrid.data);
+  }
+
+  // --- Phase 7: surface grid ---
+  // Uint8Array.set — zero allocation; dimensions are fixed at world creation
+  dst.surface.data.set(src.surface.data);
+
+  // --- Phase 7: undergroundGrids — same delete-stale + upsert pattern as pheromoneGrids ---
+  for (const key in dst.undergroundGrids) {
+    if (!(key in src.undergroundGrids)) {
+      delete dst.undergroundGrids[key as unknown as ColonyId];
+    }
+  }
+  for (const key in src.undergroundGrids) {
+    const colonyId = key as unknown as ColonyId;
+    const srcGrid = src.undergroundGrids[colonyId]!;
+    if (!(colonyId in dst.undergroundGrids)) {
+      dst.undergroundGrids[colonyId] = createUndergroundGrid(srcGrid.width, srcGrid.height);
+    }
+    dst.undergroundGrids[colonyId]!.data.set(srcGrid.data);
+  }
+
+  // --- Phase 7: foodPiles — length-adjust + field-by-field copy (reuse objects in steady state) ---
+  while (dst.foodPiles.length > src.foodPiles.length) dst.foodPiles.pop();
+  for (let i = 0; i < src.foodPiles.length; i++) {
+    if (i < dst.foodPiles.length) {
+      Object.assign(dst.foodPiles[i]!, src.foodPiles[i]!);
+    } else {
+      dst.foodPiles.push(Object.assign({}, src.foodPiles[i]!));
+    }
+  }
+
+  // --- Phase 7: pendingChambers — same delete-stale + upsert pattern as pheromoneGrids ---
+  for (const key in dst.pendingChambers) {
+    if (!(key in src.pendingChambers)) {
+      delete dst.pendingChambers[key];
+    }
+  }
+  for (const key in src.pendingChambers) {
+    if (!(key in dst.pendingChambers)) {
+      dst.pendingChambers[key] = Object.assign({}, src.pendingChambers[key]!);
+    } else {
+      Object.assign(dst.pendingChambers[key]!, src.pendingChambers[key]!);
+    }
   }
 }
 
