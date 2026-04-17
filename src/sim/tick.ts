@@ -28,6 +28,12 @@ import {
   tickAntMovement,
 } from './ant/ant-system.js';
 import { tickPheromoneDecay } from './pheromone/pheromone-system.js';
+import { createDigFlowFields } from './dig-system.js';
+
+// Temporary stub DigFlowFields for Plan 06 — Plan 08 (scenario setup) will wire the proper
+// scenario-level instance so that tickDigExecution and tickAntMovement share the same cache.
+// Created once at module load; fields/queues populated lazily by ensureDigFlowField in step 9.
+const _stubDigFlowFields = createDigFlowFields();
 
 /**
  * Advance the simulation by one tick — 13-step PRD §8a dispatcher.
@@ -251,7 +257,7 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   // ---------------------------------------------------------------------------
   // Step 12: Movement (passes the reconstructed rng for deterministic forager gradient sampling)
   // ---------------------------------------------------------------------------
-  tickAntMovement(world, rng);
+  tickAntMovement(world, rng, _stubDigFlowFields);
 
   // ---------------------------------------------------------------------------
   // Step 13: rngState writeback (BEFORE tick increment per PRD §4 serialization contract)

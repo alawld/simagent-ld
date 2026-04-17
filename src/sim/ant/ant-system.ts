@@ -620,7 +620,7 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         const tileY = posY >> FP_SHIFT;
         const colonyId = ants.colonyId[id]!;
         const colony = world.colonies[colonyId];
-        if (colony) {
+        if (colony && colony.entrances) {
           for (let e = 0; e < colony.entrances.length; e++) {
             const entrance = colony.entrances[e]!;
             if (entrance.isOpen && entrance.surfaceTileX === tileX && entrance.surfaceTileY === tileY) {
@@ -644,7 +644,7 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         if (tileY === 0) {
           const colonyId = ants.colonyId[id]!;
           const colony = world.colonies[colonyId];
-          if (colony) {
+          if (colony && colony.entrances) {
             for (let e = 0; e < colony.entrances.length; e++) {
               const entrance = colony.entrances[e]!;
               if (entrance.isOpen && entrance.surfaceTileX === tileX) {
