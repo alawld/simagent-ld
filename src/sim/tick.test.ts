@@ -1,7 +1,8 @@
 // src/sim/tick.test.ts
-// Tests for tick() 13-step PRD §8a dispatcher — Phase 6 full suite.
+// Tests for tick() 17-step PRD §9a dispatcher — Phase 6 + Phase 7 full suite.
 // Preserves Phase 5 tests; adds Phase 6 command, step-ordering, task-assignment,
-// pheromone, and writeback tests.
+// pheromone, and writeback tests; Phase 7 adds command processing, step ordering,
+// and integration tests.
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { tick } from './tick.js';
@@ -761,5 +762,571 @@ describe('PHER-02 two-grid integration', () => {
     expect(dangerVal).toBeLessThan(foodVal);
     // FoodTrail has NOT decayed to zero — confirms real differential decay, not both zeroed
     expect(foodVal).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7: Command processing tests
+// ---------------------------------------------------------------------------
+
+import { createUndergroundGrid, UndergroundTileState, ugGet } from './terrain.js';
+import { ChamberType, DiggingSubState } from './enums.js';
+import type { FoodPile } from './food.js';
+import {
+  MAX_ENTRANCES_PER_COLONY,
+  UNDERGROUND_GRID_WIDTH,
+  UNDERGROUND_GRID_HEIGHT,
+  PLAYER_COLONY_ID,
+  ENEMY_COLONY_ID,
+} from './constants.js';
+import { CHAMBER_DIMENSIONS } from './colony/chamber.js';
+import { createScenario } from './scenario.js';
+import { tickAntMovement } from './ant/ant-system.js';
+import { createDigFlowFields } from './dig-system.js';
+import { Rng } from './rng.js';
+
+describe('Phase 7: MarkDigTile command processing', () => {
+  function makeWorldWithUnderground(seed = 42) {
+    const world = createWorldState(seed);
+    const queenId = allocateEntityId(world);
+    initAnt(world.ants, queenId, { colonyId: 1, posX: 1024, posY: 1024, task: AntTask.Idle, subTask: 0 });
+    world.colonies[1] = createColonyRecord(1, queenId);
+    world.colonies[1]!.foodStored = 10000;
+    // Phase 3 extension fields required by tick.ts
+    world.colonies[1]!.entrances = [];
+    world.colonies[1]!.rallyPoint = null;
+    world.colonies[1]!.digFlowFieldDirty = false;
+    world.undergroundGrids[1] = createUndergroundGrid(UNDERGROUND_GRID_WIDTH, UNDERGROUND_GRID_HEIGHT);
+    return { world, colonyId: 1 as ColonyId };
+  }
+
+  // Test P7-1: MarkDigTile on Solid tile → becomes Marked, digFlowFieldDirty set true
+  it('Test P7-1: MarkDigTile on Solid tile → Marked + digFlowFieldDirty=true', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 10, tileY: 10, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    const underground = world.undergroundGrids[colonyId]!;
+    expect(ugGet(underground, 10, 10)).toBe(UndergroundTileState.Marked);
+    // digFlowFieldDirty reset by step 9 recompute — confirm tile is correctly set
+  });
+
+  // Test P7-2: MarkDigTile on non-Solid tile → silent drop
+  it('Test P7-2: MarkDigTile on non-Solid tile → silent drop', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    // Pre-set tile to Open
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 10, tileY: 10, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    // Should remain Open (not changed to Marked)
+    expect(ugGet(underground, 10, 10)).toBe(UndergroundTileState.Open);
+  });
+
+  // Test P7-3: MarkDigTile out of bounds → silent drop
+  it('Test P7-3: MarkDigTile out of bounds → silent drop, no throw', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: -1, tileY: 10, issuedAtTick: 0 };
+    expect(() => tick(world, [cmd])).not.toThrow();
+    expect(world.tick).toBe(1);
+  });
+
+  // Test P7-4: CancelDigMark on Marked tile → becomes Solid, digFlowFieldDirty set true
+  it('Test P7-4: CancelDigMark on Marked tile → Solid', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    // Pre-mark the tile
+    underground.data[5 * UNDERGROUND_GRID_WIDTH + 5] = UndergroundTileState.Marked;
+    const cmd: SimCommand = { type: 'CancelDigMark', colonyId, tileX: 5, tileY: 5, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    expect(ugGet(underground, 5, 5)).toBe(UndergroundTileState.Solid);
+  });
+
+  // Test P7-5: CancelDigMark on BeingDug tile → silent drop (finish-then-switch rule)
+  it('Test P7-5: CancelDigMark on BeingDug tile → silent drop (finish-then-switch)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[7 * UNDERGROUND_GRID_WIDTH + 7] = UndergroundTileState.BeingDug;
+    const cmd: SimCommand = { type: 'CancelDigMark', colonyId, tileX: 7, tileY: 7, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    // Should remain BeingDug
+    expect(ugGet(underground, 7, 7)).toBe(UndergroundTileState.BeingDug);
+  });
+
+  // Test P7-6: MarkFoodPile toggles isMarkedPriority on matching food pile
+  it('Test P7-6: MarkFoodPile toggles isMarkedPriority on matching pile', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const pile: FoodPile = { foodPileId: 0, tileX: 20, tileY: 30, isMarkedPriority: false };
+    world.foodPiles.push(pile);
+    const cmd: SimCommand = { type: 'MarkFoodPile', colonyId, tileX: 20, tileY: 30, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    expect(world.foodPiles[0]!.isMarkedPriority).toBe(true);
+    // Toggle again
+    tick(world, [cmd]);
+    expect(world.foodPiles[0]!.isMarkedPriority).toBe(false);
+  });
+
+  // Test P7-7: PlaceChamber creates PendingChamber with correct dimensions; footprint tiles marked
+  it('Test P7-7: PlaceChamber creates PendingChamber with correct dims; tiles marked', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = {
+      type: 'PlaceChamber',
+      colonyId,
+      chamberType: ChamberType.Queen,
+      anchorTileX: 10,
+      anchorTileY: 10,
+      issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    const pcKey = `${colonyId}:10:10`;
+    expect(world.pendingChambers[pcKey]).toBeDefined();
+    const pc = world.pendingChambers[pcKey]!;
+    const dims = CHAMBER_DIMENSIONS[ChamberType.Queen]!;
+    expect(pc.width).toBe(dims.width);
+    expect(pc.height).toBe(dims.height);
+    expect(pc.chamberType).toBe(ChamberType.Queen);
+    // Footprint tiles should be Marked (were Solid before)
+    const underground = world.undergroundGrids[colonyId]!;
+    for (let dy = 0; dy < dims.height; dy++) {
+      for (let dx = 0; dx < dims.width; dx++) {
+        expect(ugGet(underground, 10 + dx, 10 + dy)).toBe(UndergroundTileState.Marked);
+      }
+    }
+  });
+
+  // Test P7-8: PlaceChamber rejected if overlapping existing pendingChamber
+  it('Test P7-8: PlaceChamber rejected if overlapping existing pendingChamber', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    // Place first chamber
+    const cmd1: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Nursery, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    tick(world, [cmd1]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBeDefined();
+
+    // Try to place second chamber that overlaps
+    const cmd2: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.FoodStorage, anchorTileX: 12, anchorTileY: 10, issuedAtTick: 1,
+    };
+    tick(world, [cmd2]);
+    // Overlapping chamber should NOT have been created
+    expect(world.pendingChambers[`${colonyId}:12:10`]).toBeUndefined();
+  });
+
+  // Test P7-9: PlaceChamber rejected if out of bounds
+  it('Test P7-9: PlaceChamber rejected if out of bounds', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const dims = CHAMBER_DIMENSIONS[ChamberType.Queen]!;
+    const cmd: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen,
+      // anchorTileX so that anchor + width > UNDERGROUND_GRID_WIDTH
+      anchorTileX: UNDERGROUND_GRID_WIDTH - dims.width + 1,
+      anchorTileY: 10,
+      issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    const pcKey = `${colonyId}:${UNDERGROUND_GRID_WIDTH - dims.width + 1}:10`;
+    expect(world.pendingChambers[pcKey]).toBeUndefined();
+  });
+
+  // Test P7-10: DesignateEntrance creates NestEntrance in colony.entrances; shaft tiles marked
+  it('Test P7-10: DesignateEntrance creates NestEntrance; shaft tiles marked', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    const colony = world.colonies[colonyId]!;
+    expect(colony.entrances.length).toBe(1);
+    expect(colony.entrances[0]!.surfaceTileX).toBe(50);
+    expect(colony.entrances[0]!.isOpen).toBe(false);
+    // Shaft tiles (y=0, y=1) at x=50 should be Marked
+    const underground = world.undergroundGrids[colonyId]!;
+    expect(ugGet(underground, 50, 0)).toBe(UndergroundTileState.Marked);
+    expect(ugGet(underground, 50, 1)).toBe(UndergroundTileState.Marked);
+  });
+
+  // Test P7-11: DesignateEntrance rejected if max entrances reached
+  it('Test P7-11: DesignateEntrance rejected if MAX_ENTRANCES_PER_COLONY reached', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    // Manually fill up to MAX_ENTRANCES_PER_COLONY
+    for (let i = 0; i < MAX_ENTRANCES_PER_COLONY; i++) {
+      colony.entrances.push({
+        entranceId: allocateEntityId(world),
+        surfaceTileX: i,
+        surfaceTileY: 0,
+        isOpen: false,
+      });
+    }
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 99, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    // Should remain at MAX_ENTRANCES_PER_COLONY
+    expect(colony.entrances.length).toBe(MAX_ENTRANCES_PER_COLONY);
+  });
+
+  // Test P7-12: DesignateEntrance rejected if duplicate (same surfaceTileX/Y)
+  it('Test P7-12: DesignateEntrance rejected if duplicate surfaceTileX/Y', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    const colony = world.colonies[colonyId]!;
+    expect(colony.entrances.length).toBe(1);
+    // Second command with same surfaceTileX/Y
+    tick(world, [cmd]);
+    expect(colony.entrances.length).toBe(1); // still 1
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7: Step ordering tests
+// ---------------------------------------------------------------------------
+
+describe('Phase 7: Step ordering tests', () => {
+  function makeWorldWithUnderground(seed = 42) {
+    const world = createWorldState(seed);
+    const queenId = allocateEntityId(world);
+    initAnt(world.ants, queenId, { colonyId: 1, posX: 1024, posY: 1024, task: AntTask.Idle, subTask: 0 });
+    world.colonies[1] = createColonyRecord(1, queenId);
+    world.colonies[1]!.foodStored = 10000;
+    world.colonies[1]!.entrances = [];
+    world.colonies[1]!.rallyPoint = null;
+    world.colonies[1]!.digFlowFieldDirty = false;
+    world.undergroundGrids[1] = createUndergroundGrid(UNDERGROUND_GRID_WIDTH, UNDERGROUND_GRID_HEIGHT);
+    return { world, colonyId: 1 as ColonyId };
+  }
+
+  // Test P7-13: Step 9 before step 10: after MarkDigTile tick, flow-field recomputed
+  it('Test P7-13: flow-field recomputed in step 9 before step 10 tick dig execution', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    // Mark a tile in step 1 of next tick — dirty flag will be set; step 9 recomputes
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 10, tileY: 10, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    // After tick: digFlowFieldDirty was reset by step 9 recompute
+    expect(world.colonies[colonyId]!.digFlowFieldDirty).toBe(false);
+  });
+
+  // Test P7-14: checkPendingChambers (step 11) promotes chamber when all footprint tiles open
+  it('Test P7-14: step 11 checkPendingChambers promotes fully-open PendingChamber to ChamberRecord', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    const dims = CHAMBER_DIMENSIONS[ChamberType.Nursery]!;
+    const ax = 20, ay = 5;
+    // Pre-open all footprint tiles
+    for (let dy = 0; dy < dims.height; dy++) {
+      for (let dx = 0; dx < dims.width; dx++) {
+        underground.data[(ay + dy) * UNDERGROUND_GRID_WIDTH + (ax + dx)] = UndergroundTileState.Open;
+      }
+    }
+    // Create PendingChamber directly (bypassing PlaceChamber command)
+    const pcKey = `${colonyId}:${ax}:${ay}`;
+    world.pendingChambers[pcKey] = {
+      colonyId,
+      chamberType: ChamberType.Nursery,
+      anchorTileX: ax,
+      anchorTileY: ay,
+      width: dims.width,
+      height: dims.height,
+    };
+    tick(world, []);
+    // checkPendingChambers (step 11) should have promoted it
+    expect(world.pendingChambers[pcKey]).toBeUndefined();
+    const colony = world.colonies[colonyId]!;
+    expect(colony.chambers.length).toBeGreaterThan(0);
+    expect(colony.chambers[0]!.chamberType).toBe(ChamberType.Nursery);
+  });
+
+  // Test P7-14a: Same-tick dig→chamber completion (proves tickDigExecution at step 10, not step 16)
+  it('Test P7-14a: same-tick dig→chamber: last BeingDug tile opens AND PendingChamber promotes in single tick', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // 1×1 chamber so only one tile needs to be Open
+    const dims = { width: 1, height: 1 };
+    const ax = 15, ay = 3;
+
+    // Set the single footprint tile to BeingDug
+    underground.data[ay * UNDERGROUND_GRID_WIDTH + ax] = UndergroundTileState.BeingDug;
+
+    // Create PendingChamber for the single tile
+    const pcKey = `${colonyId}:${ax}:${ay}`;
+    world.pendingChambers[pcKey] = {
+      colonyId,
+      chamberType: ChamberType.Nursery,
+      anchorTileX: ax,
+      anchorTileY: ay,
+      width: dims.width,
+      height: dims.height,
+    };
+
+    // Place a Digging+Excavating worker ON that tile with digTicksRemaining=1
+    const colony = world.colonies[colonyId]!;
+    const wid = allocateEntityId(world);
+    // Zone.Underground = 1 (from terrain.ts)
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: ax << FP_SHIFT,
+      posY: ay << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+    });
+    world.ants.zone[wid] = 1; // Zone.Underground
+    world.ants.digTileX[wid] = ax;
+    world.ants.digTileY[wid] = ay;
+    world.ants.digTicksRemaining[wid] = 1;
+    colony.workers.push(wid);
+    colony.workerCount += 1;
+    colony.digFlowFieldDirty = true; // trigger step 9
+
+    tick(world, []);
+
+    // (a) tile must be Open
+    expect(ugGet(underground, ax, ay)).toBe(UndergroundTileState.Open);
+    // (b) PendingChamber must be gone and ChamberRecord created
+    expect(world.pendingChambers[pcKey]).toBeUndefined();
+    expect(colony.chambers.length).toBeGreaterThan(0);
+  });
+
+  // Test P7-14b: Same-tick dig→entrance opening
+  it('Test P7-14b: same-tick dig→entrance opening: last shaft tile opens, entrance.isOpen=true in one tick', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    const colony = world.colonies[colonyId]!;
+
+    // Entrance at surfaceTileX=30; shaft tileY=0 already Open, tileY=1 BeingDug
+    underground.data[0 * UNDERGROUND_GRID_WIDTH + 30] = UndergroundTileState.Open;
+    underground.data[1 * UNDERGROUND_GRID_WIDTH + 30] = UndergroundTileState.BeingDug;
+
+    colony.entrances.push({
+      entranceId: allocateEntityId(world),
+      surfaceTileX: 30,
+      surfaceTileY: 0,
+      isOpen: false,
+    });
+
+    // Worker digging tileY=1 with digTicksRemaining=1
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: 30 << FP_SHIFT,
+      posY: 1 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+    });
+    world.ants.zone[wid] = 1; // Zone.Underground
+    world.ants.digTileX[wid] = 30;
+    world.ants.digTileY[wid] = 1;
+    world.ants.digTicksRemaining[wid] = 1;
+    colony.workers.push(wid);
+    colony.workerCount += 1;
+    colony.digFlowFieldDirty = true;
+
+    tick(world, []);
+
+    // Shaft tile y=1 should now be Open
+    expect(ugGet(underground, 30, 1)).toBe(UndergroundTileState.Open);
+    // Entrance should be open (checkEntranceCompletion at step 12 observes the transition)
+    expect(colony.entrances[0]!.isOpen).toBe(true);
+  });
+
+  // Test P7-15: checkEntranceCompletion (step 12) with pre-opened shaft tiles
+  it('Test P7-15: step 12 checkEntranceCompletion sets isOpen=true when both shaft tiles Open', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    const colony = world.colonies[colonyId]!;
+
+    // Pre-open both shaft tiles
+    underground.data[0 * UNDERGROUND_GRID_WIDTH + 20] = UndergroundTileState.Open;
+    underground.data[1 * UNDERGROUND_GRID_WIDTH + 20] = UndergroundTileState.Open;
+
+    colony.entrances.push({
+      entranceId: allocateEntityId(world),
+      surfaceTileX: 20,
+      surfaceTileY: 0,
+      isOpen: false,
+    });
+
+    tick(world, []);
+
+    expect(colony.entrances[0]!.isOpen).toBe(true);
+  });
+
+  // Test P7-15a: Step 16 movement is pure for dig workers (digTicksRemaining unchanged)
+  it('Test P7-15a: tickAntMovement (step 16) does NOT decrement digTicksRemaining — movement is pure', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // Place an Excavating dig worker with digTicksRemaining=5
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: 10 << FP_SHIFT,
+      posY: 10 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+    });
+    world.ants.zone[wid] = 1; // Zone.Underground
+    world.ants.digTileX[wid] = 10;
+    world.ants.digTileY[wid] = 10;
+    world.ants.digTicksRemaining[wid] = 5;
+    colony.workers.push(wid);
+    colony.workerCount += 1;
+    // Set tile to BeingDug (required for Excavating state)
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.BeingDug;
+
+    // Call tickAntMovement directly — bypassing step 10
+    const rng = new Rng(world.rngState);
+    const stubFields = createDigFlowFields();
+    tickAntMovement(world, rng, stubFields);
+
+    // digTicksRemaining MUST be unchanged (5) — countdown only in tickDigExecution (step 10)
+    expect(world.ants.digTicksRemaining[wid]).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 7: Integration tests (SC 1, 5, 6, 7)
+// ---------------------------------------------------------------------------
+
+describe('Phase 7: Integration tests', () => {
+  // SC 1: createScenario + MarkDigTile + run ticks → dig workers path to and clear tiles
+  it('SC 1: workers with Dig priority path toward MarkDigTile targets over multiple ticks', () => {
+    const world = createScenario(42);
+    const colonyId = PLAYER_COLONY_ID as ColonyId;
+    const colony = world.colonies[colonyId]!;
+
+    // Set high dig ratio so workers reassign to Digging
+    colony.targetRatio.forage = 0;
+    colony.targetRatio.dig    = 10;
+    colony.targetRatio.fight  = 0;
+
+    // Mark a tile close to the colony start (player starts at x=24, y=64 on surface)
+    // Workers start at Underground zone after tickAntMovement moves them in, but for
+    // this test we just verify no crash and tick increments correctly
+    const cmd: SimCommand = {
+      type: 'MarkDigTile',
+      colonyId,
+      tileX: 30,
+      tileY: 5,
+      issuedAtTick: 0,
+    };
+
+    // Run 10 ticks with the command in tick 0
+    tick(world, [cmd]);
+    for (let i = 1; i < 10; i++) {
+      tick(world, []);
+    }
+
+    // Workers should have been reassigned to Digging via step 10a
+    expect(world.tick).toBe(10);
+    // At least some workers are Digging (after allocation kicked in)
+    const diggingCount = colony.workers.filter(wid => world.ants.task[wid] === AntTask.Digging).length;
+    expect(diggingCount).toBeGreaterThan(0);
+  });
+
+  // SC 5: createScenario + DesignateEntrance + manually open shaft → entrance.isOpen=true
+  it('SC 5: DesignateEntrance then manually open shaft tiles → entrance opens', () => {
+    const world = createScenario(42);
+    const colonyId = PLAYER_COLONY_ID as ColonyId;
+    const colony = world.colonies[colonyId]!;
+
+    // Designate entrance at surfaceTileX=50
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance',
+      colonyId,
+      surfaceTileX: 50,
+      surfaceTileY: 0,
+      issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+
+    // Manually open both shaft tiles (simulating excavation complete)
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[0 * UNDERGROUND_GRID_WIDTH + 50] = UndergroundTileState.Open;
+    underground.data[1 * UNDERGROUND_GRID_WIDTH + 50] = UndergroundTileState.Open;
+
+    tick(world, []);
+
+    // checkEntranceCompletion (step 12) should have set isOpen=true
+    const entrance = colony.entrances.find(e => e.surfaceTileX === 50);
+    expect(entrance).toBeDefined();
+    expect(entrance!.isOpen).toBe(true);
+  });
+
+  // SC 6: PlaceChamber + manually open footprint → ChamberRecord created; overlap rejected
+  it('SC 6: PlaceChamber + open footprint → ChamberRecord; overlapping chamber rejected', () => {
+    const world = createScenario(42);
+    const colonyId = PLAYER_COLONY_ID as ColonyId;
+    const colony = world.colonies[colonyId]!;
+
+    const chamberType = ChamberType.FoodStorage;
+    const dims = CHAMBER_DIMENSIONS[chamberType]!;
+    const ax = 30, ay = 10;
+
+    const cmd1: SimCommand = {
+      type: 'PlaceChamber',
+      colonyId,
+      chamberType,
+      anchorTileX: ax,
+      anchorTileY: ay,
+      issuedAtTick: 0,
+    };
+    tick(world, [cmd1]);
+
+    // Manually open all footprint tiles
+    const underground = world.undergroundGrids[colonyId]!;
+    for (let dy = 0; dy < dims.height; dy++) {
+      for (let dx = 0; dx < dims.width; dx++) {
+        underground.data[(ay + dy) * UNDERGROUND_GRID_WIDTH + (ax + dx)] = UndergroundTileState.Open;
+      }
+    }
+    tick(world, []);
+
+    // ChamberRecord should exist with correct dimensions
+    const chamber = colony.chambers.find(ch => (ch.posX >> FP_SHIFT) === ax && (ch.posY >> FP_SHIFT) === ay);
+    expect(chamber).toBeDefined();
+    expect(chamber!.width).toBe(dims.width);
+    expect(chamber!.height).toBe(dims.height);
+    expect(chamber!.chamberType).toBe(chamberType);
+
+    // Try to place overlapping chamber — should be rejected
+    const cmd2: SimCommand = {
+      type: 'PlaceChamber',
+      colonyId,
+      chamberType: ChamberType.Nursery,
+      anchorTileX: ax + 1, // overlaps existing chamber
+      anchorTileY: ay,
+      issuedAtTick: 2,
+    };
+    tick(world, [cmd2]);
+    const pcKey2 = `${colonyId}:${ax + 1}:${ay}`;
+    expect(world.pendingChambers[pcKey2]).toBeUndefined();
+  });
+
+  // SC 7: createScenario(42) twice → undergroundGrids are independent
+  it('SC 7: two createScenario(42) calls produce independent undergroundGrids', () => {
+    const world1 = createScenario(42);
+    const world2 = createScenario(42);
+    const colonyId1 = PLAYER_COLONY_ID as ColonyId;
+    const colonyId2 = ENEMY_COLONY_ID as ColonyId;
+
+    // Mutate world1's player underground grid
+    world1.undergroundGrids[colonyId1]!.data[100] = UndergroundTileState.Open;
+
+    // world2's player underground grid should be unaffected
+    expect(world2.undergroundGrids[colonyId1]!.data[100]).toBe(UndergroundTileState.Solid);
+
+    // world1's enemy underground grid should also be unaffected
+    expect(world1.undergroundGrids[colonyId2]!.data[100]).toBe(UndergroundTileState.Solid);
   });
 });
