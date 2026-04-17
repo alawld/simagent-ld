@@ -46,7 +46,7 @@ import { Rng } from '../rng.js';
 import { depositFoodTrail, sampleGradient } from '../pheromone/pheromone-system.js';
 import { pheromoneGridKey } from '../pheromone/pheromone-store.js';
 import type { DigFlowFields } from '../dig-system.js';
-import { Zone, UndergroundTileState, ugSet } from '../terrain.js';
+import { Zone, UndergroundTileState, ugGet, ugSet } from '../terrain.js';
 
 // ---------------------------------------------------------------------------
 // Direction tables for dig flow-field to dx/dy conversion
@@ -545,15 +545,64 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
     let dx: number;
     let dy: number;
 
+    // --- PRD §4d Food Storage chamber routing (underground carrying foragers) ---
+    // Underground + Foraging + foodCarrying > 0 → target the nearest OPEN tile
+    // inside any FoodStorage chamber footprint (Manhattan from ant's tile).
+    // If the colony has no FoodStorage chamber, fall through to entrance targeting
+    // below — the ant routes to the underground side of the nearest open entrance
+    // (tileY=0 at entrance column) per PRD §4d fallback.
+    // Tie-break is deterministic: first chamber in colony.chambers array order,
+    // then row-major tile iteration — stable across ticks given stable inputs.
+    let chamberTargetX = -1;
+    let chamberTargetY = -1;
+    let hasFoodStorage = false;
+    if (
+      zone === Zone.Underground &&
+      task === AntTask.Foraging &&
+      foodCarrying > 0
+    ) {
+      const colonyId = ants.colonyId[id]!;
+      const colony = world.colonies[colonyId];
+      const underground = world.undergroundGrids[colonyId];
+      if (colony && underground) {
+        const antTileX = ants.posX[id]! >> FP_SHIFT;
+        const antTileY = ants.posY[id]! >> FP_SHIFT;
+        let bestDist = -1;
+        for (let c = 0; c < colony.chambers.length; c++) {
+          const chamber = colony.chambers[c]!;
+          if (chamber.chamberType !== ChamberType.FoodStorage) continue;
+          hasFoodStorage = true;
+          const baseX = chamber.posX >> FP_SHIFT;
+          const baseY = chamber.posY >> FP_SHIFT;
+          for (let ty = 0; ty < chamber.height; ty++) {
+            for (let tx = 0; tx < chamber.width; tx++) {
+              const cx = baseX + tx;
+              const cy = baseY + ty;
+              if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
+              const dist = Math.abs(cx - antTileX) + Math.abs(cy - antTileY);
+              if (bestDist < 0 || dist < bestDist) {
+                bestDist = dist;
+                chamberTargetX = cx << FP_SHIFT;
+                chamberTargetY = cy << FP_SHIFT;
+              }
+            }
+          }
+        }
+      }
+    }
+
     // --- PRD §5c entrance targeting (zone-transitioning ants) ---
     // Surface→Underground: Digging, Nursing, or Foraging+CarryingFood.
     // Underground→Surface: Foraging+SearchingFood (foodCarrying=0), or Fighting.
+    // Underground+Foraging+CarryingFood falls here ONLY when no FoodStorage chamber
+    // exists (PRD §4d fallback) — target is the underground side of the nearest open
+    // entrance at tileY=0.
     // Target the nearest OPEN entrance (Manhattan; lower entranceId breaks ties).
     // Step overrides any priority target set by routeForagerPriority (step 13) —
     // only SearchingFood surface foragers (non-transitioning) keep that target.
     let entranceTargetX = -1;
     let entranceTargetY = -1;
-    {
+    if (chamberTargetX === -1) {
       let needsTransition = false;
       if (zone === Zone.Surface) {
         needsTransition =
@@ -564,7 +613,10 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         // Zone.Underground
         needsTransition =
           (task === AntTask.Foraging && foodCarrying === 0) ||
-          task === AntTask.Fighting;
+          task === AntTask.Fighting ||
+          // PRD §4d fallback: carrying forager with no FoodStorage chamber routes
+          // to underground side of nearest open entrance.
+          (task === AntTask.Foraging && foodCarrying > 0 && !hasFoodStorage);
       }
 
       if (needsTransition) {
@@ -596,7 +648,20 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
       }
     }
 
-    if (entranceTargetX !== -1) {
+    if (chamberTargetX !== -1) {
+      // PRD §4d: underground carrying forager routes to nearest Open FoodStorage tile.
+      const posX = ants.posX[id]!;
+      const posY = ants.posY[id]!;
+      const rawDx = chamberTargetX - posX;
+      const rawDy = chamberTargetY - posY;
+      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+        dy = 0;
+      } else {
+        dx = 0;
+        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+      }
+    } else if (entranceTargetX !== -1) {
       // Zone-transitioning ant — move toward nearest open entrance.
       const posX = ants.posX[id]!;
       const posY = ants.posY[id]!;

@@ -776,6 +776,8 @@ import {
   MAX_ENTRANCES_PER_COLONY,
   UNDERGROUND_GRID_WIDTH,
   UNDERGROUND_GRID_HEIGHT,
+  SURFACE_GRID_WIDTH,
+  SURFACE_GRID_HEIGHT,
   PLAYER_COLONY_ID,
   ENEMY_COLONY_ID,
 } from './constants.js';
@@ -1522,6 +1524,90 @@ describe('Regression: reviewer P1 fixes', () => {
     };
     tick(world, [cmd]);
     expect(world.colonies[colonyId]!.entrances.length).toBe(0);
+  });
+
+  // --- PRD §4d Food Storage chamber routing (underground carrying foragers) ---
+  it('underground CarryingFood ant routes to nearest Open FoodStorage tile (PRD §4d)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+    // Open a small FoodStorage footprint at (20-23, 10-12)
+    for (let ty = 10; ty <= 12; ty++) {
+      for (let tx = 20; tx <= 23; tx++) {
+        underground.data[ty * UNDERGROUND_GRID_WIDTH + tx] = UndergroundTileState.Open;
+      }
+    }
+    colony.chambers.push({
+      chamberId: 7,
+      chamberType: ChamberType.FoodStorage,
+      foodStored: 0,
+      posX: 20 << FP_SHIFT, posY: 10 << FP_SHIFT,
+      width: 4, height: 3,
+    });
+    // Also open a path from ant position to chamber so nothing else interferes
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId, posX: 10 << FP_SHIFT, posY: 10 << FP_SHIFT,
+      task: AntTask.Foraging, subTask: ForagingSubState.CarryingFood, speed: 1,
+    });
+    world.ants.zone[antId] = 1; // Underground
+    world.ants.foodCarrying[antId] = 5;
+    const x0 = world.ants.posX[antId]!;
+    tickAntMovement(world, new Rng(world.rngState), createDigFlowFields());
+    // Should move +x toward chamber tile at (20,10) — X distance 10, Y distance 0
+    expect(world.ants.posX[antId]!).toBeGreaterThan(x0);
+  });
+
+  it('underground CarryingFood ant with no FoodStorage chamber falls back to entrance', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    // No FoodStorage chamber; add only an entrance at column 40.
+    colony.entrances.push({ entranceId: 1, surfaceTileX: 40, surfaceTileY: 10, isOpen: true });
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId, posX: 10 << FP_SHIFT, posY: 5 << FP_SHIFT,
+      task: AntTask.Foraging, subTask: ForagingSubState.CarryingFood, speed: 1,
+    });
+    world.ants.zone[antId] = 1; // Underground
+    world.ants.foodCarrying[antId] = 5;
+    const x0 = world.ants.posX[antId]!;
+    const y0 = world.ants.posY[antId]!;
+    tickAntMovement(world, new Rng(world.rngState), createDigFlowFields());
+    // Moves toward entrance at (40, 0) underground-side — either +x or -y
+    const dx = world.ants.posX[antId]! - x0;
+    const dy = world.ants.posY[antId]! - y0;
+    expect(dx > 0 || dy < 0).toBe(true);
+  });
+
+  it('chamber target overrides surface pheromone gradient (no spurious surface-grid sampling)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+    // Open a FoodStorage footprint well to the east of the ant
+    for (let ty = 10; ty <= 12; ty++) {
+      for (let tx = 30; tx <= 33; tx++) {
+        underground.data[ty * UNDERGROUND_GRID_WIDTH + tx] = UndergroundTileState.Open;
+      }
+    }
+    colony.chambers.push({
+      chamberId: 9, chamberType: ChamberType.FoodStorage, foodStored: 0,
+      posX: 30 << FP_SHIFT, posY: 10 << FP_SHIFT, width: 4, height: 3,
+    });
+    // Plant a strong surface food-trail gradient to the WEST to prove it's ignored.
+    const surfaceGrid = createPheromoneGrid(SURFACE_GRID_WIDTH, SURFACE_GRID_HEIGHT);
+    phSet(surfaceGrid, 5, 10, 9999);
+    world.pheromoneGrids[pheromoneGridKey(colonyId, PheromoneType.FoodTrail, 'surface')] = surfaceGrid;
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId, posX: 20 << FP_SHIFT, posY: 10 << FP_SHIFT,
+      task: AntTask.Foraging, subTask: ForagingSubState.CarryingFood, speed: 1,
+    });
+    world.ants.zone[antId] = 1; // Underground
+    world.ants.foodCarrying[antId] = 5;
+    const x0 = world.ants.posX[antId]!;
+    tickAntMovement(world, new Rng(world.rngState), createDigFlowFields());
+    // Chamber is east → +x. Surface gradient lure was west → would be -x if the bug were still present.
+    expect(world.ants.posX[antId]!).toBeGreaterThan(x0);
   });
 
   it('DesignateEntrance rejected: another colony already has an entrance there', () => {
