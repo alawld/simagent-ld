@@ -11,6 +11,7 @@
 
 import type { EntityId } from '../types.js';
 import type { ChamberType } from '../enums.js';
+import type { NestEntrance } from './entrance.js';
 import {
   DEFAULT_BEHAVIOR_RATIO,
   STARVATION_GRACE_TICKS,
@@ -76,16 +77,20 @@ export interface ChamberRecord {
 }
 
 // ---------------------------------------------------------------------------
-// ColonyRecord — canonical per-colony state (PRD §2)
+// ColonyRecord — canonical per-colony state (PRD §2 + accepted Phase 3 PRD §2 extensions)
 //
-// Exactly 17 fields — verbatim from PRD §2. No additions.
-//
+// 17 Phase 2 fields + 3 Phase 3 extension fields (entrances, rallyPoint, digFlowFieldDirty).
 // Field inventory:
 //   colonyId, queenEntityId, queenStarvationTimer, foodStored,
 //   workerCount, eggCount, larvaeCount, nurseCount,
 //   eggs, larvae, workers, chambers,
 //   targetRatio, computedAllocation, taskCensus,
-//   defeated, reconcileCountdown
+//   defeated, reconcileCountdown,
+//   entrances, rallyPoint, digFlowFieldDirty      // Phase 3 PRD — caller-side init
+//
+// Per accepted Phase 3 PRD §2a extension contract, createColonyRecord below
+// returns the Phase 2 17-field shape; the caller MUST assign the 3 Phase 3
+// defaults immediately after the factory call.
 // ---------------------------------------------------------------------------
 
 export interface ColonyRecord {
@@ -112,12 +117,30 @@ export interface ColonyRecord {
   taskCensus:            WorkerAllocation;
   defeated:              boolean;
   reconcileCountdown:    number;
+
+  /** Phase 3 PRD §2 — nest entrances (max MAX_ENTRANCES_PER_COLONY = 4). Assigned caller-side (PRD §2a extension contract); the Phase 2 factory body does not initialize this field. */
+  entrances: NestEntrance[];
+
+  /** Phase 3 PRD §2 — current active fight rally point in tile coords, null if unset. Read by Phase 9 fight behavior; Phase 7 does not mutate but must round-trip through copyWorldState. Assigned caller-side per PRD §2a extension contract. */
+  rallyPoint: { tileX: number; tileY: number } | null;
+
+  /** Phase 3 PRD §2 — set true when any tile passability in this colony's underground changes (per research Pitfall 3). Cleared by tick.ts step 9 after flow-field recomputation. Assigned caller-side per PRD §2a extension contract. */
+  digFlowFieldDirty: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // createColonyRecord — factory producing a fresh ColonyRecord (PRD §2 line 455)
 //
-// Default values:
+// IMPORTANT: per accepted Phase 3 PRD §2a, this factory DOES NOT initialize
+// the 3 Phase 3 extension fields (entrances, rallyPoint, digFlowFieldDirty).
+// Callers MUST assign those 3 fields immediately after the factory call:
+//   const colony = createColonyRecord(colonyId, queenEntityId);
+//   colony.entrances        = [];
+//   colony.rallyPoint       = null;
+//   colony.digFlowFieldDirty = false;
+// Callers: createScenario (Plan 07), copyWorldState new-colony fallback (Plan 03 Task 2).
+//
+// Default values (Phase 2 fields):
 //   - foodStored=0, workerCount=0, eggCount=0, larvaeCount=0, nurseCount=0
 //   - eggs/larvae/workers/chambers: empty arrays (fresh per call)
 //   - targetRatio: spread of DEFAULT_BEHAVIOR_RATIO (independent object per colony)
@@ -132,6 +155,12 @@ export interface ColonyRecord {
 // ---------------------------------------------------------------------------
 
 export function createColonyRecord(colonyId: ColonyId, queenEntityId: EntityId): ColonyRecord {
+  // Phase 2 factory body — unchanged. Per accepted Phase 3 PRD §2a, this factory
+  // intentionally does NOT initialize entrances / rallyPoint / digFlowFieldDirty.
+  // Callers MUST assign those three fields immediately after this factory call
+  // (see createScenario in Plan 07, and the new-colony fallback in copyWorldState
+  // in Task 2 below). The `as ColonyRecord` assertion reflects that the object is
+  // complete only after the caller assigns the Phase 3 defaults.
   return {
     colonyId,
     queenEntityId,
@@ -150,7 +179,7 @@ export function createColonyRecord(colonyId: ColonyId, queenEntityId: EntityId):
     taskCensus:            { nurse: 0, forage: 0, dig: 0, fight: 0 },
     defeated:              false,
     reconcileCountdown:    RECONCILE_INTERVAL_TICKS,
-  };
+  } as ColonyRecord;
 }
 
 // ---------------------------------------------------------------------------

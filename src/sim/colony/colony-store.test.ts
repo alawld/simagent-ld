@@ -1,6 +1,6 @@
 // colony-store.test.ts — Vitest tests for colony-store.ts (PRD §2)
 //
-// 11 tests covering:
+// 11 tests covering Phase 2 fields:
 //   (1)  Initial values from createColonyRecord
 //   (2)  Empty bucket arrays
 //   (3)  Fresh targetRatio per colony (independent mutation surface)
@@ -11,7 +11,12 @@
 //   (8)  ChamberRecord field types
 //   (9)  taskCensus is 4-field WorkerAllocation (nurse/forage/dig/fight) — PRD §2 verbatim
 //   (10) No idleCount field (regression guard against prior-revision drift)
-//   (11) ColonyRecord has exactly 17 fields
+//   (11) ColonyRecord Phase 2 factory returns 17 fields (Phase 3 extensions are undefined until caller assigns)
+//
+// Phase 3 PRD §2a caller-side init contract tests:
+//   (12) Factory returns object where Phase 3 extension fields are undefined before caller assigns
+//   (13) Caller-side assignment: independent entrances arrays and rallyPoint across colonies
+//   (14) Phase 2 regression: independent bucket arrays/objects per colony (factory body unchanged guard)
 
 import { describe, it, expect } from 'vitest';
 import { ChamberType } from '../enums.js';
@@ -90,9 +95,72 @@ describe('createColonyRecord', () => {
     expect('idleCount' in r).toBe(false);
   });
 
-  it('(11) ColonyRecord has exactly 17 fields', () => {
+  it('(11) ColonyRecord Phase 2 factory returns 17 fields (Phase 3 extensions are undefined until caller assigns)', () => {
     const r = createColonyRecord(1, 0);
+    // Factory returns exactly 17 Phase 2 fields
     expect(Object.keys(r).length).toBe(17);
+  });
+});
+
+describe('Phase 3 PRD §2a caller-side init contract', () => {
+  it('(12) factory returns object where Phase 3 extension fields are undefined before caller assigns', () => {
+    const colony = createColonyRecord(1, 42);
+    // The factory intentionally does NOT set these — per PRD §2a extension contract
+    expect((colony as Record<string, unknown>)['entrances']).toBeUndefined();
+    expect((colony as Record<string, unknown>)['rallyPoint']).toBeUndefined();
+    expect((colony as Record<string, unknown>)['digFlowFieldDirty']).toBeUndefined();
+  });
+
+  it('(13) caller-side assignment: independent entrances arrays and rallyPoint across colonies', () => {
+    const a = createColonyRecord(1, 0);
+    a.entrances = [];
+    a.rallyPoint = null;
+    a.digFlowFieldDirty = false;
+
+    const b = createColonyRecord(2, 0);
+    b.entrances = [];
+    b.rallyPoint = null;
+    b.digFlowFieldDirty = false;
+
+    // entrances arrays are independent
+    a.entrances.push({ entranceId: 1, surfaceTileX: 10, surfaceTileY: 64, isOpen: false });
+    expect(b.entrances.length).toBe(0);
+
+    // rallyPoint is independent
+    a.rallyPoint = { tileX: 5, tileY: 10 };
+    expect(b.rallyPoint).toBeNull();
+
+    // digFlowFieldDirty is independent
+    a.digFlowFieldDirty = true;
+    expect(b.digFlowFieldDirty).toBe(false);
+  });
+
+  it('(14) Phase 2 regression: independent bucket arrays/objects per colony (factory body unchanged guard)', () => {
+    const a = createColonyRecord(1, 0);
+    const b = createColonyRecord(2, 0);
+
+    // eggs, larvae, workers, chambers must be independent
+    a.eggs.push(100);
+    expect(b.eggs.length).toBe(0);
+
+    a.larvae.push(200);
+    expect(b.larvae.length).toBe(0);
+
+    a.workers.push(300);
+    expect(b.workers.length).toBe(0);
+
+    a.chambers.push({ chamberId: 1, chamberType: 0, foodStored: 0, posX: 0, posY: 0, width: 5, height: 3 });
+    expect(b.chambers.length).toBe(0);
+
+    // targetRatio, computedAllocation, taskCensus must be independent objects
+    a.targetRatio.forage = 99;
+    expect(b.targetRatio.forage).toBe(10);
+
+    a.computedAllocation.nurse = 77;
+    expect(b.computedAllocation.nurse).toBe(0);
+
+    a.taskCensus.dig = 55;
+    expect(b.taskCensus.dig).toBe(0);
   });
 });
 
