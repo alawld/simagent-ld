@@ -14,7 +14,9 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    "lib": ["ES2022", "DOM"],
+    "types": ["phaser", "node"]
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist"]
