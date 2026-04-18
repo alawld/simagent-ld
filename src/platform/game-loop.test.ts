@@ -1,6 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createGameLoop, MS_PER_TICK, MAX_CATCHUP_TICKS } from './game-loop.js';
 import { createWorldState } from '../sim/types.js';
+import type { WorldState } from '../sim/types.js';
 import { GameOutcome } from '../sim/game-over.js';
 import type { SimCommand } from '../sim/commands.js';
 
@@ -129,6 +130,128 @@ describe('commandQueue drain', () => {
 
     expect(calls.length).toBe(1);
     expect(calls[0]!.cmdCount).toBe(100);
+  });
+});
+
+describe('createGameLoop — Phase 8 opts', () => {
+  // ── onBeforeTick ──────────────────────────────────────────────────────────
+
+  it('onBeforeTick is called once per tick that fires', () => {
+    const world = createWorldState(42);
+    const { fn } = makeSpyTick();
+    const spy = vi.fn();
+    const loop = createGameLoop(fn, world, { onBeforeTick: spy });
+
+    loop.update(50);   // 1 tick
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    loop.update(150);  // 3 more ticks
+    expect(spy).toHaveBeenCalledTimes(4);
+  });
+
+  it('onBeforeTick receives the live world reference and fires before commandQueue is spliced', () => {
+    const world = createWorldState(42);
+    const receivedWorld: WorldState[] = [];
+    const queueLengthAtHook: number[] = [];
+    // Push a sentinel command; onBeforeTick should see it still in the queue (splice happens after).
+    world.commandQueue.push({ type: 'NoOp', issuedAtTick: 0 });
+    const { fn } = makeSpyTick();
+    const loop = createGameLoop(fn, world, {
+      onBeforeTick: (w) => {
+        receivedWorld.push(w);
+        queueLengthAtHook.push(w.commandQueue.length);
+      },
+    });
+
+    loop.update(50); // 1 tick
+    expect(receivedWorld[0]).toBe(world);          // same object reference
+    expect(queueLengthAtHook[0]).toBe(1);          // command still present when hook fires
+  });
+
+  it('onBeforeTick is NOT called when no tick fires', () => {
+    const world = createWorldState(42);
+    const { fn } = makeSpyTick();
+    const spy = vi.fn();
+    const loop = createGameLoop(fn, world, { onBeforeTick: spy });
+
+    loop.update(30); // 30 < 50, no tick
+    expect(spy).toHaveBeenCalledTimes(0);
+  });
+
+  // ── getMsPerTick (dynamic) ─────────────────────────────────────────────────
+
+  it('getMsPerTick=()=>100 halves the tick rate', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    const loop = createGameLoop(fn, world, { getMsPerTick: () => 100 });
+
+    loop.update(150); // floor(150/100) = 1 tick; 50ms residual
+    expect(calls.length).toBe(1);
+  });
+
+  it('changing getMsPerTick mid-stream takes effect on next update', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    let mpt = 50;
+    const loop = createGameLoop(fn, world, { getMsPerTick: () => mpt });
+
+    loop.update(50);   // mpt=50 → 1 tick
+    expect(calls.length).toBe(1);
+
+    mpt = 100;
+    loop.update(100);  // mpt=100, acc=0+100 → 1 tick; 0ms residual
+    expect(calls.length).toBe(2);
+
+    loop.update(50);   // mpt=100, acc=0+50 → 0 ticks (50 < 100)
+    expect(calls.length).toBe(2);
+  });
+
+  it('spiral-of-death clamp uses dynamic msPerTick (100×5=500, not old 250)', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    const loop = createGameLoop(fn, world, { getMsPerTick: () => 100 });
+
+    loop.update(10000); // clamp to 100×5=500 → exactly 5 ticks
+    expect(calls.length).toBe(MAX_CATCHUP_TICKS);
+    expect(loop.accumulatorMs).toBe(0);
+  });
+
+  // ── getIsPaused ────────────────────────────────────────────────────────────
+
+  it('getIsPaused=()=>true prevents all ticks and does not accumulate', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    const loop = createGameLoop(fn, world, { getIsPaused: () => true });
+
+    loop.update(1000);
+    expect(calls.length).toBe(0);
+    expect(loop.accumulatorMs).toBe(0);
+  });
+
+  it('toggling pause resumes from zero accumulator', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    let paused = true;
+    const loop = createGameLoop(fn, world, { getIsPaused: () => paused });
+
+    loop.update(1000); // paused → 0 ticks, acc stays 0
+    expect(calls.length).toBe(0);
+
+    paused = false;
+    loop.update(100);  // acc=0+100 → 2 ticks (100/50)
+    expect(calls.length).toBe(2);
+  });
+
+  // ── backward compatibility ─────────────────────────────────────────────────
+
+  it('createGameLoop(tick, world) with no opts behaves identically to original contract', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    const loop = createGameLoop(fn, world); // no opts
+
+    loop.update(10000); // clamp = 50×5=250 → 5 ticks
+    expect(calls.length).toBe(MAX_CATCHUP_TICKS);
+    expect(loop.accumulatorMs).toBe(0);
   });
 });
 
