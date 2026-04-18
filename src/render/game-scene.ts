@@ -29,6 +29,8 @@ import { drawSurface, type GfxLike } from './draw-surface.js';
 import { drawUnderground } from './draw-underground.js';
 import { drawPheromoneOverlay } from './draw-pheromone.js';
 import { processCameraInput, registerDragPan } from '../input/camera-input.js';
+import { registerSurfaceInput } from '../input/surface-input.js';
+import { registerUndergroundInput } from '../input/underground-input.js';
 
 export class GameScene extends Phaser.Scene {
   private world!: WorldState;
@@ -74,6 +76,12 @@ export class GameScene extends Phaser.Scene {
     // Launch HUD scene on top.
     this.scene.launch('UIScene', { viewState: this.viewState, world: this.world });
     this.scene.bringToTop('UIScene');
+
+    // World input dispatchers — internally guard on viewState.activeView.
+    // Both handlers coexist with registerDragPan: Phaser fires all pointerdown
+    // handlers; each guards isPointerOverHUD + activeView so they don't interfere.
+    registerSurfaceInput(this, this.world, this.viewState);
+    registerUndergroundInput(this, this.world, this.viewState);
   }
 
   update(_time: number, delta: number) {
