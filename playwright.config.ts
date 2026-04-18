@@ -18,7 +18,15 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // --disable-gpu prevents WebGL framebuffer errors in headless Chromium
+        // (Phaser falls back to Canvas renderer cleanly without this flag causing
+        //  "Framebuffer status: Framebuffer Unsupported" console errors).
+        launchOptions: {
+          args: ['--disable-gpu'],
+        },
+      },
     },
   ],
   webServer: {

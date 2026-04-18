@@ -29,3 +29,7 @@ coverage/
 
 # Misc
 *.tsbuildinfo
+
+# Playwright E2E artifacts (T-08-18: traces/screenshots must not commit to git)
+test-results/
+playwright-report/
