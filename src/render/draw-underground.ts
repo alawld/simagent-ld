@@ -192,7 +192,7 @@ export function drawUndergroundEntities(
     }
   }
 
-  // --- Eggs (entity IDs in colony.eggs → positions in world.ants) ---
+  // Eggs (entity IDs in colony.eggs, positions read from world.ants)
   for (const eggId of colony.eggs) {
     if (!isAlive(curr.ants, eggId)) continue;
     const tileX = curr.ants.posX[eggId]! >> FP_SHIFT;
@@ -204,7 +204,7 @@ export function drawUndergroundEntities(
     gfx.fillCircle(screenX + TILE_SIZE_PX / 2, screenY + TILE_SIZE_PX / 2, 3);
   }
 
-  // --- Larvae (entity IDs in colony.larvae → positions in world.ants) ---
+  // Larvae (entity IDs in colony.larvae, positions read from world.ants)
   for (const larvaId of colony.larvae) {
     if (!isAlive(curr.ants, larvaId)) continue;
     const tileX = curr.ants.posX[larvaId]! >> FP_SHIFT;

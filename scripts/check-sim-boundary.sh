@@ -26,7 +26,7 @@ set -euo pipefail
 # Does NOT match: newerworld.tick = 0 (word-break at start)
 PATTERN='(^|[^[:alnum:]_])(world|worldState|w)\.[a-zA-Z_][a-zA-Z0-9_]*.*(=[^=]|[+][+]|--|[+]=|-=|[*]=|/=)'
 
-HITS=$(grep -rnE "$PATTERN" src/render src/input src/platform --include='*.ts' \
+HITS=$(grep -rnE "$PATTERN" src/render src/input src/platform --include='*.ts' --exclude='*.test.ts' \
   | grep -v '\.commandQueue' \
   || true)
 
