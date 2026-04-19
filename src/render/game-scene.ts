@@ -42,6 +42,7 @@ export class GameScene extends Phaser.Scene {
   private wasd!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
   private tabKey!: Phaser.Input.Keyboard.Key;
   private dragState!: { isDragging: boolean; lastX: number; lastY: number; active: boolean };
+  private lastActiveView: ViewState['activeView'] | null = null;
 
   constructor() { super({ key: 'GameScene' }); }
 
@@ -66,7 +67,9 @@ export class GameScene extends Phaser.Scene {
     // Drag-pan registration — returns dragState ref for processCameraInput
     this.dragState = registerDragPan(this, this.viewState);
 
-    this.cameras.main.setBounds(0, 0, SURFACE_GRID_WIDTH * TILE_SIZE_PX, SURFACE_GRID_HEIGHT * TILE_SIZE_PX);
+    // Camera bounds are applied reactively in update() based on viewState.activeView;
+    // see the lastActiveView diff block there so ALL view-change paths (Tab, HUD
+    // button, minimap click) update Phaser's camera bounds, not just Tab.
 
     // Platform accumulator — snapshot hook wired; speed/pause remain Phase 9 seams.
     this.gameLoop = createGameLoop(tick, this.world, {
@@ -88,12 +91,19 @@ export class GameScene extends Phaser.Scene {
     // Tab toggles view (JustDown handles key-press edge, not held).
     if (Phaser.Input.Keyboard.JustDown(this.tabKey)) {
       toggleView(this.viewState);
-      // Reset camera bounds when switching views (underground has different world size).
+    }
+
+    // Reactive camera bounds sync — fires on any activeView change (Tab key,
+    // HUD toggle button, minimap click), not just Tab. Keeps Phaser's camera
+    // bounds consistent with the world size for the active view so drag-pan
+    // and edge-pan clamp correctly.
+    if (this.viewState.activeView !== this.lastActiveView) {
       if (this.viewState.activeView === 'surface') {
         this.cameras.main.setBounds(0, 0, SURFACE_GRID_WIDTH * TILE_SIZE_PX, SURFACE_GRID_HEIGHT * TILE_SIZE_PX);
       } else {
         this.cameras.main.setBounds(0, 0, UNDERGROUND_GRID_WIDTH * TILE_SIZE_PX, UNDERGROUND_GRID_HEIGHT * TILE_SIZE_PX);
       }
+      this.lastActiveView = this.viewState.activeView;
     }
 
     // Drive platform accumulator (Phase 8 snapshot hook fires before each tick).

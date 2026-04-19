@@ -4,7 +4,6 @@ import { describe, it, expect } from 'vitest';
 import {
   computeHudStats,
   formatStatsPrefix,
-  formatQueenLabel,
 } from './hud-stats.js';
 import { createWorldState } from '../sim/types.js';
 import type { WorldState } from '../sim/types.js';
@@ -100,16 +99,3 @@ describe('formatStatsPrefix', () => {
   });
 });
 
-describe('formatQueenLabel', () => {
-  it('renders percentage when queen alive', () => {
-    expect(formatQueenLabel({
-      antCount: 1, foodDisplay: 0, queenHealthPct: 72, queenAlive: true,
-    })).toBe('Queen: 72%');
-  });
-
-  it('renders DEAD when queen dead', () => {
-    expect(formatQueenLabel({
-      antCount: 0, foodDisplay: 0, queenHealthPct: 0, queenAlive: false,
-    })).toBe('Queen: DEAD');
-  });
-});

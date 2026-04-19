@@ -40,22 +40,23 @@ import {
   itemLabelPos,
   drawContextMenuGeometry,
 } from './context-menu-layout.js';
-import { computeHudStats, formatStatsPrefix, formatQueenLabel } from './hud-stats.js';
+import { computeHudStats, formatStatsPrefix } from './hud-stats.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { SetBehaviorRatioCommand, PlaceChamberCommand } from '../sim/commands.js';
 
-// Queen health bar geometry (row 2 of the stats block).
-const QUEEN_BAR_X = HUD.STATS.x + 60;
-const QUEEN_BAR_Y = HUD.STATS.y + 30;
-const QUEEN_BAR_W = 60;
-const QUEEN_BAR_H = 8;
+// HUD-02 stats row lives entirely inside the 200x24 HUD.STATS rect so
+// isPointerOverHUD() correctly masks drag-pan / world-input click-through.
+// Two Texts on one 10px row: "Ants: N  Food: N  Queen:" (white) + "N%"/"DEAD"
+// (color-coded by queen health). The 10px font keeps the full line under 200px
+// even for typical POC counts.
+const STATS_ROW_Y   = HUD.STATS.y + 6;
+const STATS_TEXT_X  = HUD.STATS.x + 4;
 
 export class UIScene extends Phaser.Scene {
   private viewState!: ViewState;
   private world!: WorldState;
   private gfx!: Phaser.GameObjects.Graphics;
   private statsText!: Phaser.GameObjects.Text;
-  private queenLabelText!: Phaser.GameObjects.Text;
   private queenPctText!: Phaser.GameObjects.Text;
   private triangleLabels!: Phaser.GameObjects.Text[];
   private viewToggleText!: Phaser.GameObjects.Text;
@@ -73,29 +74,20 @@ export class UIScene extends Phaser.Scene {
     this.gfx = this.add.graphics();
     this.dragState = createTriangleDragState();
 
-    // Stats line 1 (ants + food) — updates each frame via setText; created once here.
+    // HUD-02 stats row — both Texts confined to the 200x24 HUD.STATS rect.
     this.statsText = this.add.text(
-      HUD.STATS.x,
-      HUD.STATS.y,
-      'Ants: 0  Food: 0',
-      { color: '#ffffff', fontSize: '14px', fontFamily: 'monospace' },
+      STATS_TEXT_X,
+      STATS_ROW_Y,
+      'Ants: 0  Food: 0  Queen:',
+      { color: '#ffffff', fontSize: '10px', fontFamily: 'monospace' },
     );
     this.statsText.setScrollFactor(0);
 
-    // Stats line 2 (queen health): "Queen:" label + bar (drawn in update) + percentage.
-    this.queenLabelText = this.add.text(
-      HUD.STATS.x,
-      HUD.STATS.y + 22,
-      'Queen:',
-      { color: '#ffffff', fontSize: '12px', fontFamily: 'monospace' },
-    );
-    this.queenLabelText.setScrollFactor(0);
-
     this.queenPctText = this.add.text(
-      QUEEN_BAR_X + QUEEN_BAR_W + 6,
-      HUD.STATS.y + 22,
+      STATS_TEXT_X,
+      STATS_ROW_Y,
       '100%',
-      { color: '#ffffff', fontSize: '12px', fontFamily: 'monospace' },
+      { color: '#22bb44', fontSize: '10px', fontFamily: 'monospace' },
     );
     this.queenPctText.setScrollFactor(0);
 
@@ -238,36 +230,23 @@ export class UIScene extends Phaser.Scene {
 
     const colony = this.world.colonies[PLAYER_COLONY_ID];
 
-    // Stats bar — HUD-02: ant count (workers+eggs+larvae+queen), food, queen health bar.
+    // HUD-02 stats row — both Texts confined inside the 200x24 HUD.STATS
+    // rect so isPointerOverHUD() correctly suppresses world-input
+    // click-through. queenPctText right edge is clamped to the HUD.STATS
+    // right edge regardless of font-metric variation across browsers.
     if (colony) {
       const s = computeHudStats(this.world, colony);
-      this.statsText.setText(formatStatsPrefix(s));
+      this.statsText.setText(`${formatStatsPrefix(s)}  Queen:`);
       this.queenPctText.setText(s.queenAlive ? `${s.queenHealthPct}%` : 'DEAD');
-      this.queenLabelText.setText(s.queenAlive ? 'Queen:' : formatQueenLabel(s));
+      const pctColor = !s.queenAlive ? '#cc3322'
+        : s.queenHealthPct > 60 ? '#22bb44' // green  — healthy
+        : s.queenHealthPct > 30 ? '#ddaa22' // amber  — warning
+        : '#cc3322';                         // red    — critical / dead
+      this.queenPctText.setColor(pctColor);
 
-      // Health bar: outline + filled portion. Color lerps red→green by health.
-      this.gfx.fillStyle(0x222222, 1);
-      this.gfx.fillRect(QUEEN_BAR_X, QUEEN_BAR_Y, QUEEN_BAR_W, QUEEN_BAR_H);
-      if (s.queenAlive && s.queenHealthPct > 0) {
-        const fillW = Math.max(1, Math.round(QUEEN_BAR_W * (s.queenHealthPct / 100)));
-        const barColor = s.queenHealthPct > 60
-          ? 0x22bb44 // green — healthy
-          : s.queenHealthPct > 30
-            ? 0xddaa22 // amber — warning
-            : 0xcc3322; // red — critical
-        this.gfx.fillStyle(barColor, 1);
-        this.gfx.fillRect(QUEEN_BAR_X, QUEEN_BAR_Y, fillW, QUEEN_BAR_H);
-      }
-      this.gfx.lineStyle(1, 0xffffff, 1);
-      // Phaser Graphics has no strokeRect; draw 4 edges as thin fillRects.
-      this.gfx.fillStyle(0xffffff, 1);
-      this.gfx.fillRect(QUEEN_BAR_X,                  QUEEN_BAR_Y,                  QUEEN_BAR_W, 1);
-      this.gfx.fillRect(QUEEN_BAR_X,                  QUEEN_BAR_Y + QUEEN_BAR_H - 1, QUEEN_BAR_W, 1);
-      this.gfx.fillRect(QUEEN_BAR_X,                  QUEEN_BAR_Y,                  1, QUEEN_BAR_H);
-      this.gfx.fillRect(QUEEN_BAR_X + QUEEN_BAR_W - 1, QUEEN_BAR_Y,                  1, QUEEN_BAR_H);
-
-      // Hide percentage text when queen is dead — the label already shows "DEAD".
-      this.queenPctText.setVisible(s.queenAlive);
+      const naturalX = this.statsText.x + this.statsText.width + 4;
+      const maxX     = HUD.STATS.x + HUD.STATS.w - this.queenPctText.width;
+      this.queenPctText.setPosition(Math.min(naturalX, maxX), STATS_ROW_Y);
     }
 
     // Behavior triangle widget

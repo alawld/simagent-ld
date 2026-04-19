@@ -56,16 +56,9 @@ export function computeHudStats(world: WorldState, colony: ColonyRecord): HudSta
 
 /**
  * Format the left half of the HUD stats line: "Ants: N  Food: F".
- * The queen health block is drawn separately (bar + label) so callers can
- * render it as Graphics + Text rather than concatenating into a single string.
+ * The queen health portion is a separate color-coded Text widget so it can
+ * be tinted independently without multi-color spans.
  */
 export function formatStatsPrefix(s: HudStats): string {
   return `Ants: ${s.antCount}  Food: ${s.foodDisplay}`;
-}
-
-/**
- * Format the queen health label: "Queen: 72%" or "Queen: DEAD".
- */
-export function formatQueenLabel(s: HudStats): string {
-  return s.queenAlive ? `Queen: ${s.queenHealthPct}%` : 'Queen: DEAD';
 }
