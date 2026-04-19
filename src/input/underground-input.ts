@@ -236,8 +236,9 @@ export function handleUndergroundRightClick(
  *   - pointerup: resets isDragging.
  *
  * Coexistence with registerDragPan: both register pointerdown/pointermove/pointerup.
- * Phaser fires multiple handlers; drag-pan guards on right-click (no-ops on left clicks
- * from world-click handlers), and both guard on isPointerOverHUD.
+ * Phaser fires multiple handlers; drag-pan guards on middle-button only, so left-click
+ * and right-click reach only the world-input handlers here. Both sets of handlers
+ * also guard on isPointerOverHUD so HUD widgets never receive world-click fallthrough.
  *
  * @param scene     - Phaser.Scene (GameScene) providing the input event bus.
  * @param world     - Mutable WorldState reference (commandQueue is written).

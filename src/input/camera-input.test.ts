@@ -182,9 +182,12 @@ describe('isPointerOverHUD', () => {
     });
   });
 
-  describe('SAVE_ICON zone', () => {
-    it('returns true for point inside SAVE_ICON', () => {
-      expect(isPointerOverHUD(HUD.SAVE_ICON.x + 5, HUD.SAVE_ICON.y + 5)).toBe(true);
+  describe('Phase 9 reservation zones (intentionally unmasked in Phase 8)', () => {
+    it('does NOT mask SAVE_ICON — Phase 8 renders nothing there, so masking creates an invisible dead zone', () => {
+      expect(isPointerOverHUD(HUD.SAVE_ICON.x + 5, HUD.SAVE_ICON.y + 5)).toBe(false);
+    });
+    it('does NOT mask SPEED — Phase 8 renders nothing there, so masking creates an invisible dead zone', () => {
+      expect(isPointerOverHUD(HUD.SPEED.x + 5, HUD.SPEED.y + 5)).toBe(false);
     });
   });
 
@@ -315,6 +318,32 @@ describe('processCameraInput — edge-pan', () => {
   it('does NOT edge-pan when pointer.y > canvasH', () => {
     const vs = makeViewState('surface', 64, 64);
     processCameraInput(vs, makePanInputs({ pointerX: 400, pointerY: 600, canvasH: 592 }));
+    expect(vs.surfaceCamera.y).toBeCloseTo(64);
+  });
+
+  it('does NOT edge-pan when pointer is over HUD.STATS (top-left overlap)', () => {
+    // STATS: x:8-208, y:8-32 — (10, 10) is in the top-left edge band AND inside STATS.
+    const vs = makeViewState('surface', 64, 64);
+    processCameraInput(vs, makePanInputs({ pointerX: 10, pointerY: 10 }));
+    expect(vs.surfaceCamera.x).toBeCloseTo(64);
+    expect(vs.surfaceCamera.y).toBeCloseTo(64);
+  });
+
+  it('does NOT edge-pan when pointer is over HUD.TRIANGLE (bottom-left overlap)', () => {
+    // TRIANGLE: x:8-128, y:456-576 — (20, 570) is inside TRIANGLE AND inside the
+    // bottom edge band (canvasH=592; 592-32=560; y=570 > 560).
+    const vs = makeViewState('surface', 64, 64);
+    processCameraInput(vs, makePanInputs({ pointerX: 20, pointerY: 570 }));
+    expect(vs.surfaceCamera.x).toBeCloseTo(64);
+    expect(vs.surfaceCamera.y).toBeCloseTo(64);
+  });
+
+  it('does NOT edge-pan when pointer is over HUD.MINIMAP (bottom-right overlap)', () => {
+    // MINIMAP: x:632-792, y:424-584 — (790, 580) is inside MINIMAP AND inside
+    // both the right and bottom edge bands.
+    const vs = makeViewState('surface', 64, 64);
+    processCameraInput(vs, makePanInputs({ pointerX: 790, pointerY: 580 }));
+    expect(vs.surfaceCamera.x).toBeCloseTo(64);
     expect(vs.surfaceCamera.y).toBeCloseTo(64);
   });
 });

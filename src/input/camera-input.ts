@@ -31,10 +31,16 @@ import {
 
 /**
  * isPointerOverHUD — return true if the screen-pixel point (px, py) falls
- * inside any HUD zone rectangle.
+ * inside any *visible* HUD zone rectangle.
  *
- * Used by drag-pan to ignore pointer-down events that land on HUD widgets.
- * Edge-pan does NOT use this guard (edges are outside HUD zones by construction).
+ * Used by drag-pan, edge-pan, and world-input handlers to suppress
+ * pointer events that land on HUD widgets.
+ *
+ * PRD §6 reserves HUD.SPEED and HUD.SAVE_ICON as Phase 9 layout slots —
+ * Phase 8 renders nothing there, so masking those zones in Phase 8 creates
+ * invisible input-dead zones that feel broken to the player. They are
+ * intentionally omitted from the zone list here and should be re-added in
+ * Phase 9 when the speed controls and autosave indicator render.
  *
  * Inclusion rule: x in [rect.x, rect.x + rect.w) and y in [rect.y, rect.y + rect.h).
  */
@@ -42,10 +48,8 @@ export function isPointerOverHUD(px: number, py: number): boolean {
   const zones = [
     HUD.STATS,
     HUD.TRIANGLE,
-    HUD.SPEED,
     HUD.MINIMAP,
     HUD.VIEW_TOGGLE,
-    HUD.SAVE_ICON,
   ] as const;
   for (const zone of zones) {
     if (
@@ -149,19 +153,25 @@ export function processCameraInput(viewState: ViewState, inputs: PanInputs): voi
   }
 
   // --- Edge-pan (canvas-bounds guard: pointer must be inside [0, canvasW] × [0, canvasH]) ---
+  // Suppress edge-pan when the pointer is over a visible HUD widget — the
+  // stats bar, triangle, and minimap all overlap the 32px edge bands, and
+  // scrolling the camera while the player is dragging the triangle or
+  // clicking the minimap makes the UI feel unstable.
   const { pointer, canvasW, canvasH } = inputs;
 
-  if (pointer.x >= 0 && pointer.x < EDGE_PAN_THRESHOLD_PX) {
-    cam.x -= CAMERA_SCROLL_SPEED;
-  }
-  if (pointer.x > canvasW - EDGE_PAN_THRESHOLD_PX && pointer.x <= canvasW) {
-    cam.x += CAMERA_SCROLL_SPEED;
-  }
-  if (pointer.y >= 0 && pointer.y < EDGE_PAN_THRESHOLD_PX) {
-    cam.y -= CAMERA_SCROLL_SPEED;
-  }
-  if (pointer.y > canvasH - EDGE_PAN_THRESHOLD_PX && pointer.y <= canvasH) {
-    cam.y += CAMERA_SCROLL_SPEED;
+  if (!isPointerOverHUD(pointer.x, pointer.y)) {
+    if (pointer.x >= 0 && pointer.x < EDGE_PAN_THRESHOLD_PX) {
+      cam.x -= CAMERA_SCROLL_SPEED;
+    }
+    if (pointer.x > canvasW - EDGE_PAN_THRESHOLD_PX && pointer.x <= canvasW) {
+      cam.x += CAMERA_SCROLL_SPEED;
+    }
+    if (pointer.y >= 0 && pointer.y < EDGE_PAN_THRESHOLD_PX) {
+      cam.y -= CAMERA_SCROLL_SPEED;
+    }
+    if (pointer.y > canvasH - EDGE_PAN_THRESHOLD_PX && pointer.y <= canvasH) {
+      cam.y += CAMERA_SCROLL_SPEED;
+    }
   }
 
   // --- Single clamp at end of frame ---
@@ -189,14 +199,18 @@ export interface DragState {
 /**
  * registerDragPan — wire drag-pan event handlers on a Phaser.Scene.
  *
+ * Drag-pan is bound to **middle-button drag only** so it cannot collide
+ * with left-click world actions (dig marking, food-pile mark, entrance
+ * designation, chamber context menu). The left button is reserved
+ * entirely for world input; the arrow keys, WASD, and mouse edge-pan
+ * remain available for camera movement. (Phase 9 may add spacebar-held
+ * pan if middle-button is awkward on trackpads.)
+ *
  * Returns the shared dragState object so GameScene can pass it through
  * PanInputs for debugging (processCameraInput ignores it).
  *
- * Camera mutations happen directly inside the pointermove handler;
- * processCameraInput only applies keyboard + edge-pan + the final clamp.
- *
- * Right-click and HUD-zone pointerdown are ignored (guard applied in pointerdown).
- * HUD-zone pointermove is also guarded so accidental drags into the HUD stop.
+ * HUD-zone pointerdown and HUD-zone pointermove are ignored so a drag
+ * starting inside a HUD widget never pans the camera.
  */
 export function registerDragPan(scene: Phaser.Scene, viewState: ViewState): DragState {
   const dragState: DragState = {
@@ -207,7 +221,7 @@ export function registerDragPan(scene: Phaser.Scene, viewState: ViewState): Drag
   };
 
   scene.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
-    if (!pointer.leftButtonDown()) return;
+    if (!pointer.middleButtonDown()) return;
     if (isPointerOverHUD(pointer.x, pointer.y)) return;
     dragState.active = true;
     dragState.lastX = pointer.x;
@@ -216,7 +230,7 @@ export function registerDragPan(scene: Phaser.Scene, viewState: ViewState): Drag
   });
 
   scene.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
-    if (!dragState.active || !pointer.isDown) return;
+    if (!dragState.active || !pointer.middleButtonDown()) return;
     if (isPointerOverHUD(pointer.x, pointer.y)) return;
 
     const dx = (pointer.x - dragState.lastX) / TILE_SIZE_PX;
