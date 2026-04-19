@@ -266,15 +266,20 @@ describe('handleUndergroundLeftClick', () => {
     expect(state.lastMarkedTileY).toBe(10);
   });
 
-  it('hides context menu and consumes click (no MarkDigTile) when menu is visible', () => {
+  it('suppresses click without mutating menu state when menu is visible', () => {
+    // UIScene owns menu dismissal (requestHideContextMenu → applied next frame).
+    // handleUndergroundLeftClick must NOT flip `visible` synchronously or it
+    // races with UIScene's pointerdown handler on the same event.
     const world = makeWorld();
     const vs = makeViewState('underground', 64, 32);
     const state = makeState();
     contextMenuState.visible = true;
     const { x, y } = tileToScreen(5, 10, 64, 32);
     handleUndergroundLeftClick(world, vs, x, y, state);
-    expect(contextMenuState.visible).toBe(false);
+    expect(contextMenuState.visible).toBe(true);
+    expect(contextMenuState.pendingHide).toBe(false);
     expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(false);
   });
 });
 

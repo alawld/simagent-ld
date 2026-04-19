@@ -27,18 +27,39 @@ import {
   type TriangleDragState,
 } from './triangle-widget.js';
 import { drawMinimap, applyMinimapClick } from './minimap.js';
-import { contextMenuState, hideContextMenu } from './context-menu-state.js';
+import {
+  contextMenuState,
+  hideContextMenu,
+  requestHideContextMenu,
+  applyPendingContextMenuHide,
+} from './context-menu-state.js';
+import {
+  CONTEXT_MENU_ITEMS,
+  contextMenuItemAt,
+  isInsideContextMenu,
+  itemLabelPos,
+  drawContextMenuGeometry,
+} from './context-menu-layout.js';
+import { computeHudStats, formatStatsPrefix, formatQueenLabel } from './hud-stats.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
-import { ChamberType } from '../sim/enums.js';
 import type { SetBehaviorRatioCommand, PlaceChamberCommand } from '../sim/commands.js';
+
+// Queen health bar geometry (row 2 of the stats block).
+const QUEEN_BAR_X = HUD.STATS.x + 60;
+const QUEEN_BAR_Y = HUD.STATS.y + 30;
+const QUEEN_BAR_W = 60;
+const QUEEN_BAR_H = 8;
 
 export class UIScene extends Phaser.Scene {
   private viewState!: ViewState;
   private world!: WorldState;
   private gfx!: Phaser.GameObjects.Graphics;
   private statsText!: Phaser.GameObjects.Text;
+  private queenLabelText!: Phaser.GameObjects.Text;
+  private queenPctText!: Phaser.GameObjects.Text;
   private triangleLabels!: Phaser.GameObjects.Text[];
   private viewToggleText!: Phaser.GameObjects.Text;
+  private contextMenuLabels!: Phaser.GameObjects.Text[];
   private dragState!: TriangleDragState;
 
   constructor() { super({ key: 'UIScene' }); }
@@ -52,14 +73,31 @@ export class UIScene extends Phaser.Scene {
     this.gfx = this.add.graphics();
     this.dragState = createTriangleDragState();
 
-    // Stats text — updates each frame via setText; created once here.
+    // Stats line 1 (ants + food) — updates each frame via setText; created once here.
     this.statsText = this.add.text(
       HUD.STATS.x,
       HUD.STATS.y,
-      'Ants: 0  Food: 0  Queen: 100',
+      'Ants: 0  Food: 0',
       { color: '#ffffff', fontSize: '14px', fontFamily: 'monospace' },
     );
     this.statsText.setScrollFactor(0);
+
+    // Stats line 2 (queen health): "Queen:" label + bar (drawn in update) + percentage.
+    this.queenLabelText = this.add.text(
+      HUD.STATS.x,
+      HUD.STATS.y + 22,
+      'Queen:',
+      { color: '#ffffff', fontSize: '12px', fontFamily: 'monospace' },
+    );
+    this.queenLabelText.setScrollFactor(0);
+
+    this.queenPctText = this.add.text(
+      QUEEN_BAR_X + QUEEN_BAR_W + 6,
+      HUD.STATS.y + 22,
+      '100%',
+      { color: '#ffffff', fontSize: '12px', fontFamily: 'monospace' },
+    );
+    this.queenPctText.setScrollFactor(0);
 
     // Triangle vertex labels — static text, created once.
     this.triangleLabels = [
@@ -96,8 +134,57 @@ export class UIScene extends Phaser.Scene {
     this.viewToggleText.setPadding(4);
     this.viewToggleText.setScrollFactor(0);
 
+    // Context menu item labels — created once, positioned/shown per frame.
+    // One Phaser.Text per ChamberType (Queen / Nursery / Food Storage) so the
+    // player can actually read the choices instead of seeing unlabeled stripes.
+    this.contextMenuLabels = CONTEXT_MENU_ITEMS.map(item => {
+      const t = this.add.text(
+        0,
+        0,
+        item.label,
+        { color: '#ffffff', fontSize: '13px', fontFamily: 'monospace' },
+      );
+      t.setScrollFactor(0);
+      t.setVisible(false);
+      t.setDepth(10); // draw above the gfx stripes
+      return t;
+    });
+
     // Pointer events for HUD interactions.
     this.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+      // Context menu takes precedence when visible. A click inside selects an
+      // item; a click anywhere else dismisses the menu AND falls through so
+      // the underlying HUD control still receives the click — prevents the
+      // menu from lingering after unrelated HUD interactions.
+      if (contextMenuState.visible) {
+        if (isInsideContextMenu(
+          pointer.x, pointer.y,
+          contextMenuState.screenX, contextMenuState.screenY,
+        )) {
+          const choice = contextMenuItemAt(
+            pointer.x, pointer.y,
+            contextMenuState.screenX, contextMenuState.screenY,
+          );
+          if (choice !== null) {
+            const cmd: PlaceChamberCommand = {
+              type: 'PlaceChamber',
+              colonyId: PLAYER_COLONY_ID,
+              chamberType: choice,
+              anchorTileX: contextMenuState.anchorTileX,
+              anchorTileY: contextMenuState.anchorTileY,
+              issuedAtTick: this.world.tick,
+            };
+            this.world.commandQueue.push(cmd);
+          }
+          requestHideContextMenu();
+          return;
+        }
+        requestHideContextMenu();
+        // fall through — process the actual HUD target. The deferred hide
+        // lets any cross-scene pointerdown handler that runs after this one
+        // still observe visible=true and suppress its own world-click logic.
+      }
+
       // View toggle button
       if (this.isInsideRect(pointer.x, pointer.y, HUD.VIEW_TOGGLE)) {
         toggleView(this.viewState);
@@ -110,24 +197,6 @@ export class UIScene extends Phaser.Scene {
         this.dragState.isDragging = true;
         this.dragState.targetRatio = screenToBarycentric(pointer.x, pointer.y);
         return;
-      }
-      // Context menu selection or dismiss
-      if (contextMenuState.visible) {
-        if (this.isInsideContextMenu(pointer.x, pointer.y)) {
-          const choice = this.contextMenuItemAt(pointer.x, pointer.y);
-          if (choice !== null) {
-            const cmd: PlaceChamberCommand = {
-              type: 'PlaceChamber',
-              colonyId: PLAYER_COLONY_ID,
-              chamberType: choice,
-              anchorTileX: contextMenuState.anchorTileX,
-              anchorTileY: contextMenuState.anchorTileY,
-              issuedAtTick: this.world.tick,
-            };
-            this.world.commandQueue.push(cmd);
-          }
-        }
-        hideContextMenu();
       }
     });
 
@@ -153,16 +222,52 @@ export class UIScene extends Phaser.Scene {
   }
 
   update() {
+    // Apply any pending hide from the previous frame's pointerdown dispatch
+    // BEFORE reading the state, so cross-scene race conditions are resolved
+    // deterministically at the frame boundary.
+    applyPendingContextMenuHide();
     this.gfx.clear();
+
+    // Auto-dismiss the underground context menu if the player switches away
+    // from the underground view (via Tab key, toggle button, or minimap click).
+    // The menu only makes sense while underground; leaving it visible on the
+    // surface view would be a stale artifact.
+    if (contextMenuState.visible && this.viewState.activeView !== 'underground') {
+      hideContextMenu();
+    }
 
     const colony = this.world.colonies[PLAYER_COLONY_ID];
 
-    // Stats bar
+    // Stats bar — HUD-02: ant count (workers+eggs+larvae+queen), food, queen health bar.
     if (colony) {
-      const foodDisplay = colony.foodStored >> 8; // FP_SHIFT=8: convert from fixed-point to human units
-      this.statsText.setText(
-        `Ants: ${colony.workerCount}  Food: ${foodDisplay}  Queen: ${colony.queenStarvationTimer}`,
-      );
+      const s = computeHudStats(this.world, colony);
+      this.statsText.setText(formatStatsPrefix(s));
+      this.queenPctText.setText(s.queenAlive ? `${s.queenHealthPct}%` : 'DEAD');
+      this.queenLabelText.setText(s.queenAlive ? 'Queen:' : formatQueenLabel(s));
+
+      // Health bar: outline + filled portion. Color lerps red→green by health.
+      this.gfx.fillStyle(0x222222, 1);
+      this.gfx.fillRect(QUEEN_BAR_X, QUEEN_BAR_Y, QUEEN_BAR_W, QUEEN_BAR_H);
+      if (s.queenAlive && s.queenHealthPct > 0) {
+        const fillW = Math.max(1, Math.round(QUEEN_BAR_W * (s.queenHealthPct / 100)));
+        const barColor = s.queenHealthPct > 60
+          ? 0x22bb44 // green — healthy
+          : s.queenHealthPct > 30
+            ? 0xddaa22 // amber — warning
+            : 0xcc3322; // red — critical
+        this.gfx.fillStyle(barColor, 1);
+        this.gfx.fillRect(QUEEN_BAR_X, QUEEN_BAR_Y, fillW, QUEEN_BAR_H);
+      }
+      this.gfx.lineStyle(1, 0xffffff, 1);
+      // Phaser Graphics has no strokeRect; draw 4 edges as thin fillRects.
+      this.gfx.fillStyle(0xffffff, 1);
+      this.gfx.fillRect(QUEEN_BAR_X,                  QUEEN_BAR_Y,                  QUEEN_BAR_W, 1);
+      this.gfx.fillRect(QUEEN_BAR_X,                  QUEEN_BAR_Y + QUEEN_BAR_H - 1, QUEEN_BAR_W, 1);
+      this.gfx.fillRect(QUEEN_BAR_X,                  QUEEN_BAR_Y,                  1, QUEEN_BAR_H);
+      this.gfx.fillRect(QUEEN_BAR_X + QUEEN_BAR_W - 1, QUEEN_BAR_Y,                  1, QUEEN_BAR_H);
+
+      // Hide percentage text when queen is dead — the label already shows "DEAD".
+      this.queenPctText.setVisible(s.queenAlive);
     }
 
     // Behavior triangle widget
@@ -196,59 +301,22 @@ export class UIScene extends Phaser.Scene {
 
     // Context menu (drawn last so it appears on top of other HUD elements)
     if (contextMenuState.visible) {
-      this.drawContextMenu();
-    }
-  }
-
-  private drawContextMenu(): void {
-    const MENU_W = 120;
-    const ITEM_H = 24;
-    const ITEM_COUNT = 3;
-    // Semi-transparent dark background
-    this.gfx.fillStyle(0x222222, 0.95);
-    this.gfx.fillRect(
-      contextMenuState.screenX,
-      contextMenuState.screenY,
-      MENU_W,
-      ITEM_H * ITEM_COUNT,
-    );
-    // Colored stripe per item to differentiate choices visually (Phase 8 simplicity).
-    // Phase 9 may add Phaser.GameObjects.Text children for full text labels.
-    const stripColors = [0x4a1a4a, 0x1a4a1a, 0x4a3a1a]; // Queen, Nursery, Food
-    for (let i = 0; i < ITEM_COUNT; i++) {
-      this.gfx.fillStyle(stripColors[i]!, 1);
-      this.gfx.fillRect(
-        contextMenuState.screenX + 2,
-        contextMenuState.screenY + i * ITEM_H + 2,
-        MENU_W - 4,
-        ITEM_H - 4,
+      drawContextMenuGeometry(
+        this.gfx as unknown as import('./draw-surface.js').GfxLike,
+        contextMenuState.screenX,
+        contextMenuState.screenY,
       );
+      for (let i = 0; i < this.contextMenuLabels.length; i++) {
+        const label = this.contextMenuLabels[i]!;
+        const pos = itemLabelPos(i, contextMenuState.screenX, contextMenuState.screenY);
+        label.setPosition(pos.x, pos.y);
+        label.setVisible(true);
+      }
+    } else {
+      for (const label of this.contextMenuLabels) {
+        label.setVisible(false);
+      }
     }
-  }
-
-  private contextMenuItemAt(px: number, py: number): ChamberType | null {
-    const ITEM_H = 24;
-    const relY = py - contextMenuState.screenY;
-    if (relY < 0 || relY >= ITEM_H * 3) return null;
-    const idx = Math.floor(relY / ITEM_H);
-    // Ordered: 0=Queen, 1=Nursery, 2=FoodStorage (T-08-13: only valid ChamberType values)
-    const choices: ChamberType[] = [
-      ChamberType.Queen,
-      ChamberType.Nursery,
-      ChamberType.FoodStorage,
-    ];
-    return choices[idx] ?? null;
-  }
-
-  private isInsideContextMenu(px: number, py: number): boolean {
-    const MENU_W = 120;
-    const MENU_H = 72; // 3 items x 24px
-    return (
-      px >= contextMenuState.screenX &&
-      px < contextMenuState.screenX + MENU_W &&
-      py >= contextMenuState.screenY &&
-      py < contextMenuState.screenY + MENU_H
-    );
   }
 
   private isInsideRect(

@@ -10,7 +10,9 @@
 //   - viewState.activeView must be 'underground' before dispatching any command.
 //   - isPointerOverHUD rejects clicks that land on HUD zones (Pitfall 2).
 //   - Tile bounds check before accessing grid or pushing commands.
-//   - contextMenuState is suppressed and hidden on any left-click while menu is open.
+//   - When contextMenuState.visible is true, left-click is suppressed (no dig-mark).
+//     Dismissal is owned by UIScene (requestHideContextMenu → applied next frame),
+//     which prevents a scene-order race with chamber-placement selection.
 //
 // UndergroundTileState enum (terrain.ts):
 //   Solid=0, Marked=1, BeingDug=2, Open=3
@@ -23,7 +25,7 @@ import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import type { MarkDigTileCommand, CancelDigMarkCommand } from '../sim/commands.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import { isPointerOverHUD } from './camera-input.js';
-import { contextMenuState, hideContextMenu } from '../render/context-menu-state.js';
+import { contextMenuState } from '../render/context-menu-state.js';
 
 // ---------------------------------------------------------------------------
 // UndergroundInputState — mutable per-registration state
@@ -80,8 +82,9 @@ export function isTunnelEnd(world: WorldState, tileX: number, tileY: number, col
 /**
  * Handles a left-click (or drag initiation) on the underground view.
  *
- * If context menu is open, hides it and suppresses the world click (the click
- * is consumed by the dismissal — PRD §8b).
+ * If context menu is open, suppresses the world click entirely — no dig mark,
+ * no state mutation. UIScene owns menu dismissal so the dismissal happens on
+ * a deterministic frame boundary, not mid-pointerdown dispatch.
  *
  * Otherwise, if the clicked tile is Solid or Open, pushes MarkDigTileCommand
  * and sets isDragging=true to enable subsequent drag marks.
@@ -98,8 +101,11 @@ export function handleUndergroundLeftClick(
 ): void {
   if (viewState.activeView !== 'underground') return;
   if (isPointerOverHUD(screenX, screenY)) return;
-  // If context menu is visible, dismiss it and consume this click.
-  if (contextMenuState.visible) { hideContextMenu(); return; }
+  // If context menu is visible, suppress this click — UIScene handles the
+  // interaction (selection or dismissal) on its own pointerdown and applies
+  // the hide on the next frame. No state mutation here: modifying visibility
+  // mid-dispatch races with UIScene's handler on the same event.
+  if (contextMenuState.visible) return;
   const { tileX, tileY } = screenToTile(screenX, screenY, viewState.undergroundCamera);
   const grid = world.undergroundGrids[PLAYER_COLONY_ID];
   if (!grid) return;
