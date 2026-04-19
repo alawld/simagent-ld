@@ -40,24 +40,34 @@ import {
   itemLabelPos,
   drawContextMenuGeometry,
 } from './context-menu-layout.js';
-import { computeHudStats, formatStatsPrefix } from './hud-stats.js';
+import {
+  computeHudStats,
+  formatAntsLabel,
+  formatFoodLabel,
+  queenBarRect,
+  queenHealthBarColor,
+  queenHealthBarFillWidth,
+  HUD_STATS_COLORS,
+  HUD_STATS_LAYOUT,
+} from './hud-stats.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { SetBehaviorRatioCommand, PlaceChamberCommand } from '../sim/commands.js';
 
 // HUD-02 stats row lives entirely inside the 200x24 HUD.STATS rect so
-// isPointerOverHUD() correctly masks drag-pan / world-input click-through.
-// Two Texts on one 10px row: "Ants: N  Food: N  Queen:" (white) + "N%"/"DEAD"
-// (color-coded by queen health). The 10px font keeps the full line under 200px
-// even for typical POC counts.
-const STATS_ROW_Y   = HUD.STATS.y + 6;
-const STATS_TEXT_X  = HUD.STATS.x + 4;
+// isPointerOverHUD() correctly masks world-input click-through. Per PRD §6c:
+//   - Semi-transparent dark background (0x000000, α=0.6) fills the full rect.
+//   - "Ants: N" (white) + "Food: N" (green-tinted indicator) on one 10px row.
+//   - "Queen:" label + visual health bar, right-anchored inside the rect.
+const STATS_ROW_Y  = HUD.STATS.y + HUD_STATS_LAYOUT.textRowYOffset;
+const STATS_TEXT_X = HUD.STATS.x + 4;
 
 export class UIScene extends Phaser.Scene {
   private viewState!: ViewState;
   private world!: WorldState;
   private gfx!: Phaser.GameObjects.Graphics;
-  private statsText!: Phaser.GameObjects.Text;
-  private queenPctText!: Phaser.GameObjects.Text;
+  private antsText!: Phaser.GameObjects.Text;
+  private foodText!: Phaser.GameObjects.Text;
+  private queenLabelText!: Phaser.GameObjects.Text;
   private triangleLabels!: Phaser.GameObjects.Text[];
   private viewToggleText!: Phaser.GameObjects.Text;
   private contextMenuLabels!: Phaser.GameObjects.Text[];
@@ -74,22 +84,33 @@ export class UIScene extends Phaser.Scene {
     this.gfx = this.add.graphics();
     this.dragState = createTriangleDragState();
 
-    // HUD-02 stats row — both Texts confined to the 200x24 HUD.STATS rect.
-    this.statsText = this.add.text(
+    // HUD-02 stats row — three Texts confined to the 200x24 HUD.STATS rect.
+    // antsText is white; foodText is green-tinted per PRD §6c; queenLabelText
+    // sits immediately to the left of the visual queen health bar (drawn in
+    // update() via gfx so its color can change per frame without Text churn).
+    this.antsText = this.add.text(
       STATS_TEXT_X,
       STATS_ROW_Y,
-      'Ants: 0  Food: 0  Queen:',
-      { color: '#ffffff', fontSize: '10px', fontFamily: 'monospace' },
+      'Ants: 0',
+      { color: HUD_STATS_COLORS.antsTextCss, fontSize: '10px', fontFamily: 'monospace' },
     );
-    this.statsText.setScrollFactor(0);
+    this.antsText.setScrollFactor(0);
 
-    this.queenPctText = this.add.text(
+    this.foodText = this.add.text(
       STATS_TEXT_X,
       STATS_ROW_Y,
-      '100%',
-      { color: '#22bb44', fontSize: '10px', fontFamily: 'monospace' },
+      'Food: 0',
+      { color: HUD_STATS_COLORS.foodTextCss, fontSize: '10px', fontFamily: 'monospace' },
     );
-    this.queenPctText.setScrollFactor(0);
+    this.foodText.setScrollFactor(0);
+
+    this.queenLabelText = this.add.text(
+      STATS_TEXT_X,
+      STATS_ROW_Y,
+      'Queen:',
+      { color: HUD_STATS_COLORS.queenTextCss, fontSize: '10px', fontFamily: 'monospace' },
+    );
+    this.queenLabelText.setScrollFactor(0);
 
     // Triangle vertex labels — static text, created once.
     this.triangleLabels = [
@@ -230,23 +251,35 @@ export class UIScene extends Phaser.Scene {
 
     const colony = this.world.colonies[PLAYER_COLONY_ID];
 
-    // HUD-02 stats row — both Texts confined inside the 200x24 HUD.STATS
-    // rect so isPointerOverHUD() correctly suppresses world-input
-    // click-through. queenPctText right edge is clamped to the HUD.STATS
-    // right edge regardless of font-metric variation across browsers.
+    // HUD-02 stats bar per PRD §6c:
+    //   - semi-transparent dark background over the full 200x24 rect
+    //   - "Ants: N" white text, "Food: N" green-tinted text, "Queen:" label
+    //   - visual queen-health bar right-anchored inside the rect, color by pct
+    this.gfx.fillStyle(HUD_STATS_COLORS.background, HUD_STATS_COLORS.backgroundAlpha);
+    this.gfx.fillRect(HUD.STATS.x, HUD.STATS.y, HUD.STATS.w, HUD.STATS.h);
+
     if (colony) {
       const s = computeHudStats(this.world, colony);
-      this.statsText.setText(`${formatStatsPrefix(s)}  Queen:`);
-      this.queenPctText.setText(s.queenAlive ? `${s.queenHealthPct}%` : 'DEAD');
-      const pctColor = !s.queenAlive ? '#cc3322'
-        : s.queenHealthPct > 60 ? '#22bb44' // green  — healthy
-        : s.queenHealthPct > 30 ? '#ddaa22' // amber  — warning
-        : '#cc3322';                         // red    — critical / dead
-      this.queenPctText.setColor(pctColor);
+      this.antsText.setText(formatAntsLabel(s));
+      this.foodText.setText(formatFoodLabel(s));
 
-      const naturalX = this.statsText.x + this.statsText.width + 4;
-      const maxX     = HUD.STATS.x + HUD.STATS.w - this.queenPctText.width;
-      this.queenPctText.setPosition(Math.min(naturalX, maxX), STATS_ROW_Y);
+      // Layout: antsText stays at left margin; foodText follows with a
+      // two-space gap; queenLabel + bar right-anchor inside HUD.STATS.
+      const bar = queenBarRect(HUD.STATS);
+
+      this.foodText.setPosition(this.antsText.x + this.antsText.width + 8, STATS_ROW_Y);
+
+      const queenLabelX = bar.x - this.queenLabelText.width - 4;
+      this.queenLabelText.setPosition(queenLabelX, STATS_ROW_Y);
+
+      // Queen health bar — track + proportional fill.
+      this.gfx.fillStyle(HUD_STATS_COLORS.barTrack, 1);
+      this.gfx.fillRect(bar.x, bar.y, bar.w, bar.h);
+      const fillW = queenHealthBarFillWidth(s, bar.w);
+      if (fillW > 0) {
+        this.gfx.fillStyle(queenHealthBarColor(s), 1);
+        this.gfx.fillRect(bar.x, bar.y, fillW, bar.h);
+      }
     }
 
     // Behavior triangle widget

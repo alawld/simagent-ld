@@ -1,15 +1,18 @@
 // hud-stats.ts — Pure helpers for HUD-02 stats bar.
 //
-// Extracted from UIScene so the computation can be unit-tested under Node
-// without a Phaser scene. The UIScene feeds these results into a Text object
+// Extracted from UIScene so the computation + layout can be unit-tested under
+// Node without a Phaser scene. UIScene feeds these results into Text widgets
 // and a Graphics bar in its update() pass.
 //
-// HUD-02 contract (v1.0 REQUIREMENTS.md line 84):
-//   Colony stats display: ant count, food stored, queen health.
-//
-// Ant count is the TOTAL population — workers + eggs + larvae + queen-if-alive
-// (not just workerCount). Queen health is a percentage derived from
-// queenStarvationTimer vs. STARVATION_GRACE_TICKS, shown as a bar + label.
+// HUD-02 contract — PRD §6c (04-PRD-playable-game-loop.md:908):
+//   - 200×24 rect at (8, 8) with semi-transparent dark background (0x000000, α=0.6)
+//   - Ant count = workerCount + eggCount + larvaeCount + (queen alive ? 1 : 0)
+//   - Food stored = foodStored >> FP_SHIFT, green-tinted indicator
+//   - Queen health = visual bar derived from queenStarvationTimer / STARVATION_GRACE_TICKS
+//     * green  when pct > 50  (healthy)
+//     * yellow when 25 ≤ pct ≤ 50 (moderate)
+//     * red    when pct < 25  (critical)
+//     * dead queen renders empty bar in the critical color
 
 import type { WorldState } from '../sim/types.js';
 import type { ColonyRecord } from '../sim/colony/colony-store.js';
@@ -24,20 +27,30 @@ export interface HudStats {
   queenAlive:     boolean;
 }
 
-/**
- * Compute the HUD stats snapshot for a colony.
- *
- * antCount: workers + eggs + larvae + (queen alive ? 1 : 0). The queen is
- * counted separately because ColonyRecord.workerCount tracks only worker
- * castes; eggs/larvae/queen are siblings in the ECS and the HUD contract
- * reports the combined colony population.
- *
- * foodDisplay: colony.foodStored >> FP_SHIFT (convert from fixed-point units
- * to human-readable integer food).
- *
- * queenHealthPct: clamp(queenStarvationTimer / STARVATION_GRACE_TICKS, 0, 1)
- * × 100, rounded to nearest integer. If the queen is dead, returns 0.
- */
+export type QueenHealthState = 'dead' | 'critical' | 'moderate' | 'healthy';
+
+export const HUD_STATS_COLORS = {
+  background:      0x000000,
+  backgroundAlpha: 0.6,
+  barTrack:        0x333333,
+  barHealthy:      0x22bb44,
+  barModerate:     0xddaa22,
+  barCritical:     0xcc3322,
+  antsTextCss:     '#ffffff',
+  foodTextCss:     '#22bb44',
+  queenTextCss:    '#ffffff',
+} as const;
+
+export const HUD_STATS_LAYOUT = {
+  textRowYOffset: 6,
+  queenBar: {
+    w:          48,
+    h:          6,
+    yOffset:    9,
+    rightInset: 6,
+  },
+} as const;
+
 export function computeHudStats(world: WorldState, colony: ColonyRecord): HudStats {
   const queenAlive  = isAlive(world.ants, colony.queenEntityId);
   const queenBit    = queenAlive ? 1 : 0;
@@ -46,19 +59,64 @@ export function computeHudStats(world: WorldState, colony: ColonyRecord): HudSta
 
   let queenHealthPct = 0;
   if (queenAlive) {
-    const raw   = colony.queenStarvationTimer / STARVATION_GRACE_TICKS;
-    const t     = raw < 0 ? 0 : (raw > 1 ? 1 : raw);
+    const raw = colony.queenStarvationTimer / STARVATION_GRACE_TICKS;
+    const t   = raw < 0 ? 0 : (raw > 1 ? 1 : raw);
     queenHealthPct = Math.round(t * 100);
   }
 
   return { antCount, foodDisplay, queenHealthPct, queenAlive };
 }
 
+export function formatAntsLabel(s: HudStats): string {
+  return `Ants: ${s.antCount}`;
+}
+
+export function formatFoodLabel(s: HudStats): string {
+  return `Food: ${s.foodDisplay}`;
+}
+
+export function queenHealthState(s: HudStats): QueenHealthState {
+  if (!s.queenAlive)       return 'dead';
+  if (s.queenHealthPct > 50)  return 'healthy';
+  if (s.queenHealthPct >= 25) return 'moderate';
+  return 'critical';
+}
+
+export function queenHealthBarColor(s: HudStats): number {
+  switch (queenHealthState(s)) {
+    case 'healthy':  return HUD_STATS_COLORS.barHealthy;
+    case 'moderate': return HUD_STATS_COLORS.barModerate;
+    case 'dead':
+    case 'critical': return HUD_STATS_COLORS.barCritical;
+  }
+}
+
+export function queenHealthBarFillWidth(s: HudStats, totalW: number): number {
+  if (!s.queenAlive) return 0;
+  const w = Math.round((totalW * s.queenHealthPct) / 100);
+  if (w < 0)      return 0;
+  if (w > totalW) return totalW;
+  return w;
+}
+
+export interface QueenBarRect { x: number; y: number; w: number; h: number; }
+
+export function queenBarRect(statsRect: { x: number; y: number; w: number; h: number }): QueenBarRect {
+  const { w, h, yOffset, rightInset } = HUD_STATS_LAYOUT.queenBar;
+  return {
+    x: statsRect.x + statsRect.w - rightInset - w,
+    y: statsRect.y + yOffset,
+    w,
+    h,
+  };
+}
+
 /**
- * Format the left half of the HUD stats line: "Ants: N  Food: F".
- * The queen health portion is a separate color-coded Text widget so it can
- * be tinted independently without multi-color spans.
+ * formatStatsPrefix — legacy helper retained for back-compat with any
+ * test or caller that expected the combined "Ants: N  Food: N" string.
+ * Prefer formatAntsLabel + formatFoodLabel, which are color-split per
+ * PRD §6c (food gets its own green-tinted indicator).
  */
 export function formatStatsPrefix(s: HudStats): string {
-  return `Ants: ${s.antCount}  Food: ${s.foodDisplay}`;
+  return `${formatAntsLabel(s)}  ${formatFoodLabel(s)}`;
 }
