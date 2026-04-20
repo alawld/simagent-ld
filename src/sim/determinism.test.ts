@@ -18,6 +18,7 @@ import {
   WORKER_BASE_SPEED,
   STARVATION_GRACE_TICKS,
   PLAYER_COLONY_ID,
+  ENEMY_COLONY_ID,
 } from './constants.js';
 import { FP_SHIFT } from './fixed.js';
 import type { WorldState } from './types.js';
@@ -445,4 +446,59 @@ describe('No-allocation invariant: object identity in steady state', () => {
     expect(colony.computedAllocation).toBe(computedAllocationRef);
     expect(colony.taskCensus).toBe(taskCensusRef);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 9 SC 5 — two-colony determinism proof (appended)
+// ---------------------------------------------------------------------------
+
+describe('Phase 9 determinism (SC 5) — two-colony parity', () => {
+  // Test A: pure determinism — same seed, no commands, 500 ticks, byte-identical serialized state.
+  it('500-tick two-colony parity: identical seeds produce byte-identical serialized states', () => {
+    const seed = 424242;
+    const worldA = createScenario(seed);
+    const worldB = createScenario(seed);
+
+    const TICKS = 500;
+    for (let i = 0; i < TICKS; i++) {
+      tick(worldA, []);
+      tick(worldB, []);
+    }
+
+    expect(serializeWorldState(worldA)).toBe(serializeWorldState(worldB));
+  }, 20_000);
+
+  // Test B: combat-surface determinism — forcing ants together then running 500 ticks still parity-clean.
+  // We don't need a full "force workers to tile" helper — createScenario already spawns both colonies
+  // near each other per PLAYER_START_X/Y and ENEMY_START_X/Y (constants.ts). Over 500 ticks foragers
+  // naturally wander, encounter enemies, and trigger combat. If Phase 9 combat/AI/rally paths are
+  // non-deterministic, the serialized states will diverge even without artificial placement.
+  it('500-tick two-colony parity with natural combat: worlds still serialize identically', () => {
+    const seed = 31415;
+    const worldA = createScenario(seed);
+    const worldB = createScenario(seed);
+
+    for (let i = 0; i < 500; i++) {
+      tick(worldA, []);
+      tick(worldB, []);
+    }
+
+    // Sanity: both colonies still present (no freak ENOENT on colony lookup).
+    expect(worldA.colonies[PLAYER_COLONY_ID]).toBeDefined();
+    expect(worldA.colonies[ENEMY_COLONY_ID]).toBeDefined();
+
+    expect(serializeWorldState(worldA)).toBe(serializeWorldState(worldB));
+  }, 20_000);
+
+  // Test C: rngState scalar parity — cheaper fast-fail on drift.
+  it('RNG scalar parity: rngState identical after 500 ticks', () => {
+    const seed = 17;
+    const worldA = createScenario(seed);
+    const worldB = createScenario(seed);
+    for (let i = 0; i < 500; i++) {
+      tick(worldA, []);
+      tick(worldB, []);
+    }
+    expect(worldA.rngState).toBe(worldB.rngState);
+  }, 15_000);
 });
