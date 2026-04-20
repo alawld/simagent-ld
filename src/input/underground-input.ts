@@ -236,11 +236,13 @@ export function handleUndergroundRightClick(
 /**
  * registerUndergroundInput — attach underground-click + drag handlers to a Phaser.Scene.
  *
- * Called from GameScene.create() (Plan 06 Task 3) after UIScene is launched.
- * Event registrations:
- *   - pointerdown: left → handleUndergroundLeftClick, right → handleUndergroundRightClick.
- *   - pointermove (while left button down): handleUndergroundDrag.
- *   - pointerup: resets isDragging.
+ * Called from GameScene.create() (Plan 06 Task 3).
+ *
+ * getWorld is a LAZY accessor — called on every pointer event — so the
+ * handler always dispatches against the live WorldState even if
+ * GameScene swaps references mid-session (bootFresh, bootFromSave,
+ * restartGame). Direct world-reference capture was a stale-closure bug.
+ * Returns undefined pre-boot; all handlers short-circuit.
  *
  * Coexistence with registerDragPan: both register pointerdown/pointermove/pointerup.
  * Phaser fires multiple handlers; drag-pan guards on middle-button only, so left-click
@@ -248,12 +250,12 @@ export function handleUndergroundRightClick(
  * also guard on isPointerOverHUD so HUD widgets never receive world-click fallthrough.
  *
  * @param scene     - Phaser.Scene (GameScene) providing the input event bus.
- * @param world     - Mutable WorldState reference (commandQueue is written).
+ * @param getWorld  - Lazy accessor for the live WorldState.
  * @param viewState - Render-layer ViewState; activeView is read for guard.
  */
 export function registerUndergroundInput(
   scene: Phaser.Scene,
-  world: WorldState,
+  getWorld: () => WorldState | undefined,
   viewState: ViewState,
 ): void {
   const state: UndergroundInputState = {
@@ -263,6 +265,8 @@ export function registerUndergroundInput(
   };
 
   scene.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+    const world = getWorld();
+    if (!world) return;
     if (pointer.leftButtonDown()) {
       handleUndergroundLeftClick(world, viewState, pointer.x, pointer.y, state);
     } else if (pointer.rightButtonDown()) {
@@ -272,6 +276,8 @@ export function registerUndergroundInput(
 
   scene.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
     if (pointer.isDown && pointer.leftButtonDown()) {
+      const world = getWorld();
+      if (!world) return;
       handleUndergroundDrag(world, viewState, pointer.x, pointer.y, state);
     }
   });

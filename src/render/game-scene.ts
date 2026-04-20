@@ -125,13 +125,19 @@ export class GameScene extends Phaser.Scene {
     this.input.keyboard!.on('keydown-TWO', () => { this.speedMultiplier = 2; });
     this.input.keyboard!.on('keydown-FOUR', () => { this.speedMultiplier = 4; });
 
+    // UIScene + input handlers take a LAZY world accessor — `this.world` is
+    // assigned by bootFresh/bootFromSave below, and may be replaced again on
+    // restart. Capturing the current (undefined) reference here would freeze
+    // the HUD + world input against a pre-boot world (see Phase 9 stabilization).
+    const getWorld = (): WorldState | undefined => this.world;
+
     // Launch HUD scene on top.
-    this.scene.launch('UIScene', { viewState: this.viewState, world: this.world });
+    this.scene.launch('UIScene', { viewState: this.viewState, getWorld });
     this.scene.bringToTop('UIScene');
 
     // World input dispatchers — internally guard on viewState.activeView.
-    this.surfaceInputState = registerSurfaceInput(this, this.world, this.viewState);
-    registerUndergroundInput(this, this.world, this.viewState);
+    this.surfaceInputState = registerSurfaceInput(this, getWorld, this.viewState);
+    registerUndergroundInput(this, getWorld, this.viewState);
 
     // Phase 9 boot: check for existing save. If found, show SavePrompt overlay.
     // Otherwise boot a fresh scenario directly.
@@ -217,12 +223,9 @@ export class GameScene extends Phaser.Scene {
     this.gamePhase = GamePhase.Playing;
     this.gameLoop.resume();  // ensure running (createGameLoop default is not paused)
     this.lastAutosaveMs = performance.now();
-
-    // Update UIScene reference to the new world (post-boot or post-restart)
-    // Note: UIScene.init() received the original world ref via scene.launch data;
-    // after bootFresh/bootFromSave we hold a new WorldState. UIScene reads world
-    // via the reference stored in its own field. For POC scope, we accept that
-    // UIScene uses the original reference — Plan 07 Playwright covers the full flow.
+    // UIScene and world-input handlers resolve `this.world` lazily via the
+    // getWorld accessor installed in create(), so the new reference is picked
+    // up automatically on bootFresh, bootFromSave, and restartGame.
   }
 
   private restartGame(): void {

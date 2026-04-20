@@ -106,7 +106,11 @@ const STATS_TEXT_X = HUD.STATS.x + 4;
 
 export class UIScene extends Phaser.Scene {
   private viewState!: ViewState;
-  private world!: WorldState;
+  // Lazy accessor — returns the live WorldState or undefined pre-boot.
+  // GameScene stores a class-field world reference that is undefined until
+  // bootFresh/bootFromSave runs; direct capture in init() was a stale-reference
+  // bug that froze the HUD on the pre-boot (undefined) world.
+  private getWorld!: () => WorldState | undefined;
   private gfx!: Phaser.GameObjects.Graphics;
   private antsText!: Phaser.GameObjects.Text;
   private foodText!: Phaser.GameObjects.Text;
@@ -122,9 +126,9 @@ export class UIScene extends Phaser.Scene {
 
   constructor() { super({ key: 'UIScene' }); }
 
-  init(data: { viewState: ViewState; world: WorldState }) {
+  init(data: { viewState: ViewState; getWorld: () => WorldState | undefined }) {
     this.viewState = data.viewState;
-    this.world = data.world;
+    this.getWorld = data.getWorld;
   }
 
   create() {
@@ -229,16 +233,17 @@ export class UIScene extends Phaser.Scene {
             pointer.x, pointer.y,
             contextMenuState.screenX, contextMenuState.screenY,
           );
-          if (choice !== null) {
+          const world = this.getWorld();
+          if (choice !== null && world) {
             const cmd: PlaceChamberCommand = {
               type: 'PlaceChamber',
               colonyId: PLAYER_COLONY_ID,
               chamberType: choice,
               anchorTileX: contextMenuState.anchorTileX,
               anchorTileY: contextMenuState.anchorTileY,
-              issuedAtTick: this.world.tick,
+              issuedAtTick: world.tick,
             };
-            this.world.commandQueue.push(cmd);
+            world.commandQueue.push(cmd);
           }
           requestHideContextMenu();
           return;
@@ -280,14 +285,17 @@ export class UIScene extends Phaser.Scene {
 
     this.input.on('pointerup', () => {
       if (this.dragState.isDragging) {
-        // Emit exactly one SetBehaviorRatioCommand per drag session (T-08-12).
-        const cmd: SetBehaviorRatioCommand = {
-          type: 'SetBehaviorRatio',
-          colonyId: PLAYER_COLONY_ID,
-          ratio: this.dragState.targetRatio,
-          issuedAtTick: this.world.tick,
-        };
-        this.world.commandQueue.push(cmd);
+        const world = this.getWorld();
+        if (world) {
+          // Emit exactly one SetBehaviorRatioCommand per drag session (T-08-12).
+          const cmd: SetBehaviorRatioCommand = {
+            type: 'SetBehaviorRatio',
+            colonyId: PLAYER_COLONY_ID,
+            ratio: this.dragState.targetRatio,
+            issuedAtTick: world.tick,
+          };
+          world.commandQueue.push(cmd);
+        }
         this.dragState.isDragging = false;
       }
     });
@@ -300,11 +308,10 @@ export class UIScene extends Phaser.Scene {
     applyPendingContextMenuHide();
     this.gfx.clear();
 
-    // Guard: world may be undefined during SavePrompt phase before bootFresh/bootFromSave
-    // sets GameScene.world (GameScene.create() launches UIScene before calling bootFresh).
-    // Overlay lifecycle still works (setActiveOverlay is called outside update()), so
-    // skip all world-dependent HUD rendering until a world is available.
-    if (!this.world) return;
+    // Pull the live world each frame via the lazy getter. Returns undefined
+    // pre-boot (SavePrompt phase) and on any future world swap between frames.
+    const world = this.getWorld();
+    if (!world) return;
 
     // Auto-dismiss the underground context menu if the player switches away
     // from the underground view (via Tab key, toggle button, or minimap click).
@@ -314,7 +321,7 @@ export class UIScene extends Phaser.Scene {
       hideContextMenu();
     }
 
-    const colony = this.world.colonies[PLAYER_COLONY_ID];
+    const colony = world.colonies[PLAYER_COLONY_ID];
 
     // HUD-02 stats bar per PRD §6c:
     //   - semi-transparent dark background over the full 200x24 rect
@@ -324,7 +331,7 @@ export class UIScene extends Phaser.Scene {
     this.gfx.fillRect(HUD.STATS.x, HUD.STATS.y, HUD.STATS.w, HUD.STATS.h);
 
     if (colony) {
-      const s = computeHudStats(this.world, colony);
+      const s = computeHudStats(world, colony);
       this.antsText.setText(formatAntsLabel(s));
       this.foodText.setText(formatFoodLabel(s));
 
@@ -367,7 +374,7 @@ export class UIScene extends Phaser.Scene {
     }
 
     // Minimap
-    drawMinimap(this.gfx as unknown as import('./draw-surface.js').GfxLike, this.world, this.viewState);
+    drawMinimap(this.gfx as unknown as import('./draw-surface.js').GfxLike, world, this.viewState);
 
     // View toggle button background
     this.gfx.fillStyle(0x333333, 1);
@@ -420,8 +427,11 @@ export class UIScene extends Phaser.Scene {
     title.setOrigin(0.5);
     title.setDepth(21);
 
-    // Kill stats subtitle — read via plain-object bracket access (ADR-0006)
-    const playerColony = this.world.colonies[_PLAYER_COLONY_ID];
+    // Kill stats subtitle — read via plain-object bracket access (ADR-0006).
+    // GameScene only triggers this overlay after a tick produces an outcome,
+    // so getWorld() must be defined; optional-chain the colony read regardless.
+    const world = this.getWorld();
+    const playerColony = world?.colonies[_PLAYER_COLONY_ID];
     const killCount = playerColony?.killCount ?? 0;
     const subtitle = this.add.text(W / 2, H / 2 - 10, formatKillStatsSubtitle(killCount), {
       fontSize: '18px',

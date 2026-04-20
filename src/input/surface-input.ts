@@ -255,17 +255,24 @@ export function handleSurfaceRightClick(
 /**
  * registerSurfaceInput — attach surface-click handlers to a Phaser.Scene.
  *
- * Called from GameScene.create() (Plan 06 Task 3) after UIScene is launched.
- * Each handler internally guards on viewState.activeView === 'surface',
- * so surface + underground handlers may both be registered without interference.
+ * Called from GameScene.create() (Plan 06 Task 3). Each handler internally
+ * guards on viewState.activeView === 'surface', so surface + underground
+ * handlers may both be registered without interference.
+ *
+ * getWorld is a LAZY accessor — called on every pointer event — so the
+ * handler always dispatches against the live WorldState even if
+ * GameScene swaps references mid-session (bootFresh, bootFromSave,
+ * restartGame). Direct world-reference capture was a stale-closure bug:
+ * the world assigned after registration was invisible to the handler.
+ * Returns undefined pre-boot; all handlers short-circuit.
  *
  * @param scene     - Phaser.Scene (GameScene) providing the input event bus.
- * @param world     - Mutable WorldState reference (commandQueue is written).
+ * @param getWorld  - Lazy accessor for the live WorldState.
  * @param viewState - Render-layer ViewState; activeView is read for guard.
  */
 export function registerSurfaceInput(
   scene: Phaser.Scene,
-  world: WorldState,
+  getWorld: () => WorldState | undefined,
   viewState: ViewState,
 ): SurfaceInputState {
   const state: SurfaceInputState = {
@@ -273,6 +280,8 @@ export function registerSurfaceInput(
     pendingEntranceTileY: null,
   };
   scene.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
+    const world = getWorld();
+    if (!world) return;
     if (pointer.leftButtonDown()) {
       handleSurfaceLeftClick(world, viewState, pointer.x, pointer.y, state);
     } else if (pointer.rightButtonDown()) {
