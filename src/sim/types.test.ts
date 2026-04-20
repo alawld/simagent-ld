@@ -478,6 +478,23 @@ describe('WorldState', () => {
         dst.colonies[1]!.entrances.push({ entranceId: 99, surfaceTileX: 50, surfaceTileY: 64, isOpen: false });
         expect(src.colonies[1]!.entrances.length).toBe(0);
       });
+
+      it('copyWorldState round-trips killCount', () => {
+        src.colonies[1] = createColonyRecord(1, 42);
+        src.colonies[1]!.entrances = [];
+        src.colonies[1]!.rallyPoint = null;
+        src.colonies[1]!.digFlowFieldDirty = false;
+        src.colonies[1]!.killCount = 5;
+
+        dst.colonies[1] = createColonyRecord(1, 42);
+        dst.colonies[1]!.entrances = [];
+        dst.colonies[1]!.rallyPoint = null;
+        dst.colonies[1]!.digFlowFieldDirty = false;
+        dst.colonies[1]!.killCount = 99;
+
+        copyWorldState(src, dst);
+        expect(dst.colonies[1]!.killCount).toBe(5);
+      });
     });
 
   }); // end describe('copyWorldState')

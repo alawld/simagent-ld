@@ -68,6 +68,7 @@ function serializeWorldState(w: WorldState): string {
         nurseCount:           c.nurseCount,
         defeated:             c.defeated,
         reconcileCountdown:   c.reconcileCountdown,
+        killCount:            c.killCount,
         digFlowFieldDirty:    c.digFlowFieldDirty,
         eggs:                 [...c.eggs],
         larvae:               [...c.larvae],

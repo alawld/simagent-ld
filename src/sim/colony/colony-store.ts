@@ -126,6 +126,11 @@ export interface ColonyRecord {
 
   /** Phase 3 PRD §2 — set true when any tile passability in this colony's underground changes (per research Pitfall 3). Cleared by tick.ts step 9 after flow-field recomputation. Assigned caller-side per PRD §2a extension contract. */
   digFlowFieldDirty: boolean;
+
+  /** Phase 9 / CMBT-06/07 / PRD §1a — cumulative count of enemies killed by this colony's ants.
+   *  Incremented inside combat.killAnt (Plan 02) when ants from this colony win a combat round.
+   *  Initialized to 0 in createColonyRecord. Round-trips through copyWorldState + save. */
+  killCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +184,7 @@ export function createColonyRecord(colonyId: ColonyId, queenEntityId: EntityId):
     taskCensus:            { nurse: 0, forage: 0, dig: 0, fight: 0 },
     defeated:              false,
     reconcileCountdown:    RECONCILE_INTERVAL_TICKS,
+    killCount:             0,
   }) as unknown as ColonyRecord;
 }
 

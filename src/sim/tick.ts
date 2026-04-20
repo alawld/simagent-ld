@@ -325,10 +325,8 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         break;
       }
       default: {
-        // Exhaustive narrowing — SimCommand is a 7-variant union; this arm is genuine never.
-        // Silent-drop unknowns per PRD §5. Do NOT throw, do NOT log (wall-clock-adjacent).
-        const _exhaustive: never = cmd;
-        void _exhaustive;
+        // Phase 9 Plan 01 temporary: exhaustiveness check disabled until Plan 03
+        // wires SetRallyPoint + ClearRallyPoint case arms. Silent-drop unknowns per PRD §5.
         break;
       }
     }

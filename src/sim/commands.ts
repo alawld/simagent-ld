@@ -62,6 +62,20 @@ export interface DesignateEntranceCommand extends SimCommandBase {
   readonly surfaceTileY: number;
 }
 
+/** PRD §4 / SURF-04 — player sets a rally point at a surface tile for fight-assigned ants. */
+export interface SetRallyPointCommand extends SimCommandBase {
+  readonly type: 'SetRallyPoint';
+  readonly colonyId: ColonyId;
+  readonly tileX: number;
+  readonly tileY: number;
+}
+
+/** PRD §4 / SURF-04 — player clears the existing rally point for a colony. */
+export interface ClearRallyPointCommand extends SimCommandBase {
+  readonly type: 'ClearRallyPoint';
+  readonly colonyId: ColonyId;
+}
+
 export type SimCommand =
   | NoOpCommand
   | SetBehaviorRatioCommand
@@ -69,6 +83,8 @@ export type SimCommand =
   | MarkFoodPileCommand
   | CancelDigMarkCommand
   | PlaceChamberCommand
-  | DesignateEntranceCommand;
+  | DesignateEntranceCommand
+  | SetRallyPointCommand
+  | ClearRallyPointCommand;
 
 export const MAX_COMMANDS_PER_TICK = 64; // PRD §5 line 680 — FIFO silent-drop beyond cap

@@ -8,6 +8,8 @@ import {
   type CancelDigMarkCommand,
   type PlaceChamberCommand,
   type DesignateEntranceCommand,
+  type SetRallyPointCommand,
+  type ClearRallyPointCommand,
   MAX_COMMANDS_PER_TICK,
 } from './commands.js';
 import { ChamberType } from './enums.js';
@@ -198,9 +200,9 @@ describe('SimCommand', () => {
   });
 
   describe('discriminated union type narrowing', () => {
-    it('7-variant exhaustive switch: all variants handled, default never arm compiles', () => {
+    it('9-variant exhaustive switch: all variants handled, default never arm compiles', () => {
       // This function's type correctness is validated by TypeScript at compile time.
-      // The runtime test verifies the discriminant values are correct for all 7 variants.
+      // The runtime test verifies the discriminant values are correct for all 9 variants.
       function handleCommand(cmd: SimCommand): string {
         switch (cmd.type) {
           case 'NoOp':
@@ -217,6 +219,10 @@ describe('SimCommand', () => {
             return `chamber:${cmd.anchorTileX},${cmd.anchorTileY}:type${cmd.chamberType}`;
           case 'DesignateEntrance':
             return `entrance:${cmd.surfaceTileX},${cmd.surfaceTileY}`;
+          case 'SetRallyPoint':
+            return `rally:${cmd.colonyId}:${cmd.tileX},${cmd.tileY}`;
+          case 'ClearRallyPoint':
+            return `clearrally:${cmd.colonyId}`;
           default: {
             // Exhaustive check — TypeScript will error here if a variant is unhandled
             const _exhaustive: never = cmd;
@@ -232,6 +238,43 @@ describe('SimCommand', () => {
       expect(handleCommand({ type: 'CancelDigMark', colonyId: 1, tileX: 5, tileY: 9, issuedAtTick: 4 })).toBe('cancel:5,9');
       expect(handleCommand({ type: 'PlaceChamber', colonyId: 1, chamberType: ChamberType.Queen, anchorTileX: 3, anchorTileY: 7, issuedAtTick: 5 })).toBe('chamber:3,7:type0');
       expect(handleCommand({ type: 'DesignateEntrance', colonyId: 1, surfaceTileX: 20, surfaceTileY: 64, issuedAtTick: 6 })).toBe('entrance:20,64');
+      expect(handleCommand({ type: 'SetRallyPoint', colonyId: 1, tileX: 10, tileY: 20, issuedAtTick: 7 })).toBe('rally:1:10,20');
+      expect(handleCommand({ type: 'ClearRallyPoint', colonyId: 1, issuedAtTick: 8 })).toBe('clearrally:1');
+    });
+  });
+
+  describe('SetRallyPointCommand / ClearRallyPointCommand shape', () => {
+    it('SetRallyPointCommand has issuedAtTick (extends SimCommandBase)', () => {
+      const cmd: SetRallyPointCommand = {
+        type: 'SetRallyPoint',
+        colonyId: 1,
+        tileX: 5,
+        tileY: 7,
+        issuedAtTick: 42,
+      };
+      expect(cmd.type).toBe('SetRallyPoint');
+      expect(cmd.colonyId).toBe(1);
+      expect(cmd.tileX).toBe(5);
+      expect(cmd.tileY).toBe(7);
+      expect(cmd.issuedAtTick).toBe(42);
+    });
+
+    it('ClearRallyPointCommand has issuedAtTick (extends SimCommandBase)', () => {
+      const cmd: ClearRallyPointCommand = {
+        type: 'ClearRallyPoint',
+        colonyId: 2,
+        issuedAtTick: 42,
+      };
+      expect(cmd.type).toBe('ClearRallyPoint');
+      expect(cmd.colonyId).toBe(2);
+      expect(cmd.issuedAtTick).toBe(42);
+    });
+
+    it('both are assignable to SimCommand union (9 variants)', () => {
+      const a: SimCommand = { type: 'SetRallyPoint', colonyId: 1, tileX: 3, tileY: 9, issuedAtTick: 0 };
+      const b: SimCommand = { type: 'ClearRallyPoint', colonyId: 1, issuedAtTick: 0 };
+      expect(a.type).toBe('SetRallyPoint');
+      expect(b.type).toBe('ClearRallyPoint');
     });
   });
 

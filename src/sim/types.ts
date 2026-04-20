@@ -121,6 +121,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
       fresh.entrances         = [];
       fresh.rallyPoint        = null;
       fresh.digFlowFieldDirty = false;
+      fresh.killCount         = 0;
     }
     const d = dst.colonies[colonyId]!;
 
@@ -135,6 +136,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
     d.nurseCount           = s.nurseCount;
     d.defeated             = s.defeated;
     d.reconcileCountdown   = s.reconcileCountdown;
+    d.killCount            = s.killCount;
 
     // Bucket arrays — reuse via length truncation + index copy (no new array)
     d.eggs.length = s.eggs.length;
