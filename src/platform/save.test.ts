@@ -13,7 +13,8 @@ import type { SimCommand } from '../sim/commands.js';
 import type { ColonyId } from '../sim/colony/colony-store.js';
 
 describe('save.ts (SCEN-04 + SCEN-06)', () => {
-  beforeEach(() => { localStorage.clear(); });
+  // Use window.localStorage to ensure jsdom's implementation (not Node 25 native localStorage)
+  beforeEach(() => { window.localStorage.clear(); });
 
   describe('serializeWorldState — envelope coverage', () => {
     it('includes every WorldState field (tick, rngState, nextEntityId, commandQueue, ants, colonies, pheromoneGrids, surface, undergroundGrids, foodPiles, pendingChambers)', () => {
@@ -172,7 +173,8 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
     });
     it('returns lastSaveMs unchanged on setItem throw (quota)', () => {
       const w = createScenario(42);
-      const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+      // Spy on the actual localStorage instance (InMemoryStorage replaces Storage.prototype on Node 25)
+      const spy = vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('quota'); });
       try {
         const result = tickAutosave(42, [], w, 0, AUTOSAVE_INTERVAL_MS + 1);
         expect(result).toBe(0);
