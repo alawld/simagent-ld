@@ -239,7 +239,7 @@ describe('drawSurfaceEntities', () => {
     expect(antRect).toBeDefined();
   });
 
-  it('draws queen with larger rect (10×10) and a strokeCircle', () => {
+  it('draws queen with larger rect (12×12) and a strokeCircle', () => {
     const antId = 0;
     const colonyId = PLAYER_COLONY_ID;
 
@@ -254,8 +254,8 @@ describe('drawSurfaceEntities', () => {
     drawSurfaceEntities(gfx, world, world, 0, cam);
 
     const rects = gfx.callsOf('fillRect');
-    // Queen rect is 10×10
-    const queenRect = rects.find(r => r.args[2] === 10 && r.args[3] === 10);
+    // Queen rect is 12×12 (Phase 8.5 readability bump from 10×10).
+    const queenRect = rects.find(r => r.args[2] === 12 && r.args[3] === 12);
     expect(queenRect).toBeDefined();
 
     const strokeCircles = gfx.callsOf('strokeCircle');

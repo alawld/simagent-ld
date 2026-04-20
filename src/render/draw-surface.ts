@@ -101,6 +101,10 @@ export function drawSurfaceTerrain(gfx: GfxLike, world: WorldState, cam: CameraS
  *
  * Moving entities (ants) are interpolated between prev and curr state at alpha.
  * Static entities (food piles, entrances) read directly from curr. (VIEW-03)
+ *
+ * `pendingEntrance` is the Phase 8.5 right-click preview: when non-null, a
+ * gold frame is drawn on that tile so the player can see which tile a
+ * confirming left-click will place the entrance at.
  */
 export function drawSurfaceEntities(
   gfx: GfxLike,
@@ -108,6 +112,7 @@ export function drawSurfaceEntities(
   curr: WorldState,
   alpha: number,
   cam: CameraState,
+  pendingEntrance: { tileX: number; tileY: number } | null = null,
 ): void {
   const left = Math.floor(cam.x - cam.viewportWidth  / 2);
   const top  = Math.floor(cam.y - cam.viewportHeight / 2);
@@ -116,25 +121,37 @@ export function drawSurfaceEntities(
   const canvasH = cam.viewportHeight * TILE_SIZE_PX;
 
   // --- Food piles ---
+  // Phase 8.5 readability: add a 1-px dark outline to separate the green pile
+  // circle from the green grass tile underneath.
   for (const pile of curr.foodPiles) {
     const sx = (pile.tileX - left) * TILE_SIZE_PX;
     const sy = (pile.tileY - top)  * TILE_SIZE_PX;
     // Trivial viewport cull
     if (sx < -TILE_SIZE_PX || sx > canvasW || sy < -TILE_SIZE_PX || sy > canvasH) continue;
     const color = pile.isMarkedPriority ? COLOR_FOOD_PILE_MARKED : COLOR_FOOD_PILE_NORMAL;
+    const cx = sx + TILE_SIZE_PX / 2;
+    const cy = sy + TILE_SIZE_PX / 2;
+    const r  = TILE_SIZE_PX / 2 - 2;
     gfx.fillStyle(color, 1);
-    gfx.fillCircle(sx + TILE_SIZE_PX / 2, sy + TILE_SIZE_PX / 2, TILE_SIZE_PX / 2 - 2);
+    gfx.fillCircle(cx, cy, r);
+    gfx.lineStyle(1, 0x000000, 0.6);
+    gfx.strokeCircle(cx, cy, r);
   }
 
   // --- Entrance holes on surface ---
+  // Phase 8.5 readability: render a 2-px dirt rim around the dark hole interior
+  // so the entrance reads as a dug-out hole with a piled-dirt mound, not an
+  // arbitrary black square.
   for (const colony of Object.values(curr.colonies)) {
     if (!colony.entrances) continue;
     for (const entrance of colony.entrances) {
       const sx = (entrance.surfaceTileX - left) * TILE_SIZE_PX;
       const sy = (entrance.surfaceTileY - top)  * TILE_SIZE_PX;
       if (sx < -TILE_SIZE_PX || sx > canvasW || sy < -TILE_SIZE_PX || sy > canvasH) continue;
-      gfx.fillStyle(COLOR_SURFACE_ENTRANCE_HOLE, 1);
+      gfx.fillStyle(COLOR_SURFACE_DIRT, 1);
       gfx.fillRect(sx, sy, TILE_SIZE_PX, TILE_SIZE_PX);
+      gfx.fillStyle(COLOR_SURFACE_ENTRANCE_HOLE, 1);
+      gfx.fillRect(sx + 2, sy + 2, TILE_SIZE_PX - 4, TILE_SIZE_PX - 4);
     }
   }
 
@@ -163,13 +180,31 @@ export function drawSurfaceEntities(
     const color = colonyId === PLAYER_COLONY_ID ? COLOR_PLAYER_COLONY : COLOR_ENEMY_COLONY;
 
     if (isQueen) {
+      // Phase 8.5 readability: larger body + thicker gold ring so the queen
+      // is immediately distinguishable from a worker cluster.
       gfx.fillStyle(color, 1);
-      gfx.fillRect(screenX - 5, screenY - 5, 10, 10);
-      gfx.lineStyle(1, COLOR_QUEEN_OUTLINE, 1);
-      gfx.strokeCircle(screenX, screenY, 7);
+      gfx.fillRect(screenX - 6, screenY - 6, 12, 12);
+      gfx.lineStyle(2, COLOR_QUEEN_OUTLINE, 1);
+      gfx.strokeCircle(screenX, screenY, 9);
     } else {
       gfx.fillStyle(color, 1);
       gfx.fillRect(screenX - 3, screenY - 3, 6, 6);
+    }
+  }
+
+  // --- Pending-entrance preview (Phase 8.5) ---
+  // A 2-px gold frame drawn on the tile the player right-clicked. Reads from
+  // the mutable SurfaceInputState exposed by registerSurfaceInput. Clears
+  // automatically once the player left-clicks the same tileX to confirm.
+  if (pendingEntrance !== null) {
+    const sx = (pendingEntrance.tileX - left) * TILE_SIZE_PX;
+    const sy = (pendingEntrance.tileY - top)  * TILE_SIZE_PX;
+    if (sx > -TILE_SIZE_PX && sx < canvasW && sy > -TILE_SIZE_PX && sy < canvasH) {
+      gfx.fillStyle(COLOR_QUEEN_OUTLINE, 0.7);
+      gfx.fillRect(sx,                      sy,                      TILE_SIZE_PX, 2);            // top
+      gfx.fillRect(sx,                      sy + TILE_SIZE_PX - 2,   TILE_SIZE_PX, 2);            // bottom
+      gfx.fillRect(sx,                      sy,                      2,            TILE_SIZE_PX); // left
+      gfx.fillRect(sx + TILE_SIZE_PX - 2,   sy,                      2,            TILE_SIZE_PX); // right
     }
   }
 }
@@ -183,6 +218,9 @@ export function drawSurfaceEntities(
  *
  * Note: pheromone overlay is drawn by GameScene between terrain and entities;
  * it is NOT called from here.
+ *
+ * `pendingEntrance` (Phase 8.5) is forwarded to drawSurfaceEntities so the
+ * right-click preview frame renders on top of all other surface layers.
  */
 export function drawSurface(
   gfx: GfxLike,
@@ -190,7 +228,8 @@ export function drawSurface(
   curr: WorldState,
   alpha: number,
   cam: CameraState,
+  pendingEntrance: { tileX: number; tileY: number } | null = null,
 ): void {
   drawSurfaceTerrain(gfx, curr, cam);
-  drawSurfaceEntities(gfx, prev, curr, alpha, cam);
+  drawSurfaceEntities(gfx, prev, curr, alpha, cam, pendingEntrance);
 }

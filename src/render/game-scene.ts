@@ -1,10 +1,20 @@
 // game-scene.ts — Phase 8 Phaser GameScene: drives game loop, renders world, handles keyboard/camera.
 //
-// Owns: createGameLoop wiring, draw dispatch, Tab view-toggle, all four camera-pan triggers.
+// Owns: createGameLoop wiring, draw dispatch, Tab view-toggle, camera-pan triggers.
 // UIScene is launched on top of GameScene (stub in Plan 05).
 //
-// Pitfall 1: Phaser camera scrollX/scrollY are top-left pixel offsets; CameraState.x/y are
-//            tile-unit centers. Conversion: scrollX = (cam.x - cam.viewportWidth/2) * TILE_SIZE_PX.
+// Coordinate model (Phase 8.5 stabilization):
+//   The project owns the camera. `CameraState` is in tile units; the draw modules
+//   project world tiles into screen pixels manually by subtracting `left/top` in
+//   visibleRange(). Phaser's own camera (`this.cameras.main`) is left at
+//   scroll=0 and bounds=default — it is NOT synced to CameraState. Previously we
+//   also set `cameras.main.scrollX/scrollY` from CameraState, which double-
+//   translated the Graphics object and pushed the world offscreen (this was the
+//   "surface appears all black" + "underground click Y-offset" bug). The fix is
+//   a single transform: manual projection in the draw modules.
+//
+// Pitfall 1: Do not sync `cameras.main.scrollX/scrollY` from CameraState. The
+//            draw modules already project to screen space.
 // Pitfall 2: Keyboard registration is GameScene-only — UIScene must NOT call createCursorKeys().
 // Pitfall 3: scale.mode = NONE, fixed 800x592 — no DPR scaling.
 
@@ -19,7 +29,6 @@ import {
   toggleView,
   clampCamera,
 } from './camera.js';
-import { TILE_SIZE_PX } from './sprites.js';
 import {
   PLAYER_START_X, PLAYER_START_Y,
   SURFACE_GRID_WIDTH, SURFACE_GRID_HEIGHT,
@@ -29,7 +38,7 @@ import { drawSurface, type GfxLike } from './draw-surface.js';
 import { drawUnderground } from './draw-underground.js';
 import { drawPheromoneOverlay } from './draw-pheromone.js';
 import { processCameraInput, registerDragPan } from '../input/camera-input.js';
-import { registerSurfaceInput } from '../input/surface-input.js';
+import { registerSurfaceInput, type SurfaceInputState } from '../input/surface-input.js';
 import { registerUndergroundInput } from '../input/underground-input.js';
 
 export class GameScene extends Phaser.Scene {
@@ -42,6 +51,7 @@ export class GameScene extends Phaser.Scene {
   private wasd!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
   private tabKey!: Phaser.Input.Keyboard.Key;
   private dragState!: { isDragging: boolean; lastX: number; lastY: number; active: boolean };
+  private surfaceInputState!: SurfaceInputState;
   private lastActiveView: ViewState['activeView'] | null = null;
 
   constructor() { super({ key: 'GameScene' }); }
@@ -67,9 +77,10 @@ export class GameScene extends Phaser.Scene {
     // Drag-pan registration — returns dragState ref for processCameraInput
     this.dragState = registerDragPan(this, this.viewState);
 
-    // Camera bounds are applied reactively in update() based on viewState.activeView;
-    // see the lastActiveView diff block there so ALL view-change paths (Tab, HUD
-    // button, minimap click) update Phaser's camera bounds, not just Tab.
+    // Phase 8.5: Phaser's main camera is intentionally left at scroll=0 with
+    // default bounds. CameraState drives the manual projection inside the draw
+    // modules; syncing Phaser's camera to the same value caused a double-
+    // translation that pushed the world offscreen. See file header.
 
     // Platform accumulator — snapshot hook wired; speed/pause remain Phase 9 seams.
     this.gameLoop = createGameLoop(tick, this.world, {
@@ -83,7 +94,7 @@ export class GameScene extends Phaser.Scene {
     // World input dispatchers — internally guard on viewState.activeView.
     // Both handlers coexist with registerDragPan: Phaser fires all pointerdown
     // handlers; each guards isPointerOverHUD + activeView so they don't interfere.
-    registerSurfaceInput(this, this.world, this.viewState);
+    this.surfaceInputState = registerSurfaceInput(this, this.world, this.viewState);
     registerUndergroundInput(this, this.world, this.viewState);
   }
 
@@ -93,40 +104,29 @@ export class GameScene extends Phaser.Scene {
       toggleView(this.viewState);
     }
 
-    // Reactive camera bounds sync — fires on any activeView change (Tab key,
-    // HUD toggle button, minimap click), not just Tab. Keeps Phaser's camera
-    // bounds consistent with the world size for the active view so drag-pan
-    // and edge-pan clamp correctly.
+    // Track active view for anything that needs to diff on toggle. Phaser's
+    // camera intentionally stays at default bounds / scroll=0 (see header).
     if (this.viewState.activeView !== this.lastActiveView) {
-      if (this.viewState.activeView === 'surface') {
-        this.cameras.main.setBounds(0, 0, SURFACE_GRID_WIDTH * TILE_SIZE_PX, SURFACE_GRID_HEIGHT * TILE_SIZE_PX);
-      } else {
-        this.cameras.main.setBounds(0, 0, UNDERGROUND_GRID_WIDTH * TILE_SIZE_PX, UNDERGROUND_GRID_HEIGHT * TILE_SIZE_PX);
-      }
       this.lastActiveView = this.viewState.activeView;
     }
 
     // Drive platform accumulator (Phase 8 snapshot hook fires before each tick).
     this.gameLoop.update(delta);
 
-    // Apply camera pan triggers + clamp.
+    // Apply keyboard-pan + final clamp. Drag-pan runs in its own handlers
+    // inside registerDragPan. Edge-pan was removed in Phase 8.5.
     processCameraInput(this.viewState, {
       cursors: this.cursors,
       wasd: this.wasd,
-      pointer: this.input.activePointer,
-      canvasW: this.scale.width,
-      canvasH: this.scale.height,
       dragState: this.dragState,
     });
 
-    // Sync Phaser camera scroll to the project's CameraState (Pitfall 1 — center-to-top-left conversion).
+    // Pick the active CameraState for draw dispatch. Phaser's camera is NOT
+    // synced — the draw modules project manually (see file header).
     const cam = this.viewState.activeView === 'surface' ? this.viewState.surfaceCamera : this.viewState.undergroundCamera;
-    this.cameras.main.scrollX = (cam.x - cam.viewportWidth / 2) * TILE_SIZE_PX;
-    this.cameras.main.scrollY = (cam.y - cam.viewportHeight / 2) * TILE_SIZE_PX;
 
-    // After all pan triggers, ensure the active camera is clamped once per frame.
-    // (processCameraInput clamps keyboard + edge-pan; drag-pan clamps inline.
-    //  This final call is a safety net for accumulated floating-point drift.)
+    // After all pan triggers, ensure the active CameraState is clamped once
+    // per frame (safety net for floating-point drift; pan paths also clamp).
     const worldW = this.viewState.activeView === 'surface' ? SURFACE_GRID_WIDTH : UNDERGROUND_GRID_WIDTH;
     const worldH = this.viewState.activeView === 'surface' ? SURFACE_GRID_HEIGHT : UNDERGROUND_GRID_HEIGHT;
     clampCamera(cam, worldW, worldH);
@@ -137,7 +137,18 @@ export class GameScene extends Phaser.Scene {
     gfx.clear();
     drawPheromoneOverlay(gfx, this.world, cam, this.viewState.activeView);
     if (this.viewState.activeView === 'surface') {
-      drawSurface(gfx, this.prevState, this.world, alpha, cam);
+      // Phase 8.5 interaction-feedback: forward the right-click entrance
+      // preview so the player sees a gold frame on the tile that a
+      // confirming left-click will place the entrance at.
+      const pending =
+        this.surfaceInputState.pendingEntranceTileX !== null &&
+        this.surfaceInputState.pendingEntranceTileY !== null
+          ? {
+              tileX: this.surfaceInputState.pendingEntranceTileX,
+              tileY: this.surfaceInputState.pendingEntranceTileY,
+            }
+          : null;
+      drawSurface(gfx, this.prevState, this.world, alpha, cam, pending);
     } else {
       drawUnderground(gfx, this.prevState, this.world, alpha, cam);
     }

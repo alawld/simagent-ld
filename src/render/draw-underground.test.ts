@@ -255,7 +255,7 @@ describe('drawUndergroundEntities', () => {
     expect(rects.length).toBe(0);
   });
 
-  it('draws queen with 10×10 rect + strokeCircle with COLOR_QUEEN_OUTLINE', () => {
+  it('draws queen with 12×12 rect + strokeCircle with COLOR_QUEEN_OUTLINE', () => {
     const queenId = 0;
     world.colonies[PLAYER_COLONY_ID]!.queenEntityId = queenId;
     initAnt(world.ants, queenId, {
@@ -269,7 +269,8 @@ describe('drawUndergroundEntities', () => {
     drawUndergroundEntities(gfx, world, world, 0, cam);
 
     const rects = gfx.callsOf('fillRect');
-    const queenRect = rects.find(r => r.args[2] === 10 && r.args[3] === 10);
+    // Queen rect is 12×12 (Phase 8.5 readability bump from 10×10).
+    const queenRect = rects.find(r => r.args[2] === 12 && r.args[3] === 12);
     expect(queenRect).toBeDefined();
 
     const strokes = gfx.callsOf('strokeCircle');

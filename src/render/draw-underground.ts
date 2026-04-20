@@ -91,6 +91,13 @@ export function drawUndergroundTerrain(gfx: GfxLike, world: WorldState, cam: Cam
         const color = entranceXSet.has(tx) ? COLOR_UNDERGROUND_OPEN : COLOR_UNDERGROUND_CEILING_STRIP;
         gfx.fillStyle(color, 1);
         gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
+        // Phase 8.5 usability (PRD §7c.1): highlight entrance-column ceiling
+        // gaps with a translucent gold tint so the "way in" reads at a glance
+        // even when the grid is almost entirely Solid (first-visit state).
+        if (entranceXSet.has(tx)) {
+          gfx.fillStyle(COLOR_QUEEN_OUTLINE, 0.28);
+          gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
+        }
       } else {
         const state = ugGet(grid, tx, ty);
         if (state === UndergroundTileState.Solid) {
@@ -101,15 +108,19 @@ export function drawUndergroundTerrain(gfx: GfxLike, world: WorldState, cam: Cam
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
         } else if (state === UndergroundTileState.Marked) {
           // Draw open base then overlay
+          // Phase 8.5 readability: overlay alpha 0.4→0.55 so Marked tiles read
+          // distinctly from Open floor without washing out the blue tint.
           gfx.fillStyle(COLOR_UNDERGROUND_OPEN, 1);
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
-          gfx.fillStyle(COLOR_MARKED_TILE_OVERLAY, 0.4);
+          gfx.fillStyle(COLOR_MARKED_TILE_OVERLAY, 0.55);
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
         } else if (state === UndergroundTileState.BeingDug) {
           // Draw open base then overlay
+          // Phase 8.5 readability: overlay alpha 0.5→0.65 so BeingDug tiles
+          // read as actively worked, not just "vaguely tinted".
           gfx.fillStyle(COLOR_UNDERGROUND_OPEN, 1);
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
-          gfx.fillStyle(COLOR_BEING_DUG_OVERLAY, 0.5);
+          gfx.fillStyle(COLOR_BEING_DUG_OVERLAY, 0.65);
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
         }
       }
@@ -145,6 +156,9 @@ export function drawUndergroundEntities(
   const canvasH = cam.viewportHeight * TILE_SIZE_PX;
 
   // --- Chambers ---
+  // Phase 8.5 usability (PRD §7c.1): after drawing the chamber fill, queen
+  // chambers get a 2-px gold outline so at least one landmark is visible on
+  // the first underground Tab, even when the rest of the grid is all-Solid.
   for (const chamber of colony.chambers) {
     const dims = CHAMBER_DIMENSIONS[chamber.chamberType];
     if (dims === undefined) continue;
@@ -153,8 +167,17 @@ export function drawUndergroundEntities(
     const screenX = (tileX - left) * TILE_SIZE_PX;
     const screenY = (tileY - top)  * TILE_SIZE_PX;
     const color = CHAMBER_COLORS[chamber.chamberType] ?? COLOR_CHAMBER_QUEEN;
+    const w = dims.width  * TILE_SIZE_PX;
+    const h = dims.height * TILE_SIZE_PX;
     gfx.fillStyle(color, 1);
-    gfx.fillRect(screenX, screenY, dims.width * TILE_SIZE_PX, dims.height * TILE_SIZE_PX);
+    gfx.fillRect(screenX, screenY, w, h);
+    if (chamber.chamberType === ChamberType.Queen) {
+      gfx.fillStyle(COLOR_QUEEN_OUTLINE, 0.7);
+      gfx.fillRect(screenX,         screenY,         w, 2);     // top
+      gfx.fillRect(screenX,         screenY + h - 2, w, 2);     // bottom
+      gfx.fillRect(screenX,         screenY,         2, h);     // left
+      gfx.fillRect(screenX + w - 2, screenY,         2, h);     // right
+    }
   }
 
   // --- Underground ants (zone === 1) ---
@@ -182,10 +205,12 @@ export function drawUndergroundEntities(
     const color = colonyId === PLAYER_COLONY_ID ? COLOR_PLAYER_COLONY : COLOR_ENEMY_COLONY;
 
     if (isQueen) {
+      // Phase 8.5 readability: larger body + thicker gold ring so the queen
+      // is immediately distinguishable from a worker cluster.
       gfx.fillStyle(color, 1);
-      gfx.fillRect(screenX - 5, screenY - 5, 10, 10);
-      gfx.lineStyle(1, COLOR_QUEEN_OUTLINE, 1);
-      gfx.strokeCircle(screenX, screenY, 7);
+      gfx.fillRect(screenX - 6, screenY - 6, 12, 12);
+      gfx.lineStyle(2, COLOR_QUEEN_OUTLINE, 1);
+      gfx.strokeCircle(screenX, screenY, 9);
     } else {
       gfx.fillStyle(color, 1);
       gfx.fillRect(screenX - 3, screenY - 3, 6, 6);
