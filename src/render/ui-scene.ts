@@ -300,6 +300,12 @@ export class UIScene extends Phaser.Scene {
     applyPendingContextMenuHide();
     this.gfx.clear();
 
+    // Guard: world may be undefined during SavePrompt phase before bootFresh/bootFromSave
+    // sets GameScene.world (GameScene.create() launches UIScene before calling bootFresh).
+    // Overlay lifecycle still works (setActiveOverlay is called outside update()), so
+    // skip all world-dependent HUD rendering until a world is available.
+    if (!this.world) return;
+
     // Auto-dismiss the underground context menu if the player switches away
     // from the underground view (via Tab key, toggle button, or minimap click).
     // The menu only makes sense while underground; leaving it visible on the
