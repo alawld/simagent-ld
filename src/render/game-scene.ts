@@ -193,6 +193,8 @@ export class GameScene extends Phaser.Scene {
    *   - no in-flight pan / drag / dig / entrance-preview state leaks across
    *   - contextMenuState is hidden
    *   - lastActiveView diff sentinel is cleared so the next frame re-syncs
+   *   - speedMultiplier is back to 1x (Phase 4 fresh-boot contract) — save
+   *     files don't persist speed, so continue-from-save also restarts at 1x
    *
    * All mutations are in-place so references already captured by UIScene
    * and by registerSurfaceInput / registerUndergroundInput / registerDragPan
@@ -209,6 +211,7 @@ export class GameScene extends Phaser.Scene {
     hideContextMenu();
     this.lastActiveView = null;
     this.currentOutcome = GameOutcome.None;
+    this.speedMultiplier = 1;
   }
 
   private bootFresh(): void {

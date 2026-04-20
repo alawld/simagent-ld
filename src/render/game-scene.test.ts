@@ -274,11 +274,13 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     surfaceInputState: SurfaceInputState;
     undergroundInputState: UndergroundInputState;
     dragState: DragState;
+    /** GameScene scalar — modeled here so the harness exercises the same fan-out. */
+    speedMultiplier: number;
   }
 
   function makeDirtySession(): SessionState {
     // Emulate a mid-session GameScene: mid-game, mid-drag, context menu open,
-    // entrance previewed, pan in flight.
+    // entrance previewed, pan in flight, game sped up.
     const inputLog: SimCommand[] = [
       { type: 'NoOp', issuedAtTick: 0 },
       { type: 'NoOp', issuedAtTick: 1 },
@@ -302,7 +304,14 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     panInputState.isPanning = true;
     contextMenuState.visible = true;
     contextMenuState.screenX = 300;
-    return { inputLog, viewState, surfaceInputState, undergroundInputState, dragState };
+    return {
+      inputLog,
+      viewState,
+      surfaceInputState,
+      undergroundInputState,
+      dragState,
+      speedMultiplier: 4, // player had sped up to 4x before the restart
+    };
   }
 
   // Matches resetSessionState's fan-out exactly — kept here so the contract
@@ -316,6 +325,7 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     resetDragState(s.dragState);
     resetPanInputState();
     hideContextMenu();
+    s.speedMultiplier = 1;
   }
 
   it('clears every piece of session state back to defaults', () => {
@@ -338,6 +348,19 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     expect(panInputState.spaceHeld).toBe(false);
     expect(panInputState.isPanning).toBe(false);
     expect(contextMenuState.visible).toBe(false);
+    expect(s.speedMultiplier).toBe(1);
+  });
+
+  it('speedMultiplier resets to 1x regardless of prior 2x / 4x setting', () => {
+    // Phase 4 contract: every new session boots at 1x. Save files do not
+    // persist speed so continue-from-save also restarts at 1x — the reset
+    // runs unconditionally at the top of bootFresh and bootFromSave.
+    for (const prior of [1, 2, 4]) {
+      const s = makeDirtySession();
+      s.speedMultiplier = prior;
+      runSessionReset(s);
+      expect(s.speedMultiplier).toBe(1);
+    }
   });
 
   it('preserves every object identity — no captured handler is stranded', () => {
@@ -385,6 +408,7 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     s.surfaceInputState.pendingEntranceTileX = 12;
     s.surfaceInputState.pendingEntranceTileY = 4;
     s.undergroundInputState.isDragging = true;
+    s.speedMultiplier = 2;
 
     runSessionReset(s);
 
@@ -392,6 +416,7 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     expect(s.viewState.surfaceCamera.x).toBe(PLAYER_START_X);
     expect(s.surfaceInputState.pendingEntranceTileX).toBeNull();
     expect(s.undergroundInputState.isDragging).toBe(false);
+    expect(s.speedMultiplier).toBe(1);
   });
 });
 
