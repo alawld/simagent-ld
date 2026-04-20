@@ -11,6 +11,7 @@ import {
   VIEWPORT_WIDTH_TILES,
   VIEWPORT_HEIGHT_TILES,
   createViewState,
+  resetViewState,
   toggleView,
   clampCamera,
   screenToTile,
@@ -66,6 +67,89 @@ describe('createViewState', () => {
     expect(vs.surfaceCamera.viewportHeight).toBe(VIEWPORT_HEIGHT_TILES);
     expect(vs.undergroundCamera.viewportWidth).toBe(VIEWPORT_WIDTH_TILES);
     expect(vs.undergroundCamera.viewportHeight).toBe(VIEWPORT_HEIGHT_TILES);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resetViewState — Phase 9 session reset
+// ---------------------------------------------------------------------------
+
+describe('resetViewState', () => {
+  it('restores activeView to "surface" regardless of prior view', () => {
+    const vs = createViewState(10, 10);
+    vs.activeView = 'underground';
+    resetViewState(vs, 24, 64);
+    expect(vs.activeView).toBe('surface');
+  });
+
+  it('rebinds surfaceCamera center to the given start tile', () => {
+    const vs = createViewState(10, 10);
+    vs.surfaceCamera.x = 999;
+    vs.surfaceCamera.y = 999;
+    resetViewState(vs, 24, 64);
+    expect(vs.surfaceCamera.x).toBe(24);
+    expect(vs.surfaceCamera.y).toBe(64);
+  });
+
+  it('rebinds undergroundCamera to (start, UNDERGROUND_GRID_HEIGHT/2)', () => {
+    const vs = createViewState(10, 10);
+    vs.undergroundCamera.x = 999;
+    vs.undergroundCamera.y = 999;
+    resetViewState(vs, 24, 64);
+    expect(vs.undergroundCamera.x).toBe(24);
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+  });
+
+  it('clears undergroundVisited so the next toggle re-centers Y', () => {
+    const vs = createViewState(24, 64);
+    toggleView(vs); // → underground, visited=true
+    toggleView(vs); // → surface
+    expect(vs.undergroundVisited).toBe(true);
+    resetViewState(vs, 24, 64);
+    expect(vs.undergroundVisited).toBe(false);
+    // Next underground toggle should re-center Y (first-visit semantics).
+    vs.undergroundCamera.y = 5;
+    toggleView(vs);
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+  });
+
+  it('preserves the ViewState object identity (mutates in place)', () => {
+    // Critical invariant: UIScene + input handlers capture this reference in
+    // create(). A reassigned object would strand those references on the old.
+    const vs = createViewState(10, 10);
+    const surfaceCamRef = vs.surfaceCamera;
+    const undergroundCamRef = vs.undergroundCamera;
+    resetViewState(vs, 24, 64);
+    expect(vs.surfaceCamera).toBe(surfaceCamRef);
+    expect(vs.undergroundCamera).toBe(undergroundCamRef);
+  });
+
+  it('restores viewport dimensions to canonical defaults', () => {
+    const vs = createViewState(10, 10);
+    vs.surfaceCamera.viewportWidth = 99;
+    vs.surfaceCamera.viewportHeight = 99;
+    vs.undergroundCamera.viewportWidth = 99;
+    vs.undergroundCamera.viewportHeight = 99;
+    resetViewState(vs, 24, 64);
+    expect(vs.surfaceCamera.viewportWidth).toBe(VIEWPORT_WIDTH_TILES);
+    expect(vs.surfaceCamera.viewportHeight).toBe(VIEWPORT_HEIGHT_TILES);
+    expect(vs.undergroundCamera.viewportWidth).toBe(VIEWPORT_WIDTH_TILES);
+    expect(vs.undergroundCamera.viewportHeight).toBe(VIEWPORT_HEIGHT_TILES);
+  });
+
+  it('restart simulation: mid-game underground pan does not leak into fresh session', () => {
+    const vs = createViewState(24, 64);
+    toggleView(vs); // underground
+    vs.undergroundCamera.x = 100;
+    vs.undergroundCamera.y = 40;
+    vs.surfaceCamera.x = 80;
+    resetViewState(vs, 24, 64);
+    expect(vs.activeView).toBe('surface');
+    expect(vs.surfaceCamera.x).toBe(24);
+    expect(vs.surfaceCamera.y).toBe(64);
+    expect(vs.undergroundCamera.x).toBe(24);
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+    expect(vs.undergroundVisited).toBe(false);
   });
 });
 

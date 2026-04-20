@@ -120,6 +120,38 @@ export function createViewState(startTileX: number, startTileY: number): ViewSta
 }
 
 // ---------------------------------------------------------------------------
+// resetViewState — in-place reset for session restart
+// ---------------------------------------------------------------------------
+
+/**
+ * Reset an existing ViewState back to the same defaults as createViewState,
+ * but MUTATING IN PLACE so references captured by UIScene / input handlers
+ * remain valid. Reassigning to a fresh object would strand those references
+ * on the pre-restart ViewState (same failure class as the stale-world bug).
+ *
+ * Used by bootFresh / bootFromSave / restartGame: a new session must not
+ * inherit the prior session's activeView, camera position, drag state, or
+ * first-visit flag. Save files do not persist camera state, so continue-from-
+ * save also starts the player back at the default surface view.
+ */
+export function resetViewState(
+  viewState: ViewState,
+  startTileX: number,
+  startTileY: number,
+): void {
+  viewState.activeView = 'surface';
+  viewState.surfaceCamera.x = startTileX;
+  viewState.surfaceCamera.y = startTileY;
+  viewState.surfaceCamera.viewportWidth = VIEWPORT_WIDTH_TILES;
+  viewState.surfaceCamera.viewportHeight = VIEWPORT_HEIGHT_TILES;
+  viewState.undergroundCamera.x = startTileX;
+  viewState.undergroundCamera.y = UNDERGROUND_GRID_HEIGHT / 2;
+  viewState.undergroundCamera.viewportWidth = VIEWPORT_WIDTH_TILES;
+  viewState.undergroundCamera.viewportHeight = VIEWPORT_HEIGHT_TILES;
+  viewState.undergroundVisited = false;
+}
+
+// ---------------------------------------------------------------------------
 // toggleView
 // ---------------------------------------------------------------------------
 

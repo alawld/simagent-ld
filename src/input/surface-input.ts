@@ -47,6 +47,17 @@ export interface SurfaceInputState {
   pendingEntranceTileY: number | null;
 }
 
+/**
+ * Reset a SurfaceInputState in-place so the new session starts without any
+ * pending entrance-preview left over from the previous game. Called at
+ * session-restart boundaries; preserves the object identity captured by
+ * registerSurfaceInput's pointerdown closure and by the render layer.
+ */
+export function resetSurfaceInputState(state: SurfaceInputState): void {
+  state.pendingEntranceTileX = null;
+  state.pendingEntranceTileY = null;
+}
+
 // ---------------------------------------------------------------------------
 // isEmptySurfaceTile — checks whether a tile is empty (not entrance, not food pile)
 // ---------------------------------------------------------------------------

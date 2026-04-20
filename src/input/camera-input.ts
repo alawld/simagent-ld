@@ -64,13 +64,36 @@ export const panInputState = {
 };
 
 /**
- * Test-only reset so unit tests that exercise world-input handlers do not
- * inherit state from a prior test that set `spaceHeld = true`. Production
- * code should never need to call this.
+ * Reset the module-level panInputState singleton back to defaults.
+ *
+ * Used at session-restart boundaries (bootFresh / bootFromSave / restartGame)
+ * so a Space key held or pan gesture in flight at the moment the user clicks
+ * Restart or Continue does not leak into the new session. Without this, the
+ * new GameScene instance would see `spaceHeld=true` and suppress left-click
+ * world input until the next Space up-event.
+ *
+ * Also used by unit tests as `resetPanInputStateForTests` (aliased below) so
+ * tests that exercise world-input handlers don't inherit state across cases.
  */
-export function resetPanInputStateForTests(): void {
+export function resetPanInputState(): void {
   panInputState.spaceHeld = false;
   panInputState.isPanning = false;
+}
+
+/** @deprecated Alias kept for test back-compat — use resetPanInputState. */
+export const resetPanInputStateForTests = resetPanInputState;
+
+/**
+ * Reset a DragState object in-place. registerDragPan owns the canonical
+ * instance and passes it to processCameraInput via PanInputs; at session
+ * restart we need to clear any in-flight gesture without replacing the
+ * object (the input handlers closed over the original reference).
+ */
+export function resetDragState(dragState: DragState): void {
+  dragState.isDragging = false;
+  dragState.lastX = 0;
+  dragState.lastY = 0;
+  dragState.active = false;
 }
 
 // ---------------------------------------------------------------------------

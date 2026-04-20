@@ -17,6 +17,8 @@ import {
   handleSurfaceRightClick,
   isEmptySurfaceTile,
   handleSetRallyPoint,
+  resetSurfaceInputState,
+  type SurfaceInputState,
 } from './surface-input.js';
 import { panInputState, resetPanInputStateForTests } from './camera-input.js';
 
@@ -528,5 +530,44 @@ describe('surface-input rally-point fall-through (SURF-04)', () => {
     expect(cmd.tileX).toBe(7);
     expect(cmd.tileY).toBe(2);
     expect(cmd.issuedAtTick).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resetSurfaceInputState — Phase 9 session reset
+// ---------------------------------------------------------------------------
+
+describe('resetSurfaceInputState', () => {
+  it('clears a pending entrance-preview set by a prior right-click', () => {
+    const state: SurfaceInputState = { pendingEntranceTileX: 12, pendingEntranceTileY: 3 };
+    resetSurfaceInputState(state);
+    expect(state.pendingEntranceTileX).toBeNull();
+    expect(state.pendingEntranceTileY).toBeNull();
+  });
+
+  it('preserves the state object identity (mutates in place)', () => {
+    // Required so registerSurfaceInput's closure keeps seeing the same state.
+    const state: SurfaceInputState = { pendingEntranceTileX: 1, pendingEntranceTileY: 1 };
+    const ref = state;
+    resetSurfaceInputState(state);
+    expect(state).toBe(ref);
+  });
+
+  it('is idempotent on an already-cleared state', () => {
+    const state: SurfaceInputState = { pendingEntranceTileX: null, pendingEntranceTileY: null };
+    resetSurfaceInputState(state);
+    expect(state.pendingEntranceTileX).toBeNull();
+    expect(state.pendingEntranceTileY).toBeNull();
+  });
+
+  it('restart simulation: after reset a fresh right-click still sets preview', () => {
+    const state: SurfaceInputState = { pendingEntranceTileX: 5, pendingEntranceTileY: 5 };
+    resetSurfaceInputState(state);
+    const world = makeWorld({ surfaceWidth: 128, surfaceHeight: 64 });
+    const vs = makeViewState('surface', 64, 32);
+    const tile = tileToScreen(20, 10, 64, 32);
+    handleSurfaceRightClick(world, vs, tile.x, tile.y, state);
+    expect(state.pendingEntranceTileX).toBe(20);
+    expect(state.pendingEntranceTileY).toBe(10);
   });
 });

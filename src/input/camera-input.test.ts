@@ -14,6 +14,9 @@ import {
   processCameraInput,
   panInputState,
   resetPanInputStateForTests,
+  resetPanInputState,
+  resetDragState,
+  type DragState,
   type PanInputs,
 } from './camera-input.js';
 
@@ -364,5 +367,44 @@ describe('panInputState', () => {
     resetPanInputStateForTests();
     expect(panInputState.spaceHeld).toBe(false);
     expect(panInputState.isPanning).toBe(false);
+  });
+
+  it('resetPanInputState (production alias) clears both flags', () => {
+    // Same behavior as the test helper; callable at session-restart boundaries.
+    panInputState.spaceHeld = true;
+    panInputState.isPanning = true;
+    resetPanInputState();
+    expect(panInputState.spaceHeld).toBe(false);
+    expect(panInputState.isPanning).toBe(false);
+  });
+
+  it('resetPanInputState === resetPanInputStateForTests (alias identity)', () => {
+    expect(resetPanInputState).toBe(resetPanInputStateForTests);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resetDragState — Phase 9 session reset
+// ---------------------------------------------------------------------------
+
+describe('resetDragState', () => {
+  it('clears active/isDragging and zeroes lastX/lastY', () => {
+    const dragState: DragState = { isDragging: true, lastX: 42, lastY: 99, active: true };
+    resetDragState(dragState);
+    expect(dragState).toEqual({ isDragging: false, lastX: 0, lastY: 0, active: false });
+  });
+
+  it('preserves the DragState object identity (mutates in place)', () => {
+    // Critical: registerDragPan's pointermove handler captured this reference.
+    const dragState: DragState = { isDragging: true, lastX: 10, lastY: 20, active: true };
+    const ref = dragState;
+    resetDragState(dragState);
+    expect(dragState).toBe(ref);
+  });
+
+  it('is idempotent on an already-cleared state', () => {
+    const dragState: DragState = { isDragging: false, lastX: 0, lastY: 0, active: false };
+    resetDragState(dragState);
+    expect(dragState).toEqual({ isDragging: false, lastX: 0, lastY: 0, active: false });
   });
 });

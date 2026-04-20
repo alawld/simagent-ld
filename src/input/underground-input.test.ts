@@ -20,6 +20,8 @@ import {
   handleUndergroundLeftClick,
   handleUndergroundDrag,
   handleUndergroundRightClick,
+  resetUndergroundInputState,
+  type UndergroundInputState,
 } from './underground-input.js';
 import { contextMenuState, hideContextMenu } from '../render/context-menu-state.js';
 import { panInputState, resetPanInputStateForTests } from './camera-input.js';
@@ -471,5 +473,65 @@ describe('handleUndergroundRightClick', () => {
     const vs = makeViewState('underground', 64, 32);
     handleUndergroundRightClick(world, vs, HUD.STATS.x + 5, HUD.STATS.y + 5);
     expect(world.commandQueue).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resetUndergroundInputState — Phase 9 session reset
+// ---------------------------------------------------------------------------
+
+describe('resetUndergroundInputState', () => {
+  it('ends an in-flight drag and clears the last-marked debounce', () => {
+    const state: UndergroundInputState = {
+      isDragging: true,
+      lastMarkedTileX: 12,
+      lastMarkedTileY: 7,
+    };
+    resetUndergroundInputState(state);
+    expect(state.isDragging).toBe(false);
+    expect(state.lastMarkedTileX).toBe(-1);
+    expect(state.lastMarkedTileY).toBe(-1);
+  });
+
+  it('preserves the state object identity (mutates in place)', () => {
+    // registerUndergroundInput closed over this reference; must not swap it.
+    const state: UndergroundInputState = {
+      isDragging: true,
+      lastMarkedTileX: 5,
+      lastMarkedTileY: 5,
+    };
+    const ref = state;
+    resetUndergroundInputState(state);
+    expect(state).toBe(ref);
+  });
+
+  it('is idempotent on an already-reset state', () => {
+    const state: UndergroundInputState = {
+      isDragging: false,
+      lastMarkedTileX: -1,
+      lastMarkedTileY: -1,
+    };
+    resetUndergroundInputState(state);
+    expect(state).toEqual({ isDragging: false, lastMarkedTileX: -1, lastMarkedTileY: -1 });
+  });
+
+  it('restart simulation: a post-reset drag does not inherit the old debounce', () => {
+    // Starting state after restart — no prior drag, no prior tile mark.
+    const state: UndergroundInputState = { isDragging: true, lastMarkedTileX: 5, lastMarkedTileY: 5 };
+    resetUndergroundInputState(state);
+    // After reset: a pointerdown on tile (5,5) in the new session must mark
+    // it, because lastMarkedTile was cleared. handleUndergroundLeftClick
+    // issues the command unconditionally on a Solid tile so we model the
+    // drag-debounce contract directly: the next tile differs from (-1,-1).
+    const world = makeWorld();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 5, 5, UndergroundTileState.Solid);
+    const vs = makeViewState('underground', 64, 32);
+    const { x, y } = tileToScreen(5, 5, 64, 32);
+    handleUndergroundLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(1);
+    expect(state.isDragging).toBe(true);
+    expect(state.lastMarkedTileX).toBe(5);
+    expect(state.lastMarkedTileY).toBe(5);
   });
 });

@@ -62,6 +62,26 @@ export function appendInputLog(log: SimCommand[], cmds: readonly SimCommand[]): 
 }
 
 // ---------------------------------------------------------------------------
+// resetInputLog — session ownership: clears the log in-place
+// ---------------------------------------------------------------------------
+
+/**
+ * Empties the inputLog without reassigning the reference.
+ *
+ * (seed, inputLog) is the Phase 4 / Phase 9 replay contract and describes the
+ * CURRENT session only. bootFresh must start with an empty log; bootFromSave
+ * must start empty before appending the persisted log. restartGame reuses the
+ * GameScene instance so leaked commands from the previous run would otherwise
+ * silently break autosave/replay truth.
+ *
+ * In-place mutation preserves the object identity that holders (e.g. the
+ * autosave closure) have already captured.
+ */
+export function resetInputLog(log: SimCommand[]): void {
+  log.length = 0;
+}
+
+// ---------------------------------------------------------------------------
 // generateFreshSeed — wall-clock to positive int32
 // ---------------------------------------------------------------------------
 

@@ -31,13 +31,30 @@ import { contextMenuState } from '../render/context-menu-state.js';
 // UndergroundInputState — mutable per-registration state
 // ---------------------------------------------------------------------------
 
-interface UndergroundInputState {
+/**
+ * Exported so GameScene can hold the reference returned by
+ * registerUndergroundInput and call resetUndergroundInputState at session
+ * restart boundaries. Direct external callers (tests) also use the shape to
+ * assert reset semantics.
+ */
+export interface UndergroundInputState {
   /** True from the first pointerdown until pointerup — enables drag tile-mark. */
   isDragging: boolean;
   /** Last tile X that had a MarkDigTileCommand emitted during this drag. */
   lastMarkedTileX: number;
   /** Last tile Y that had a MarkDigTileCommand emitted during this drag. */
   lastMarkedTileY: number;
+}
+
+/**
+ * Reset an UndergroundInputState in-place: ends any in-flight drag and
+ * clears the last-marked debounce. Preserves the object identity captured
+ * by registerUndergroundInput's pointerdown / pointermove closures.
+ */
+export function resetUndergroundInputState(state: UndergroundInputState): void {
+  state.isDragging = false;
+  state.lastMarkedTileX = -1;
+  state.lastMarkedTileY = -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +274,7 @@ export function registerUndergroundInput(
   scene: Phaser.Scene,
   getWorld: () => WorldState | undefined,
   viewState: ViewState,
-): void {
+): UndergroundInputState {
   const state: UndergroundInputState = {
     isDragging: false,
     lastMarkedTileX: -1,
@@ -285,4 +302,6 @@ export function registerUndergroundInput(
   scene.input.on('pointerup', () => {
     state.isDragging = false;
   });
+
+  return state;
 }

@@ -37,10 +37,12 @@ import {
   appendInputLog,
   generateFreshSeed,
   decideBootMode,
+  resetInputLog,
 } from './game-scene-logic.js';
 import {
   type ViewState,
   createViewState,
+  resetViewState,
   toggleView,
   clampCamera,
 } from './camera.js';
@@ -54,9 +56,23 @@ import { GameOutcome } from '../sim/game-over.js';
 import { drawSurface, type GfxLike } from './draw-surface.js';
 import { drawUnderground } from './draw-underground.js';
 import { drawPheromoneOverlay } from './draw-pheromone.js';
-import { processCameraInput, registerDragPan } from '../input/camera-input.js';
-import { registerSurfaceInput, type SurfaceInputState } from '../input/surface-input.js';
-import { registerUndergroundInput } from '../input/underground-input.js';
+import {
+  processCameraInput,
+  registerDragPan,
+  resetDragState,
+  resetPanInputState,
+} from '../input/camera-input.js';
+import {
+  registerSurfaceInput,
+  resetSurfaceInputState,
+  type SurfaceInputState,
+} from '../input/surface-input.js';
+import {
+  registerUndergroundInput,
+  resetUndergroundInputState,
+  type UndergroundInputState,
+} from '../input/underground-input.js';
+import { hideContextMenu } from './context-menu-state.js';
 // UIScenePhase9 — subset of UIScene public API added in Plan 06 Task 3.
 // Typed here to avoid circular imports; UIScene implements these methods.
 interface UIScenePhase9 {
@@ -82,6 +98,7 @@ export class GameScene extends Phaser.Scene {
   private tabKey!: Phaser.Input.Keyboard.Key;
   private dragState!: { isDragging: boolean; lastX: number; lastY: number; active: boolean };
   private surfaceInputState!: SurfaceInputState;
+  private undergroundInputState!: UndergroundInputState;
   private lastActiveView: ViewState['activeView'] | null = null;
 
   // Phase 9 — GamePhase FSM + session fields
@@ -136,8 +153,11 @@ export class GameScene extends Phaser.Scene {
     this.scene.bringToTop('UIScene');
 
     // World input dispatchers — internally guard on viewState.activeView.
+    // Both return the per-registration state object so restartGame / boot
+    // helpers can reset them in place without invalidating the closures that
+    // Phaser now holds on pointerdown/pointermove/pointerup.
     this.surfaceInputState = registerSurfaceInput(this, getWorld, this.viewState);
-    registerUndergroundInput(this, getWorld, this.viewState);
+    this.undergroundInputState = registerUndergroundInput(this, getWorld, this.viewState);
 
     // Phase 9 boot: check for existing save. If found, show SavePrompt overlay.
     // Otherwise boot a fresh scenario directly.
@@ -161,7 +181,38 @@ export class GameScene extends Phaser.Scene {
   // Boot helpers
   // ---------------------------------------------------------------------------
 
+  /**
+   * Clear every piece of per-session state that lives on the GameScene
+   * instance or on module-level singletons shared with input handlers.
+   *
+   * Must be called at the start of bootFresh AND bootFromSave, even on the
+   * first boot. restartGame reaches this via bootFresh. The authoritative
+   * invariants after this returns:
+   *   - inputLog is empty — (seed, inputLog) describes the new session only
+   *   - viewState is back to the surface default (first-visit flag cleared)
+   *   - no in-flight pan / drag / dig / entrance-preview state leaks across
+   *   - contextMenuState is hidden
+   *   - lastActiveView diff sentinel is cleared so the next frame re-syncs
+   *
+   * All mutations are in-place so references already captured by UIScene
+   * and by registerSurfaceInput / registerUndergroundInput / registerDragPan
+   * stay valid. Reassigning would strand those references (same failure
+   * class as the stale-world bug fixed earlier in Phase 9).
+   */
+  private resetSessionState(): void {
+    resetInputLog(this.inputLog);
+    resetViewState(this.viewState, PLAYER_START_X, PLAYER_START_Y);
+    resetSurfaceInputState(this.surfaceInputState);
+    resetUndergroundInputState(this.undergroundInputState);
+    resetDragState(this.dragState);
+    resetPanInputState();
+    hideContextMenu();
+    this.lastActiveView = null;
+    this.currentOutcome = GameOutcome.None;
+  }
+
   private bootFresh(): void {
+    this.resetSessionState();
     // W1: seed formula — Date.now() is ~1.7e12, exceeds int32. Bitmask-clamp to positive int32.
     // Bitwise ops truncate to int32; 0x7fffffff mask ensures sign bit is clear.
     const seed = generateFreshSeed(Date.now());
@@ -174,11 +225,16 @@ export class GameScene extends Phaser.Scene {
   private bootFromSave(): void {
     const loaded = loadSave();
     if (loaded === null) {
-      // Corrupt save: fall through to fresh
+      // Corrupt save: fall through to fresh (bootFresh runs its own reset)
       deleteSave();
       this.bootFresh();
       return;
     }
+    // Reset BEFORE restoring so the new session starts from a clean slate,
+    // then restore exactly the persisted inputLog. Without the reset, any
+    // commands already in memory (from a prior session on the same scene
+    // instance) would concatenate with loaded.inputLog and break replay truth.
+    this.resetSessionState();
     // Plan 04 SaveFile shape: { version, seed, inputLog, snapshot }
     this.currentSeed = loaded.seed;
     this.world = deserializeWorldState(loaded.snapshot);
