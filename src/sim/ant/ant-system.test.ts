@@ -20,6 +20,7 @@ import {
   routeForagerPriority,
   tickPheromoneDeposit,
   tickAntMovement,
+  updateFightAntTargets,
 } from './ant-system.js';
 import { createWorldState, allocateEntityId } from '../types.js';
 import { createColonyRecord } from '../colony/colony-store.js';
@@ -39,7 +40,7 @@ import {
   UNDERGROUND_GRID_HEIGHT,
   DIG_TICKS_PER_TILE,
 } from '../constants.js';
-import { FP_SHIFT } from '../fixed.js';
+import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import { Zone, UndergroundTileState, ugGet, ugSet, createUndergroundGrid } from '../terrain.js';
 import { createDigFlowFields, computeDigFlowField } from '../dig-system.js';
 import type { WorldState } from '../types.js';
@@ -1263,5 +1264,150 @@ describe('antDepositFood — chamber-aware deposit (UNDR-07)', () => {
     expect(colony.foodStored).toBe(300); // overflow to pool
     expect(world.ants.foodCarrying[antId]).toBe(0);
     expect(world.ants.task[antId]).toBe(AntTask.Idle);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// updateFightAntTargets — Phase 9 / SURF-04
+// ---------------------------------------------------------------------------
+
+describe('updateFightAntTargets', () => {
+  it('writes targetPosX/targetPosY (fixed-point tile-center) for Fighting-task ants when colony rallyPoint is set', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = [];
+    colony.rallyPoint = { tileX: 10, tileY: 20 };
+    colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Fighting,
+      subTask: 0,
+    });
+    world.ants.zone[antId] = 0; // Zone.Surface
+
+    updateFightAntTargets(world);
+
+    expect(world.ants.targetPosX[antId]).toBe((10 << FP_SHIFT) + (FP_ONE >> 1)); // 2688
+    expect(world.ants.targetPosY[antId]).toBe((20 << FP_SHIFT) + (FP_ONE >> 1)); // 5248
+  });
+
+  it('does not touch non-Fighting ants', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = [];
+    colony.rallyPoint = { tileX: 10, tileY: 20 };
+    colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 5 << FP_SHIFT,
+      posY: 3 << FP_SHIFT,
+      task: AntTask.Foraging,
+      subTask: 0,
+    });
+    world.ants.zone[antId] = 0; // Zone.Surface
+    world.ants.targetPosX[antId] = 999;
+    world.ants.targetPosY[antId] = 888;
+
+    updateFightAntTargets(world);
+
+    // Non-Fighting ant's target untouched
+    expect(world.ants.targetPosX[antId]).toBe(999);
+    expect(world.ants.targetPosY[antId]).toBe(888);
+  });
+
+  it('falls back to first entrance (surfaceTileX/surfaceTileY in fp) when rallyPoint is null', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = [{ entranceId: 1, surfaceTileX: 5, surfaceTileY: 7, isOpen: true }];
+    colony.rallyPoint = null;
+    colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Fighting,
+      subTask: 0,
+    });
+    world.ants.zone[antId] = 0; // Zone.Surface
+
+    updateFightAntTargets(world);
+
+    expect(world.ants.targetPosX[antId]).toBe((5 << FP_SHIFT) + (FP_ONE >> 1));
+    expect(world.ants.targetPosY[antId]).toBe((7 << FP_SHIFT) + (FP_ONE >> 1));
+  });
+
+  it('underground Fighting ant with surface rallyPoint routes to first entrance coord first', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = [{ entranceId: 1, surfaceTileX: 3, surfaceTileY: 4, isOpen: true }];
+    colony.rallyPoint = { tileX: 10, tileY: 20 };
+    colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Fighting,
+      subTask: 0,
+    });
+    world.ants.zone[antId] = 1; // Zone.Underground
+
+    updateFightAntTargets(world);
+
+    // Underground ant with surface rally: targets entrance, not rally point
+    expect(world.ants.targetPosX[antId]).toBe((3 << FP_SHIFT) + (FP_ONE >> 1));
+    expect(world.ants.targetPosY[antId]).toBe((4 << FP_SHIFT) + (FP_ONE >> 1));
+  });
+
+  it('skips dead ants (alive[id] !== 1) and unknown colony slots (colonyId not in world.colonies)', () => {
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    const colony = createColonyRecord(COLONY_ID, 0);
+    colony.entrances = [];
+    colony.rallyPoint = { tileX: 10, tileY: 20 };
+    colony.digFlowFieldDirty = false;
+    world.colonies[COLONY_ID] = colony;
+
+    // Dead ant: alive=0
+    const deadId = allocateEntityId(world);
+    initAnt(world.ants, deadId, {
+      colonyId: COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Fighting,
+      subTask: 0,
+    });
+    world.ants.alive[deadId] = 0;
+    world.ants.targetPosX[deadId] = -1;
+    world.ants.targetPosY[deadId] = -1;
+
+    // Ant with unknown colony ID
+    const unknownColonyAntId = allocateEntityId(world);
+    initAnt(world.ants, unknownColonyAntId, {
+      colonyId: 999 as typeof COLONY_ID,
+      posX: 0, posY: 0,
+      task: AntTask.Fighting,
+      subTask: 0,
+    });
+    world.ants.zone[unknownColonyAntId] = 0;
+    world.ants.targetPosX[unknownColonyAntId] = -1;
+    world.ants.targetPosY[unknownColonyAntId] = -1;
+
+    updateFightAntTargets(world);
+
+    // Dead ant: target unchanged
+    expect(world.ants.targetPosX[deadId]).toBe(-1);
+    expect(world.ants.targetPosY[deadId]).toBe(-1);
+    // Unknown colony ant: target unchanged
+    expect(world.ants.targetPosX[unknownColonyAntId]).toBe(-1);
+    expect(world.ants.targetPosY[unknownColonyAntId]).toBe(-1);
   });
 });
