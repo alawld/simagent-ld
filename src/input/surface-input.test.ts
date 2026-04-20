@@ -15,6 +15,8 @@ import {
   findFoodPileAt,
   handleSurfaceLeftClick,
   handleSurfaceRightClick,
+  isEmptySurfaceTile,
+  handleSetRallyPoint,
 } from './surface-input.js';
 import { panInputState, resetPanInputStateForTests } from './camera-input.js';
 
@@ -27,6 +29,7 @@ import { VIEWPORT_WIDTH_TILES, VIEWPORT_HEIGHT_TILES } from '../render/camera.js
 import { HUD, TILE_SIZE_PX } from '../render/sprites.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { SimCommand } from '../sim/commands.js';
+import type { ColonyId } from '../sim/colony/colony-store.js';
 
 // Re-export TILE_SIZE_PX from sprites where it actually lives — camera.ts re-exports via void
 // but we need the numeric value. It is 16 per Plan 01.
@@ -63,24 +66,59 @@ function tileToScreen(tileX: number, tileY: number, camX: number, camY: number):
   return { x: px, y: py };
 }
 
-/** Build a minimal WorldState stub with given foodPiles and commandQueue. */
+/** Build a minimal WorldState stub with given foodPiles, colonies, and commandQueue. */
 function makeWorld(overrides: {
   tick?: number;
   foodPiles?: WorldState['foodPiles'];
+  colonies?: WorldState['colonies'];
+  surfaceWidth?: number;
+  surfaceHeight?: number;
 } = {}): WorldState {
+  const sw = overrides.surfaceWidth ?? 128;
+  const sh = overrides.surfaceHeight ?? 4;
   return {
     tick: overrides.tick ?? 0,
     rngState: 0,
     nextEntityId: 0,
     commandQueue: [] as SimCommand[],
     ants: { posX: new Int32Array(0), posY: new Int32Array(0), colonyId: new Int32Array(0), task: new Int32Array(0), subTask: new Int32Array(0), speed: new Int32Array(0), foodCarrying: new Int32Array(0), starvationTimer: new Int32Array(0), age: new Int32Array(0), alive: new Int32Array(0), lifespan: new Int32Array(0), zone: new Int32Array(0), digTileX: new Int32Array(0), digTileY: new Int32Array(0), digTicksRemaining: new Int32Array(0), targetPosX: new Int32Array(0), targetPosY: new Int32Array(0) },
-    colonies: {},
+    colonies: overrides.colonies ?? {},
     pheromoneGrids: {},
-    surface: { data: new Uint8Array(0), width: 0, height: 0 },
+    surface: { data: new Uint8Array(sw * sh), width: sw, height: sh },
     undergroundGrids: {},
     foodPiles: overrides.foodPiles ?? [],
     pendingChambers: {},
   } as unknown as WorldState;
+}
+
+/** Build a minimal colony record stub with an optional rally point and entrances. */
+function makeColony(overrides: {
+  rallyPoint?: { tileX: number; tileY: number } | null;
+  entrances?: Array<{ surfaceTileX: number; surfaceTileY: number }>;
+} = {}) {
+  return {
+    colonyId: PLAYER_COLONY_ID as ColonyId,
+    queenEntityId: 0,
+    queenStarvationTimer: 0,
+    foodStored: 0,
+    workerCount: 0,
+    eggCount: 0,
+    larvaeCount: 0,
+    nurseCount: 0,
+    eggs: [],
+    larvae: [],
+    workers: [],
+    chambers: [],
+    targetRatio: { forage: 33, dig: 33, fight: 34 },
+    computedAllocation: { nurse: 0, forage: 0, dig: 0, fight: 0 },
+    taskCensus: { nurse: 0, forage: 0, dig: 0, fight: 0 },
+    defeated: false,
+    reconcileCountdown: 0,
+    entrances: overrides.entrances ?? [],
+    rallyPoint: overrides.rallyPoint ?? null,
+    digFlowFieldDirty: false,
+    killCount: 0,
+  };
 }
 
 /** A SurfaceInputState equivalent (the exported interface in surface-input.ts). */
@@ -332,5 +370,163 @@ describe('handleSurfaceRightClick', () => {
     handleSurfaceRightClick(world, vs, x, y, state);
     expect(state.pendingEntranceTileX).toBe(40);
     expect(state.pendingEntranceTileY).toBe(50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isEmptySurfaceTile
+// ---------------------------------------------------------------------------
+
+describe('isEmptySurfaceTile', () => {
+  it('returns true for a tile within bounds with no food pile or entrance', () => {
+    const world = makeWorld({ surfaceWidth: 128, surfaceHeight: 4 });
+    expect(isEmptySurfaceTile(world, 10, 1)).toBe(true);
+  });
+
+  it('returns false when tile has a food pile', () => {
+    const world = makeWorld({
+      surfaceWidth: 128, surfaceHeight: 4,
+      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 1, isMarkedPriority: false }],
+    });
+    expect(isEmptySurfaceTile(world, 10, 1)).toBe(false);
+  });
+
+  it('returns false when tile is a colony entrance (plain-object colonies check)', () => {
+    const colony = makeColony({ entrances: [{ surfaceTileX: 20, surfaceTileY: 0 }] });
+    const world = makeWorld({
+      surfaceWidth: 128, surfaceHeight: 4,
+      colonies: { [PLAYER_COLONY_ID]: colony } as unknown as WorldState['colonies'],
+    });
+    expect(isEmptySurfaceTile(world, 20, 0)).toBe(false);
+  });
+
+  it('returns false when tileX < 0 (out of bounds)', () => {
+    const world = makeWorld({ surfaceWidth: 128, surfaceHeight: 4 });
+    expect(isEmptySurfaceTile(world, -1, 1)).toBe(false);
+  });
+
+  it('returns false when tile is beyond surface width', () => {
+    const world = makeWorld({ surfaceWidth: 128, surfaceHeight: 4 });
+    expect(isEmptySurfaceTile(world, 128, 1)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// surface-input rally-point fall-through (SURF-04)
+// ---------------------------------------------------------------------------
+
+describe('surface-input rally-point fall-through (SURF-04)', () => {
+  it('left-click on empty surface tile pushes SetRallyPointCommand for player colony', () => {
+    const world = makeWorld({ tick: 5, surfaceWidth: 128, surfaceHeight: 4 });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    // Click on tile (10, 1) — within surface bounds, no food pile, no entrance
+    const { x, y } = tileToScreen(10, 1, 64, 2);
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(1);
+    const cmd = world.commandQueue[0] as { type: string; colonyId: number; tileX: number; tileY: number; issuedAtTick: number };
+    expect(cmd.type).toBe('SetRallyPoint');
+    expect(cmd.colonyId).toBe(PLAYER_COLONY_ID);
+    expect(cmd.tileX).toBe(10);
+    expect(cmd.tileY).toBe(1);
+    expect(cmd.issuedAtTick).toBe(5);
+  });
+
+  it('pushed SetRallyPointCommand carries issuedAtTick = world.tick', () => {
+    const world = makeWorld({ tick: 42, surfaceWidth: 128, surfaceHeight: 4 });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    const { x, y } = tileToScreen(5, 1, 64, 2);
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    const cmd = world.commandQueue[0] as { issuedAtTick: number };
+    expect(cmd.issuedAtTick).toBe(42);
+  });
+
+  it('does NOT push SetRallyPoint when tile has a food pile', () => {
+    const world = makeWorld({
+      tick: 0,
+      surfaceWidth: 128, surfaceHeight: 4,
+      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 1, isMarkedPriority: false }],
+    });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 1, 64, 2);
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    // Should push MarkFoodPile, not SetRallyPoint
+    expect(world.commandQueue).toHaveLength(1);
+    const cmd = world.commandQueue[0] as { type: string };
+    expect(cmd.type).toBe('MarkFoodPile');
+  });
+
+  it('does NOT push SetRallyPoint when tile is an existing entrance', () => {
+    const colony = makeColony({ entrances: [{ surfaceTileX: 10, surfaceTileY: 0 }] });
+    const world = makeWorld({
+      tick: 0,
+      surfaceWidth: 128, surfaceHeight: 4,
+      colonies: { [PLAYER_COLONY_ID]: colony } as unknown as WorldState['colonies'],
+    });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 0, 64, 2);
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+  });
+
+  it('right-click on current rallyPoint pushes ClearRallyPointCommand', () => {
+    const colony = makeColony({ rallyPoint: { tileX: 15, tileY: 1 } });
+    const world = makeWorld({
+      tick: 7,
+      surfaceWidth: 128, surfaceHeight: 4,
+      colonies: { [PLAYER_COLONY_ID]: colony } as unknown as WorldState['colonies'],
+    });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    const { x, y } = tileToScreen(15, 1, 64, 2);
+    handleSurfaceRightClick(world, vs, x, y, state, PLAYER_COLONY_ID as ColonyId);
+    expect(world.commandQueue).toHaveLength(1);
+    const cmd = world.commandQueue[0] as { type: string; colonyId: number; issuedAtTick: number };
+    expect(cmd.type).toBe('ClearRallyPoint');
+    expect(cmd.colonyId).toBe(PLAYER_COLONY_ID);
+    expect(cmd.issuedAtTick).toBe(7);
+  });
+
+  it('right-click elsewhere does NOT clear rally (sets entrance preview instead)', () => {
+    const colony = makeColony({ rallyPoint: { tileX: 15, tileY: 1 } });
+    const world = makeWorld({
+      surfaceWidth: 128, surfaceHeight: 4,
+      colonies: { [PLAYER_COLONY_ID]: colony } as unknown as WorldState['colonies'],
+    });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    // Click at different tile (20, 1) — not the rally point
+    const { x, y } = tileToScreen(20, 1, 64, 2);
+    handleSurfaceRightClick(world, vs, x, y, state, PLAYER_COLONY_ID as ColonyId);
+    expect(world.commandQueue).toHaveLength(0);
+    // Should set entrance preview instead
+    expect(state.pendingEntranceTileX).toBe(20);
+  });
+
+  it('empty-tile click has colonyId === playerColonyId (never AI colonyId)', () => {
+    const world = makeWorld({ tick: 0, surfaceWidth: 128, surfaceHeight: 4 });
+    const vs = makeViewState('surface', 64, 2);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 1, 64, 2);
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    if (world.commandQueue.length > 0) {
+      const cmd = world.commandQueue[0] as { colonyId: number };
+      expect(cmd.colonyId).toBe(PLAYER_COLONY_ID);
+    }
+  });
+
+  it('handleSetRallyPoint pushes SetRallyPointCommand with correct fields', () => {
+    const world = makeWorld({ tick: 3 });
+    handleSetRallyPoint(world, 7, 2, PLAYER_COLONY_ID as ColonyId);
+    expect(world.commandQueue).toHaveLength(1);
+    const cmd = world.commandQueue[0] as { type: string; colonyId: number; tileX: number; tileY: number; issuedAtTick: number };
+    expect(cmd.type).toBe('SetRallyPoint');
+    expect(cmd.colonyId).toBe(PLAYER_COLONY_ID);
+    expect(cmd.tileX).toBe(7);
+    expect(cmd.tileY).toBe(2);
+    expect(cmd.issuedAtTick).toBe(3);
   });
 });

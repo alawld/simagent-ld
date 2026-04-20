@@ -1,19 +1,31 @@
-// surface-input.ts — Phase 8 surface-click dispatcher.
+// surface-input.ts — Phase 9 surface-click dispatcher.
 //
-// Handles left-click (food-pile mark + entrance designation confirmation)
-// and right-click (entrance preview) on the surface view.
+// Handles left-click (food-pile mark + entrance designation confirmation + rally point set)
+// and right-click (entrance preview + rally point clear) on the surface view.
+//
+// Priority order for left-click:
+//   1. Entrance designation confirmation (if pendingEntrance matches both X+Y)
+//   2. Food-pile mark (if tile has a food pile)
+//   3. (empty) fall-through: SetRallyPoint (SURF-04)
 //
 // Guards:
 //   - viewState.activeView must be 'surface' before dispatching any command.
 //   - isPointerOverHUD rejects clicks that land on HUD zones (Pitfall 2).
 //   - Tile bounds check (tileX/Y >= 0) before pushing commands.
+//   - ADR-0006: world.colonies accessed via plain-object bracket notation — never .get().
 
 import * as Phaser from 'phaser';
 import type { WorldState } from '../sim/types.js';
 import type { ViewState } from '../render/camera.js';
 import { screenToTile } from '../render/camera.js';
 import type { FoodPile } from '../sim/food.js';
-import type { MarkFoodPileCommand, DesignateEntranceCommand } from '../sim/commands.js';
+import type {
+  MarkFoodPileCommand,
+  DesignateEntranceCommand,
+  SetRallyPointCommand,
+  ClearRallyPointCommand,
+} from '../sim/commands.js';
+import type { ColonyId } from '../sim/colony/colony-store.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import { isPointerOverHUD, panInputState } from './camera-input.js';
 
@@ -33,6 +45,41 @@ export interface SurfaceInputState {
   pendingEntranceTileX: number | null;
   /** TileY companion to pendingEntranceTileX — needed so the render layer can outline the right cell. */
   pendingEntranceTileY: number | null;
+}
+
+// ---------------------------------------------------------------------------
+// isEmptySurfaceTile — checks whether a tile is empty (not entrance, not food pile)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns true when (tileX, tileY) is a valid surface tile that is:
+ *   - within grid bounds
+ *   - NOT occupied by any colony entrance (checked across all colonies via Object.keys)
+ *   - NOT a food pile location
+ *
+ * ADR-0006: world.colonies is a PLAIN OBJECT. Uses Object.keys — never .keys()/.entries()/.get().
+ * SURF-04: empty-tile fallthrough → SetRallyPointCommand.
+ */
+export function isEmptySurfaceTile(world: WorldState, tileX: number, tileY: number): boolean {
+  // Bounds check
+  if (tileX < 0 || tileY < 0) return false;
+  if (tileX >= world.surface.width || tileY >= world.surface.height) return false;
+
+  // Check not a food pile
+  for (const pile of world.foodPiles) {
+    if (pile.tileX === tileX && pile.tileY === tileY) return false;
+  }
+
+  // Check not a colony entrance — iterate colonies via Object.keys (ADR-0006)
+  for (const key of Object.keys(world.colonies)) {
+    const colony = world.colonies[Number(key) as ColonyId];
+    if (colony === undefined) continue;
+    for (const entrance of colony.entrances) {
+      if (entrance.surfaceTileX === tileX && entrance.surfaceTileY === tileY) return false;
+    }
+  }
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +155,7 @@ export function handleSurfaceLeftClick(
     return;
   }
 
-  // Food-pile mark at clicked tile.
+  // Food-pile mark at clicked tile (priority 2).
   const pile = findFoodPileAt(world, tileX, tileY);
   if (pile) {
     const cmd: MarkFoodPileCommand = {
@@ -119,7 +166,38 @@ export function handleSurfaceLeftClick(
       issuedAtTick: world.tick,
     };
     world.commandQueue.push(cmd);
+    return;
   }
+
+  // Empty-tile fallthrough (priority 3): set rally point for player colony (SURF-04).
+  if (isEmptySurfaceTile(world, tileX, tileY)) {
+    handleSetRallyPoint(world, tileX, tileY, PLAYER_COLONY_ID);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// handleSetRallyPoint — inner helper (pure dispatch, extracted for testability)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pushes SetRallyPointCommand for the given colony at (tileX, tileY).
+ * Called by handleSurfaceLeftClick's empty-tile fallthrough (SURF-04).
+ * colonyId argument is always the player colony — AI colonies are never passed here.
+ */
+export function handleSetRallyPoint(
+  world: WorldState,
+  tileX: number,
+  tileY: number,
+  playerColonyId: ColonyId,
+): void {
+  const cmd: SetRallyPointCommand = {
+    type: 'SetRallyPoint',
+    colonyId: playerColonyId,
+    tileX,
+    tileY,
+    issuedAtTick: world.tick,
+  };
+  world.commandQueue.push(cmd);
 }
 
 // ---------------------------------------------------------------------------
@@ -129,12 +207,14 @@ export function handleSurfaceLeftClick(
 /**
  * Handles a right-click on the surface view.
  *
- * Sets pendingEntranceTileX to the clicked tileX (entrance designation preview).
- * A subsequent left-click on the same tile confirms and pushes DesignateEntranceCommand.
+ * Priority order:
+ *   1. If the clicked tile matches the current rally-point tile, push ClearRallyPointCommand.
+ *   2. Otherwise, set pendingEntranceTileX/Y for entrance designation preview.
+ *      A subsequent left-click on the same tile confirms and pushes DesignateEntranceCommand.
  *
  * No-ops if: activeView !== 'surface', pointer over HUD, or tile out of bounds.
  *
- * Note: tileY is recorded as context but DesignateEntranceCommand carries both coords.
+ * ADR-0006: world.colonies accessed via plain-object bracket notation.
  */
 export function handleSurfaceRightClick(
   world: WorldState,
@@ -142,11 +222,28 @@ export function handleSurfaceRightClick(
   screenX: number,
   screenY: number,
   state: SurfaceInputState,
+  playerColonyId: ColonyId = PLAYER_COLONY_ID,
 ): void {
   if (viewState.activeView !== 'surface') return;
   if (isPointerOverHUD(screenX, screenY)) return;
   const { tileX, tileY } = screenToTile(screenX, screenY, viewState.surfaceCamera);
   if (tileX < 0 || tileY < 0) return;
+
+  // Rally-point clear: right-click on the current rally point tile (SURF-04)
+  const playerColony = world.colonies[playerColonyId];  // plain-object bracket access (ADR-0006)
+  if (playerColony !== undefined && playerColony.rallyPoint !== null) {
+    if (playerColony.rallyPoint.tileX === tileX && playerColony.rallyPoint.tileY === tileY) {
+      const cmd: ClearRallyPointCommand = {
+        type: 'ClearRallyPoint',
+        colonyId: playerColonyId,
+        issuedAtTick: world.tick,
+      };
+      world.commandQueue.push(cmd);
+      return;
+    }
+  }
+
+  // Default: entrance designation preview
   state.pendingEntranceTileX = tileX;
   state.pendingEntranceTileY = tileY;
 }
