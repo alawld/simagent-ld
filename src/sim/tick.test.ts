@@ -1799,7 +1799,7 @@ describe('Phase 9 tick integration', () => {
     // Combat at step 17 kills the enemy fighter (queen survives if player queen wins coin flip)
     // OR kills the player queen → step 18 sees dead queen → Victory or Defeat.
     // The key assertion: the outcome reflects what happened AFTER combat, not before.
-    const { world, playerQueenId, playerColonyId, enemyColonyId } = makeTwoColonyWorld();
+    const { world, playerQueenId, enemyColonyId } = makeTwoColonyWorld();
 
     // Place an enemy fighter on the same tile as player queen
     const enemyFighterId = allocateEntityId(world);

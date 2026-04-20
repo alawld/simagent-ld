@@ -427,10 +427,15 @@ export function updateFightAntTargets(world: WorldState): void {
 
     const rp = colony.rallyPoint;
 
-    // No rally point: fall back to first entrance (idle-at-nest).
-    if (rp === null) {
-      if (colony.entrances.length > 0) {
-        const e = colony.entrances[0]!;
+    // createColonyRecord intentionally leaves entrances/rallyPoint uninitialized (colony-store.ts:164);
+    // callers set them post-construction. Treat both null and undefined as "no value".
+    const entrances = colony.entrances;
+    const hasEntrances = entrances != null && entrances.length > 0;
+
+    // No rally point (null or uninitialized): fall back to first entrance (idle-at-nest).
+    if (rp == null) {
+      if (hasEntrances) {
+        const e = entrances[0]!;
         ants.targetPosX[id] = (e.surfaceTileX << FP_SHIFT) + (FP_ONE >> 1);
         ants.targetPosY[id] = (e.surfaceTileY << FP_SHIFT) + (FP_ONE >> 1);
       }
@@ -440,8 +445,8 @@ export function updateFightAntTargets(world: WorldState): void {
     // Underground fighter with surface rally: route to first entrance first.
     // Zone promotion happens inside tickAntMovement when the ant crosses the shaft;
     // this pass only writes the fixed-point target coord.
-    if (ants.zone[id] === 1 /* Underground */ && colony.entrances.length > 0) {
-      const e = colony.entrances[0]!;
+    if (ants.zone[id] === 1 /* Underground */ && hasEntrances) {
+      const e = entrances[0]!;
       ants.targetPosX[id] = (e.surfaceTileX << FP_SHIFT) + (FP_ONE >> 1);
       ants.targetPosY[id] = (e.surfaceTileY << FP_SHIFT) + (FP_ONE >> 1);
       continue;
