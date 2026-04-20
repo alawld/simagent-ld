@@ -1,8 +1,9 @@
-// src/sim/tick.ts — Phase 7 17-step tick dispatcher per PRD §9a.
+// src/sim/tick.ts — Phase 9 19-step tick dispatcher.
 import type { WorldState } from './types.js';
 import { allocateEntityId } from './types.js';
 import { MAX_COMMANDS_PER_TICK, type SimCommand } from './commands.js';
-import { GameOutcome } from './game-over.js';
+import { GameOutcome, checkQueenDeath } from './game-over.js';
+import { detectAndResolveCombat } from './combat.js';
 import { Rng } from './rng.js';
 import {
   AntTask,
@@ -42,6 +43,7 @@ import {
   tickAntMovement,
   tickDigExecution,
   routeForagerPriority,
+  updateFightAntTargets,
 } from './ant/ant-system.js';
 import { tickPheromoneDecay } from './pheromone/pheromone-system.js';
 import {
@@ -66,12 +68,13 @@ const digFlowFields: DigFlowFields = createDigFlowFields();
 void (undefined as unknown as PendingChamber);
 
 /**
- * Advance the simulation by one tick — 17-step PRD §9a dispatcher.
+ * Advance the simulation by one tick — 19-step PRD §9a dispatcher (Phase 9).
  *
  * Step order:
  *  1.  Process commands (FIFO cap: MAX_COMMANDS_PER_TICK; unknown variants silently dropped)
  *       Extended in Phase 7: real MarkDigTile, MarkFoodPile handlers;
  *       new CancelDigMark, PlaceChamber, DesignateEntrance handlers.
+ *       Extended in Phase 9: SetRallyPoint, ClearRallyPoint handlers (9-variant exhaustive switch).
  *  2.  Reconcile colony stats
  *  3.  Food consumption
  *  4.  Starvation check
@@ -83,21 +86,24 @@ void (undefined as unknown as PendingChamber);
  * 10.  Task assignment:
  *       10a. existing Phase 6 idle-reassignment
  *       10b. tickDigExecution — dig-worker state machine (Marked→BeingDug→Open) (NEW in Phase 7)
+ *       10c. updateFightAntTargets — route AntTask.Fighting ants to rallyPoint (NEW in Phase 9)
  * 11.  checkPendingChambers — promote fully-excavated pending chambers (NEW in Phase 7)
  * 12.  checkEntranceCompletion — enable completed entrance shafts (NEW in Phase 7)
  * 13.  routeForagerPriority — route SearchingFood foragers to marked piles (NEW in Phase 7)
  * 14.  Pheromone deposit
  * 15.  Pheromone decay
  * 16.  Movement (zone-aware, extended in Phase 7 with DigFlowFields for pure direction reads)
- * 17.  rngState writeback + world.tick increment
+ * 17.  detectAndResolveCombat (NEW in Phase 9 / CMBT-04)
+ * 18.  checkQueenDeath — game-over detection (NEW in Phase 9 / CMBT-06/07)
+ * 19.  rngState writeback + world.tick increment
  *
  * tick() retains its accepted Phase 4 2-arg signature.
  * DigFlowFields is module-level scratch state, invisible to callers.
  *
- * @param world    - Mutable world state; mutated in place across all 17 steps.
+ * @param world    - Mutable world state; mutated in place across all 19 steps.
  * @param commands - Point-in-time snapshot of commands for this tick. Not mutated.
  *                   Commands beyond MAX_COMMANDS_PER_TICK are silently dropped FIFO (PRD §5).
- * @returns GameOutcome.None (always in Phase 7; win/lose checks are Phase 9 scope).
+ * @returns GameOutcome — None each tick until a win/lose condition is detected (Phase 9).
  */
 export function tick(world: WorldState, commands: readonly SimCommand[]): GameOutcome {
   // Reconstruct Rng from saved state at tick start (PRD §4 contract).
@@ -324,9 +330,25 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         colony4.digFlowFieldDirty = true;   // typed field (Plan 03 Task 1)
         break;
       }
+      case 'SetRallyPoint': {
+        const colony = world.colonies[cmd.colonyId];
+        if (colony === undefined) break;
+        if (cmd.tileX < 0 || cmd.tileX >= SURFACE_GRID_WIDTH) break;
+        if (cmd.tileY < 0 || cmd.tileY >= SURFACE_GRID_HEIGHT) break;
+        colony.rallyPoint = { tileX: cmd.tileX, tileY: cmd.tileY };
+        break;
+      }
+      case 'ClearRallyPoint': {
+        const colony = world.colonies[cmd.colonyId];
+        if (colony === undefined) break;
+        colony.rallyPoint = null;
+        break;
+      }
       default: {
-        // Phase 9 Plan 01 temporary: exhaustiveness check disabled until Plan 03
-        // wires SetRallyPoint + ClearRallyPoint case arms. Silent-drop unknowns per PRD §5.
+        // Exhaustive narrowing — SimCommand is a 9-variant union (Phase 9 adds SetRallyPoint + ClearRallyPoint).
+        // Silent-drop unknowns per PRD §5. Do NOT throw, do NOT log (wall-clock-adjacent).
+        const _exhaustive: never = cmd;
+        void _exhaustive;
         break;
       }
     }
@@ -485,6 +507,11 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   // so same-tick BeingDug→Open transitions are visible to those steps (PRD §9a/§9b).
   tickDigExecution(world, digFlowFields);
 
+  // Step 10c: route AntTask.Fighting ants to colony.rallyPoint (Phase 9 / SURF-04).
+  // Global pass (not inlined in 10a) because this is a per-ant task filter,
+  // not a per-colony census mutation. Same split as Phase 7 tickDeadDiggerCleanup.
+  updateFightAntTargets(world);
+
   // ---------------------------------------------------------------------------
   // Step 11: checkPendingChambers (NEW in Phase 7)
   //   Promote fully-excavated PendingChambers to ChamberRecords.
@@ -533,11 +560,21 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   tickAntMovement(world, rng, digFlowFields);
 
   // ---------------------------------------------------------------------------
-  // Step 17: rngState writeback (BEFORE tick increment per PRD §4 serialization contract)
+  // Step 17: combat detection + resolution (Phase 9 / CMBT-04) — runs after step 16 tickAntMovement.
+  // ---------------------------------------------------------------------------
+  detectAndResolveCombat(world);
+
+  // ---------------------------------------------------------------------------
+  // Step 18: game-over detection (Phase 9 / CMBT-06/07).
+  // ---------------------------------------------------------------------------
+  const outcome = checkQueenDeath(world);
+
+  // ---------------------------------------------------------------------------
+  // Step 19: rngState writeback (BEFORE tick increment per PRD §4 serialization contract)
   //          then tick counter increment.
   // ---------------------------------------------------------------------------
   world.rngState = rng.getState();
   world.tick += 1;
 
-  return GameOutcome.None;
+  return outcome;
 }
