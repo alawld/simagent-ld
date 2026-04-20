@@ -1,13 +1,14 @@
 // ant-system.ts — PRD §4c + §5b + §8a step 10/12 ant interaction and movement
 //
-// Implements seven exported functions:
-//   antPickupFood        — PRD §4c L1093-1104: pickup from food pile, internal subTask transition
-//   antDepositFood       — PRD §4c (Errata E-01): chamber-aware deposit + idle-checkpoint transition
-//   getTaskDirection     — PURE direction lookup for non-forager movement (no state mutations)
-//   tickDigExecution     — Step-10 dig-worker state machine (Marked→BeingDug→Open)
-//   routeForagerPriority — Step-13 forager priority routing to marked food piles
-//   tickPheromoneDeposit — PRD §8a step 10 + §5b carry-only rule: deposit food trail per alive carrying ant
-//   tickAntMovement      — PRD §8a step 16: gradient-driven forager movement + zone-aware bounds + zone transitions
+// Implements eight exported functions:
+//   antPickupFood          — PRD §4c L1093-1104: pickup from food pile, internal subTask transition
+//   antDepositFood         — PRD §4c (Errata E-01): chamber-aware deposit + idle-checkpoint transition
+//   getTaskDirection       — PURE direction lookup for non-forager movement (no state mutations)
+//   tickDigExecution       — Step-10 dig-worker state machine (Marked→BeingDug→Open)
+//   updateFightAntTargets  — Phase 9 / SURF-04: route Fighting ants to colony.rallyPoint (step 10c global pass)
+//   routeForagerPriority   — Step-13 forager priority routing to marked food piles
+//   tickPheromoneDeposit   — PRD §8a step 10 + §5b carry-only rule: deposit food trail per alive carrying ant
+//   tickAntMovement        — PRD §8a step 16: gradient-driven forager movement + zone-aware bounds + zone transitions
 //
 // Key semantic decisions:
 //   - antPickupFood: on NONZERO transfer, sets subTask=CarryingFood internally (caller does NOT flip).
@@ -41,7 +42,7 @@ import {
   UNDERGROUND_GRID_WIDTH,
   UNDERGROUND_GRID_HEIGHT,
 } from '../constants.js';
-import { FP_SHIFT } from '../fixed.js';
+import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import { Rng } from '../rng.js';
 import { depositFoodTrail, sampleGradient } from '../pheromone/pheromone-system.js';
 import { pheromoneGridKey } from '../pheromone/pheromone-store.js';
@@ -377,6 +378,78 @@ export function tickDigExecution(
         ants.subTask[id] = DiggingSubState.MovingToTile;
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// updateFightAntTargets — Phase 9 / SURF-04 step-10c global pass
+//
+// Route AntTask.Fighting ants to their colony's rallyPoint in fixed-point coords.
+//
+// If colony.rallyPoint is set and ant is on the surface → target the rally tile center.
+// If colony.rallyPoint is null → fall back to first entrance (surfaceTileX/Y in fp).
+// If ant is underground with a surface rally → route to first entrance first
+// (zone promotion happens inside tickAntMovement at step 16 via flow fields).
+// Non-Fighting ants and dead slots are untouched.
+//
+// Architectural rationale: runs as a GLOBAL pass at step 10c (after idle-reassignment
+// 10a and tickDigExecution 10b, before checkPendingChambers 11). Not inlined in the
+// per-colony 10a loop because this is a per-ant task filter, not a per-colony census
+// mutation — same split as Phase 7's tickDeadDiggerCleanup.
+//
+// Deterministic: iterates ant entity IDs ascending (natural SoA order).
+// Pure-sim: reads world.colonies, writes only ants.targetPosX/targetPosY.
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 9 / SURF-04 — route AntTask.Fighting ants to their colony's rallyPoint.
+ *
+ * Runs at tick.ts step 10c as a GLOBAL pass (after idle-reassignment 10a and
+ * tickDigExecution 10b, before checkPendingChambers 11). Separate pass rather
+ * than inline in the per-colony 10a loop because this is a per-ant task filter,
+ * not a per-colony census mutation — same architectural split as Phase 7's
+ * tickDeadDiggerCleanup.
+ *
+ * Pure-sim: reads world.colonies, writes world.ants.targetPosX/targetPosY only.
+ * Deterministic: iterates ant entity IDs ascending (natural SoA order).
+ *
+ * @param world  WorldState (reads ants, colonies; writes ants.targetPosX/Y).
+ */
+export function updateFightAntTargets(world: WorldState): void {
+  const { ants } = world;
+  for (let id = 0; id < ants.alive.length; id++) {
+    if (ants.alive[id] !== 1) continue;
+    if (ants.task[id] !== AntTask.Fighting) continue;
+
+    const colonyId = ants.colonyId[id]! as ReturnType<typeof Number>;
+    const colony = world.colonies[colonyId as unknown as keyof typeof world.colonies];
+    if (colony === undefined) continue;
+
+    const rp = colony.rallyPoint;
+
+    // No rally point: fall back to first entrance (idle-at-nest).
+    if (rp === null) {
+      if (colony.entrances.length > 0) {
+        const e = colony.entrances[0]!;
+        ants.targetPosX[id] = (e.surfaceTileX << FP_SHIFT) + (FP_ONE >> 1);
+        ants.targetPosY[id] = (e.surfaceTileY << FP_SHIFT) + (FP_ONE >> 1);
+      }
+      continue;
+    }
+
+    // Underground fighter with surface rally: route to first entrance first.
+    // Zone promotion happens inside tickAntMovement when the ant crosses the shaft;
+    // this pass only writes the fixed-point target coord.
+    if (ants.zone[id] === 1 /* Underground */ && colony.entrances.length > 0) {
+      const e = colony.entrances[0]!;
+      ants.targetPosX[id] = (e.surfaceTileX << FP_SHIFT) + (FP_ONE >> 1);
+      ants.targetPosY[id] = (e.surfaceTileY << FP_SHIFT) + (FP_ONE >> 1);
+      continue;
+    }
+
+    // Surface fighter (or underground with no entrances yet): target rally tile center.
+    ants.targetPosX[id] = (rp.tileX << FP_SHIFT) + (FP_ONE >> 1);
+    ants.targetPosY[id] = (rp.tileY << FP_SHIFT) + (FP_ONE >> 1);
   }
 }
 
