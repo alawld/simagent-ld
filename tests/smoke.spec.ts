@@ -75,4 +75,55 @@ test.describe('Phase 8 smoke — boot, toggle, pan', () => {
       fullPage: false,
     });
   });
+
+  // Phase 8.5 regression guards — the render/camera double-transform used to
+  // push the world offscreen, and the primary pan gesture did not work on
+  // laptops without a middle mouse button.
+
+  test('underground screenshot captured for human review (Phase 8.5)', async ({ page }) => {
+    await page.goto('/');
+    const canvas = page.locator('canvas').first();
+    await canvas.waitFor({ state: 'attached' });
+    await page.waitForTimeout(300);
+
+    // Click the VIEW_TOGGLE HUD button (more reliable than Tab keyboard — no
+    // focus dependency). HUD.VIEW_TOGGLE sits at canvas-local (632, 396, 80×24).
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error('canvas has no bounding box');
+    await page.mouse.click(box.x + 632 + 40, box.y + 396 + 12);
+    await page.waitForTimeout(300);
+
+    await page.screenshot({
+      path: 'test-results/phase-08-smoke-underground.png',
+      fullPage: false,
+    });
+  });
+
+  test('Space + left-drag pans the surface camera without error (Phase 8.5 primary gesture)', async ({ page }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (errorFilter(msg)) consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(err.message));
+
+    await page.goto('/');
+    const canvas = page.locator('canvas').first();
+    await canvas.waitFor({ state: 'attached' });
+    await page.waitForTimeout(200);
+
+    // Hold Space → left-button drag over a non-HUD mid-canvas region → release.
+    // Mid-canvas (500, 300) sits clear of HUD.STATS (top-left), HUD.TRIANGLE
+    // (bottom-left), HUD.MINIMAP (bottom-right), HUD.VIEW_TOGGLE (above minimap).
+    await canvas.focus();
+    await page.keyboard.down('Space');
+    await page.mouse.move(500, 300);
+    await page.mouse.down();
+    await page.mouse.move(300, 300, { steps: 10 });
+    await page.mouse.up();
+    await page.keyboard.up('Space');
+
+    await page.waitForTimeout(150);
+    await expect(page.locator('canvas').first()).toBeAttached();
+    expect(consoleErrors, consoleErrors.join('\n')).toHaveLength(0);
+  });
 });
