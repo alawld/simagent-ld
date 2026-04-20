@@ -22,6 +22,7 @@ import {
   handleUndergroundRightClick,
 } from './underground-input.js';
 import { contextMenuState, hideContextMenu } from '../render/context-menu-state.js';
+import { panInputState, resetPanInputStateForTests } from './camera-input.js';
 import { UndergroundTileState, ugSet, createUndergroundGrid } from '../sim/terrain.js';
 import type { WorldState } from '../sim/types.js';
 import type { ViewState } from '../render/camera.js';
@@ -100,6 +101,7 @@ beforeEach(() => {
   contextMenuState.screenY = 0;
   contextMenuState.anchorTileX = 0;
   contextMenuState.anchorTileY = 0;
+  resetPanInputStateForTests();
 });
 
 // ---------------------------------------------------------------------------
@@ -281,6 +283,28 @@ describe('handleUndergroundLeftClick', () => {
     expect(world.commandQueue).toHaveLength(0);
     expect(state.isDragging).toBe(false);
   });
+
+  it('is a no-op while panInputState.spaceHeld is true (Space+left-drag is pan, not dig-mark)', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    panInputState.spaceHeld = true;
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(false);
+  });
+
+  it('is a no-op while panInputState.isPanning is true (mid-pan clicks are pan continuation)', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    panInputState.isPanning = true;
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -342,6 +366,17 @@ describe('handleUndergroundDrag', () => {
     const { x, y } = tileToScreen(6, 10, 64, 32);
     handleUndergroundDrag(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
+  });
+
+  it('cancels drag and no-ops when Space is pressed mid-drag (gesture switches to pan)', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState(true, 5, 10);
+    panInputState.spaceHeld = true;
+    const { x, y } = tileToScreen(6, 10, 64, 32);
+    handleUndergroundDrag(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(false);
   });
 });
 

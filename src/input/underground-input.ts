@@ -24,7 +24,7 @@ import { screenToTile } from '../render/camera.js';
 import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import type { MarkDigTileCommand, CancelDigMarkCommand } from '../sim/commands.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
-import { isPointerOverHUD } from './camera-input.js';
+import { isPointerOverHUD, panInputState } from './camera-input.js';
 import { contextMenuState } from '../render/context-menu-state.js';
 
 // ---------------------------------------------------------------------------
@@ -101,6 +101,9 @@ export function handleUndergroundLeftClick(
 ): void {
   if (viewState.activeView !== 'underground') return;
   if (isPointerOverHUD(screenX, screenY)) return;
+  // Pan-mode guard: while Space is held or a pan gesture is already in flight,
+  // the left-click/drag is the pan trigger — not a dig-mark.
+  if (panInputState.spaceHeld || panInputState.isPanning) return;
   // If context menu is visible, suppress this click — UIScene handles the
   // interaction (selection or dismissal) on its own pointerdown and applies
   // the hide on the next frame. No state mutation here: modifying visibility
@@ -150,6 +153,10 @@ export function handleUndergroundDrag(
   if (!state.isDragging) return;
   if (viewState.activeView !== 'underground') { state.isDragging = false; return; }
   if (isPointerOverHUD(screenX, screenY)) return;
+  // Pan-mode guard: if the player pressed Space mid-drag, treat it as a
+  // clean cancel of the excavation drag so further pointer movement goes
+  // through the pan handler exclusively.
+  if (panInputState.spaceHeld || panInputState.isPanning) { state.isDragging = false; return; }
   const { tileX, tileY } = screenToTile(screenX, screenY, viewState.undergroundCamera);
   // Debounce: emit only when entering a new tile.
   if (tileX === state.lastMarkedTileX && tileY === state.lastMarkedTileY) return;

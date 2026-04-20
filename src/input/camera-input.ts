@@ -1,7 +1,26 @@
-// camera-input.ts — Phase 8 camera pan input orchestrator.
+// camera-input.ts — Phase 8 (Phase 8.5-stabilized) camera pan input orchestrator.
 //
-// Implements all four scroll triggers (arrow keys, WASD, mouse edge-pan, drag-pan)
-// plus the HUD zone guard (isPointerOverHUD) per RESEARCH §Pattern 4.
+// Supported camera pan triggers after the Phase 8.5 stabilization pass:
+//   1. Space + left-drag — primary map-style pan gesture. Works on any mouse
+//      or trackpad that can left-click. While Space is held, world-input
+//      handlers (dig marking, food mark, entrance designation, chamber menu)
+//      are suppressed so the same gesture never races between pan and world
+//      action.
+//   2. Middle-button drag — secondary pan gesture for users with a three-
+//      button mouse. Retained because it is strictly more convenient than
+//      reaching for Space when it is available.
+//   3. Keyboard pan — arrow keys + WASD (secondary path; per-frame poll).
+//
+// Edge-pan (cursor-near-edge scroll) was removed in Phase 8.5 (2026-04-19). It
+// did not match the intended map-style surface navigation, it fought with HUD
+// widgets on the edges, and it caused drift when the cursor rested near a
+// canvas edge. The PRD (§7a) has been amended; `EDGE_PAN_THRESHOLD_PX` is kept
+// as a historical constant in `camera.ts` but is no longer consumed here.
+//
+// `panInputState` is a module-level singleton exposed so surface-input and
+// underground-input can suppress their own pointerdown handling while a pan
+// gesture is in flight. This keeps the left-drag excavation gesture intact
+// while still giving the player a practical trackpad-friendly primary pan.
 //
 // No Phaser *runtime* dependency at the module level — Phaser types are
 // imported with `import type` only so this file can be tested without Phaser.
@@ -16,7 +35,6 @@ import {
   type CameraState,
   clampCamera,
   CAMERA_SCROLL_SPEED,
-  EDGE_PAN_THRESHOLD_PX,
 } from '../render/camera.js';
 import {
   SURFACE_GRID_WIDTH,
@@ -26,6 +44,36 @@ import {
 } from '../sim/constants.js';
 
 // ---------------------------------------------------------------------------
+// panInputState — module-level singleton
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared pan-gesture state, read by world-input handlers so they know when to
+ * suppress a left-click (the same physical gesture is pan, not world action).
+ *
+ * Mutated by registerDragPan's Phaser event handlers. Exposed as a live object
+ * so consumers can read the latest values without subscribing.
+ *
+ * - `spaceHeld` flips on Space keydown / keyup. While true, a left-drag pans.
+ * - `isPanning`  is true from pan-start pointerdown until pointerup. This
+ *   covers both Space+left and middle-button gestures.
+ */
+export const panInputState = {
+  spaceHeld: false,
+  isPanning: false,
+};
+
+/**
+ * Test-only reset so unit tests that exercise world-input handlers do not
+ * inherit state from a prior test that set `spaceHeld = true`. Production
+ * code should never need to call this.
+ */
+export function resetPanInputStateForTests(): void {
+  panInputState.spaceHeld = false;
+  panInputState.isPanning = false;
+}
+
+// ---------------------------------------------------------------------------
 // isPointerOverHUD
 // ---------------------------------------------------------------------------
 
@@ -33,8 +81,8 @@ import {
  * isPointerOverHUD — return true if the screen-pixel point (px, py) falls
  * inside any *visible* HUD zone rectangle.
  *
- * Used by drag-pan, edge-pan, and world-input handlers to suppress
- * pointer events that land on HUD widgets.
+ * Used by drag-pan and world-input handlers to suppress pointer events that
+ * land on HUD widgets.
  *
  * PRD §6 reserves HUD.SPEED and HUD.SAVE_ICON as Phase 9 layout slots —
  * Phase 8 renders nothing there, so masking those zones in Phase 8 creates
@@ -72,6 +120,11 @@ export function isPointerOverHUD(px: number, py: number): boolean {
  * PanInputs — shape of everything processCameraInput needs per frame.
  *
  * Passed from GameScene.update() each frame.
+ *
+ * Phase 8.5: edge-pan was removed, so `pointer`, `canvasW`, and `canvasH` are
+ * no longer needed here. Keyboard pan is evaluated synchronously in
+ * processCameraInput; drag-pan mutations happen inside registerDragPan's
+ * event handlers.
  */
 export interface PanInputs {
   /** Phaser cursor-key state (arrow keys). */
@@ -83,16 +136,10 @@ export interface PanInputs {
     S: Phaser.Input.Keyboard.Key;
     D: Phaser.Input.Keyboard.Key;
   };
-  /** Active pointer (mouse / touch) for edge-pan. */
-  pointer: Phaser.Input.Pointer;
-  /** Canvas width in pixels — used for right/bottom edge-pan guard. */
-  canvasW: number;
-  /** Canvas height in pixels. */
-  canvasH: number;
   /**
    * Drag state reference returned from registerDragPan.
    * processCameraInput does NOT read this — drag-pan mutations happen
-   * directly in the pointermove handler.  Included here for debugging.
+   * directly in the pointermove handler. Included here for debugging.
    */
   dragState: { isDragging: boolean; lastX: number; lastY: number; active: boolean };
 }
@@ -120,19 +167,20 @@ function activeCamera(viewState: ViewState): CameraState {
 // ---------------------------------------------------------------------------
 
 /**
- * processCameraInput — apply keyboard + edge-pan pan triggers then clamp.
+ * processCameraInput — apply keyboard pan triggers then clamp.
  *
- * Called once per frame from GameScene.update().  Drag-pan mutations happen
+ * Called once per frame from GameScene.update(). Drag-pan mutations happen
  * inside the event handlers registered by registerDragPan; this function
- * applies the remaining triggers and issues the single end-of-frame clamp.
+ * applies the keyboard triggers and issues the single end-of-frame clamp.
  *
  * Pan order:
  *   1. Keyboard (arrow keys + WASD) — each axis independent.
- *   2. Edge-pan (mouse near canvas edge) — canvas-bounds guard applied.
- *   3. clampCamera() — single call at end of frame.
+ *   2. clampCamera() — single call at end of frame.
  *
  * The Phaser camera scroll is synced in GameScene.update() after this call
  * returns.
+ *
+ * Phase 8.5: edge-pan was removed — see module header.
  */
 export function processCameraInput(viewState: ViewState, inputs: PanInputs): void {
   const cam = activeCamera(viewState);
@@ -150,28 +198,6 @@ export function processCameraInput(viewState: ViewState, inputs: PanInputs): voi
   }
   if (inputs.cursors.down.isDown || inputs.wasd.S.isDown) {
     cam.y += CAMERA_SCROLL_SPEED;
-  }
-
-  // --- Edge-pan (canvas-bounds guard: pointer must be inside [0, canvasW] × [0, canvasH]) ---
-  // Suppress edge-pan when the pointer is over a visible HUD widget — the
-  // stats bar, triangle, and minimap all overlap the 32px edge bands, and
-  // scrolling the camera while the player is dragging the triangle or
-  // clicking the minimap makes the UI feel unstable.
-  const { pointer, canvasW, canvasH } = inputs;
-
-  if (!isPointerOverHUD(pointer.x, pointer.y)) {
-    if (pointer.x >= 0 && pointer.x < EDGE_PAN_THRESHOLD_PX) {
-      cam.x -= CAMERA_SCROLL_SPEED;
-    }
-    if (pointer.x > canvasW - EDGE_PAN_THRESHOLD_PX && pointer.x <= canvasW) {
-      cam.x += CAMERA_SCROLL_SPEED;
-    }
-    if (pointer.y >= 0 && pointer.y < EDGE_PAN_THRESHOLD_PX) {
-      cam.y -= CAMERA_SCROLL_SPEED;
-    }
-    if (pointer.y > canvasH - EDGE_PAN_THRESHOLD_PX && pointer.y <= canvasH) {
-      cam.y += CAMERA_SCROLL_SPEED;
-    }
   }
 
   // --- Single clamp at end of frame ---
@@ -199,15 +225,27 @@ export interface DragState {
 /**
  * registerDragPan — wire drag-pan event handlers on a Phaser.Scene.
  *
- * Drag-pan is bound to **middle-button drag only** so it cannot collide
- * with left-click world actions (dig marking, food-pile mark, entrance
- * designation, chamber context menu). The left button is reserved
- * entirely for world input; the arrow keys, WASD, and mouse edge-pan
- * remain available for camera movement. (Phase 9 may add spacebar-held
- * pan if middle-button is awkward on trackpads.)
+ * Supported pan gestures (Phase 8.5):
+ *   1. **Space + left-drag** (primary, trackpad-friendly). While the Space
+ *      key is held, pressing the left mouse button on a non-HUD region
+ *      starts a pan; moving the pointer drags the camera; releasing the
+ *      button ends the gesture. Works on any pointing device that has a
+ *      left button (i.e. every mouse and trackpad).
+ *   2. **Middle-button drag** (secondary, three-button mouse). Does not
+ *      require Space. Retained because it is faster than reaching for Space
+ *      when a middle button is available.
  *
- * Returns the shared dragState object so GameScene can pass it through
- * PanInputs for debugging (processCameraInput ignores it).
+ * Contract with world-input handlers:
+ *   - While `panInputState.spaceHeld === true` or `panInputState.isPanning
+ *     === true`, surface-input and underground-input must no-op on
+ *     left-click / drag. This is how we keep left-drag excavation
+ *     (underground dig marking) intact while still giving the player a
+ *     practical primary pan gesture — the two gestures are disambiguated
+ *     by the Space modifier, not by the mouse button.
+ *
+ * Returns the shared dragState object for back-compat with PanInputs
+ * (processCameraInput ignores it). `panInputState` is the source of truth
+ * for cross-module pan-mode checks.
  *
  * HUD-zone pointerdown and HUD-zone pointermove are ignored so a drag
  * starting inside a HUD widget never pans the camera.
@@ -220,17 +258,47 @@ export function registerDragPan(scene: Phaser.Scene, viewState: ViewState): Drag
     active: false,
   };
 
+  // --- Space modifier tracking -----------------------------------------
+  // We use the keyboard.addKey helper so Phaser manages the KeyCode lookup
+  // (avoids a direct `Phaser.Input.Keyboard.KeyCodes.SPACE` reference, which
+  // would require a runtime Phaser import). addCapture prevents Space from
+  // scrolling the host page while the canvas has focus.
+  const keyboard = scene.input.keyboard;
+  if (keyboard) {
+    keyboard.addCapture('SPACE');
+    const spaceKey = keyboard.addKey('SPACE');
+    spaceKey.on('down', () => {
+      panInputState.spaceHeld = true;
+    });
+    spaceKey.on('up', () => {
+      panInputState.spaceHeld = false;
+      // If we were panning via Space+left-drag but the user released Space
+      // before releasing the mouse, end the pan gracefully. pointerup below
+      // will also clear, so this is just defensive.
+      if (dragState.active && !panInputState.isPanning) return;
+    });
+  }
+
+  const isPanTriggerDown = (pointer: Phaser.Input.Pointer): boolean => {
+    if (pointer.middleButtonDown()) return true;
+    if (panInputState.spaceHeld && pointer.leftButtonDown()) return true;
+    return false;
+  };
+
   scene.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
-    if (!pointer.middleButtonDown()) return;
+    if (!isPanTriggerDown(pointer)) return;
     if (isPointerOverHUD(pointer.x, pointer.y)) return;
     dragState.active = true;
     dragState.lastX = pointer.x;
     dragState.lastY = pointer.y;
     dragState.isDragging = false;
+    panInputState.isPanning = true;
   });
 
   scene.input.on('pointermove', (pointer: Phaser.Input.Pointer) => {
-    if (!dragState.active || !pointer.middleButtonDown()) return;
+    if (!dragState.active) return;
+    // Continue pan only while the originating trigger is still held.
+    if (!isPanTriggerDown(pointer)) return;
     if (isPointerOverHUD(pointer.x, pointer.y)) return;
 
     const dx = (pointer.x - dragState.lastX) / TILE_SIZE_PX;
@@ -251,6 +319,7 @@ export function registerDragPan(scene: Phaser.Scene, viewState: ViewState): Drag
   scene.input.on('pointerup', () => {
     dragState.active = false;
     dragState.isDragging = false;
+    panInputState.isPanning = false;
   });
 
   return dragState;

@@ -2,17 +2,24 @@
 //
 // Tests cover:
 //   - isPointerOverHUD: boundary conditions for each HUD zone
-//   - processCameraInput: keyboard pan (arrow + WASD), edge-pan, clamp after pan
+//   - processCameraInput: keyboard pan (arrow + WASD), clamp after pan
 //   - processCameraInput: dual-axis surface vs underground world dimensions
+//   - processCameraInput: edge-pan is NOT fired (Phase 8.5 regression guards)
 //
 // registerDragPan involves Phaser scene events — verified by browser smoke test only.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   isPointerOverHUD,
   processCameraInput,
+  panInputState,
+  resetPanInputStateForTests,
   type PanInputs,
 } from './camera-input.js';
+
+beforeEach(() => {
+  resetPanInputStateForTests();
+});
 import type { ViewState } from '../render/camera.js';
 import {
   VIEWPORT_WIDTH_TILES,
@@ -55,7 +62,7 @@ function makeViewState(
   };
 }
 
-/** Build a minimal mock PanInputs with all keys up and pointer at canvas center. */
+/** Build a minimal mock PanInputs with all keys up. */
 function makePanInputs(overrides: Partial<{
   leftDown: boolean;
   rightDown: boolean;
@@ -65,11 +72,6 @@ function makePanInputs(overrides: Partial<{
   wasdD: boolean;
   wasdW: boolean;
   wasdS: boolean;
-  pointerX: number;
-  pointerY: number;
-  pointerIsDown: boolean;
-  canvasW: number;
-  canvasH: number;
 }> = {}): PanInputs {
   const opts = {
     leftDown: false,
@@ -80,11 +82,6 @@ function makePanInputs(overrides: Partial<{
     wasdD: false,
     wasdW: false,
     wasdS: false,
-    pointerX: 400,
-    pointerY: 296,
-    pointerIsDown: false,
-    canvasW: 800,
-    canvasH: 592,
     ...overrides,
   };
 
@@ -106,20 +103,11 @@ function makePanInputs(overrides: Partial<{
     D: key(opts.wasdD),
   };
 
-  const pointer = {
-    x: opts.pointerX,
-    y: opts.pointerY,
-    isDown: opts.pointerIsDown,
-  } as unknown as import('phaser').Input.Pointer;
-
   const dragState = { isDragging: false, lastX: 0, lastY: 0, active: false };
 
   return {
     cursors,
     wasd,
-    pointer,
-    canvasW: opts.canvasW,
-    canvasH: opts.canvasH,
     dragState,
   };
 }
@@ -268,83 +256,30 @@ describe('processCameraInput — keyboard pan', () => {
 });
 
 // ---------------------------------------------------------------------------
-// processCameraInput — edge-pan
+// processCameraInput — edge-pan is retired (Phase 8.5)
 // ---------------------------------------------------------------------------
+//
+// Regression guard: processCameraInput no longer consumes pointer position or
+// canvas dimensions. Calling it with only keyboard inputs must not move the
+// camera based on cursor proximity to any edge. These tests exercise the
+// specific historical edge-band positions to make sure nothing reintroduces
+// edge-pan silently.
 
-describe('processCameraInput — edge-pan', () => {
-  it('pans left when pointer.x < EDGE_PAN_THRESHOLD_PX (pointer.x=10)', () => {
+describe('processCameraInput — edge-pan is retired (Phase 8.5 regression guard)', () => {
+  it('does NOT pan even when the pointer would historically have been in the left edge band', () => {
+    // We can't pass a pointer anymore — the only way to see the regression is
+    // to confirm that with all keys up the camera stays put.
     const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 10, pointerY: 300 }));
-    expect(vs.surfaceCamera.x).toBeCloseTo(64 - CAMERA_SCROLL_SPEED);
-  });
-
-  it('pans right when pointer.x is in right edge zone (pointer.x=790)', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 790, pointerY: 300, canvasW: 800 }));
-    expect(vs.surfaceCamera.x).toBeCloseTo(64 + CAMERA_SCROLL_SPEED);
-  });
-
-  it('does NOT edge-pan when pointer.x < 0 (pointer outside canvas)', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: -5, pointerY: 300 }));
-    // x should be unchanged (no left edge-pan fired)
-    expect(vs.surfaceCamera.x).toBeCloseTo(64);
-  });
-
-  it('does NOT edge-pan when pointer.x > canvasW (pointer outside right edge)', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 810, pointerY: 300, canvasW: 800 }));
-    expect(vs.surfaceCamera.x).toBeCloseTo(64);
-  });
-
-  it('pans up when pointer.y is in top edge zone (pointer.y=10)', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 400, pointerY: 10 }));
-    expect(vs.surfaceCamera.y).toBeCloseTo(64 - CAMERA_SCROLL_SPEED);
-  });
-
-  it('pans down when pointer.y is in bottom edge zone (pointer.y=580)', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 400, pointerY: 580, canvasH: 592 }));
-    expect(vs.surfaceCamera.y).toBeCloseTo(64 + CAMERA_SCROLL_SPEED);
-  });
-
-  it('does NOT edge-pan when pointer.y < 0', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 400, pointerY: -5 }));
-    expect(vs.surfaceCamera.y).toBeCloseTo(64);
-  });
-
-  it('does NOT edge-pan when pointer.y > canvasH', () => {
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 400, pointerY: 600, canvasH: 592 }));
-    expect(vs.surfaceCamera.y).toBeCloseTo(64);
-  });
-
-  it('does NOT edge-pan when pointer is over HUD.STATS (top-left overlap)', () => {
-    // STATS: x:8-208, y:8-32 — (10, 10) is in the top-left edge band AND inside STATS.
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 10, pointerY: 10 }));
+    processCameraInput(vs, makePanInputs());
     expect(vs.surfaceCamera.x).toBeCloseTo(64);
     expect(vs.surfaceCamera.y).toBeCloseTo(64);
   });
 
-  it('does NOT edge-pan when pointer is over HUD.TRIANGLE (bottom-left overlap)', () => {
-    // TRIANGLE: x:8-128, y:456-576 — (20, 570) is inside TRIANGLE AND inside the
-    // bottom edge band (canvasH=592; 592-32=560; y=570 > 560).
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 20, pointerY: 570 }));
-    expect(vs.surfaceCamera.x).toBeCloseTo(64);
-    expect(vs.surfaceCamera.y).toBeCloseTo(64);
-  });
-
-  it('does NOT edge-pan when pointer is over HUD.MINIMAP (bottom-right overlap)', () => {
-    // MINIMAP: x:632-792, y:424-584 — (790, 580) is inside MINIMAP AND inside
-    // both the right and bottom edge bands.
-    const vs = makeViewState('surface', 64, 64);
-    processCameraInput(vs, makePanInputs({ pointerX: 790, pointerY: 580 }));
-    expect(vs.surfaceCamera.x).toBeCloseTo(64);
-    expect(vs.surfaceCamera.y).toBeCloseTo(64);
+  it('PanInputs no longer has pointer / canvasW / canvasH fields', () => {
+    const inputs = makePanInputs();
+    expect('pointer' in inputs).toBe(false);
+    expect('canvasW' in inputs).toBe(false);
+    expect('canvasH' in inputs).toBe(false);
   });
 });
 
@@ -410,5 +345,24 @@ describe('processCameraInput — world dimension constants', () => {
   it('UNDERGROUND_GRID_WIDTH is 128, UNDERGROUND_GRID_HEIGHT is 64', () => {
     expect(UNDERGROUND_GRID_WIDTH).toBe(128);
     expect(UNDERGROUND_GRID_HEIGHT).toBe(64);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// panInputState — Phase 8.5 Space+left-drag contract
+// ---------------------------------------------------------------------------
+
+describe('panInputState', () => {
+  it('defaults to both flags false', () => {
+    expect(panInputState.spaceHeld).toBe(false);
+    expect(panInputState.isPanning).toBe(false);
+  });
+
+  it('resetPanInputStateForTests clears both flags', () => {
+    panInputState.spaceHeld = true;
+    panInputState.isPanning = true;
+    resetPanInputStateForTests();
+    expect(panInputState.spaceHeld).toBe(false);
+    expect(panInputState.isPanning).toBe(false);
   });
 });
