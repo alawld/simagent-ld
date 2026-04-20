@@ -7,3 +7,74 @@ export const GameOutcome = {
   MutualDestruction: 3,
 } as const;
 export type GameOutcome = typeof GameOutcome[keyof typeof GameOutcome];
+
+import type { WorldState } from './types.js';
+import type { ColonyId, ColonyRecord } from './colony/colony-store.js';
+
+/**
+ * Returns true if the colony's queen is alive per world.ants.
+ * Side effect (idempotent): sets colony.defeated = true when queen is dead.
+ */
+function isQueenAlive(world: WorldState, colony: ColonyRecord): boolean {
+  const qid = colony.queenEntityId;
+  const alive = world.ants.alive[qid] === 1;
+  if (!alive) {
+    colony.defeated = true;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Phase 9 / CMBT-06, CMBT-07 — determine phase-end outcome from queen liveness.
+ *
+ * CLNY-08: this module does NOT import the platform-layer player colony constant — player colony
+ * is either the caller-supplied playerColonyId or (fallback) the smallest numeric colonyId present in world.colonies.
+ *
+ * Only mutation: `colony.defeated = true` for dead-queen colonies (idempotent).
+ */
+export function checkQueenDeath(world: WorldState, playerColonyId?: ColonyId): GameOutcome {
+  const colonyKeys = Object.keys(world.colonies);
+  if (colonyKeys.length === 0) return GameOutcome.None;
+
+  // Determine player colony.
+  let playerCid: ColonyId;
+  if (playerColonyId !== undefined) {
+    playerCid = playerColonyId;
+  } else {
+    // Smallest numeric colonyId.
+    let minId = Number.POSITIVE_INFINITY;
+    for (const key of colonyKeys) {
+      const id = Number(key);
+      if (id < minId) minId = id;
+    }
+    playerCid = minId as ColonyId;
+  }
+
+  const playerColony = world.colonies[playerCid];
+  if (playerColony === undefined) return GameOutcome.None;
+
+  const playerAlive = isQueenAlive(world, playerColony);
+
+  let anyOtherAlive = false;
+  let otherColonyCount = 0;
+  for (const key in world.colonies) {
+    if (!Object.hasOwn(world.colonies, key)) continue;
+    const cid = Number(key) as ColonyId;
+    if (cid === playerCid) continue;
+    otherColonyCount += 1;
+    const colony = world.colonies[cid]!;
+    if (isQueenAlive(world, colony)) anyOtherAlive = true;
+  }
+
+  // Single-colony sandboxes: no enemies → no win condition.
+  if (otherColonyCount === 0) {
+    // Defeat only if the lone colony's queen is dead.
+    return playerAlive ? GameOutcome.None : GameOutcome.Defeat;
+  }
+
+  if (playerAlive && !anyOtherAlive) return GameOutcome.Victory;
+  if (!playerAlive && anyOtherAlive) return GameOutcome.Defeat;
+  if (!playerAlive && !anyOtherAlive) return GameOutcome.MutualDestruction;
+  return GameOutcome.None;
+}
