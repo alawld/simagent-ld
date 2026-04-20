@@ -333,6 +333,72 @@ describe('GameLoopOpts Phase 9 seams', () => {
   });
 });
 
+describe('GameLoop pause()/resume() (Phase 9 Plan 06 Task 1)', () => {
+  it('pause() prevents any tickFn call even when deltaMs >> msPerTick', () => {
+    const tickSpy = vi.fn(() => GameOutcome.None);
+    const world = createWorldState(1);
+    const loop = createGameLoop(tickSpy, world);
+    loop.pause();
+    loop.update(MS_PER_TICK * 5);  // would fire 5 ticks if running
+    expect(tickSpy).toHaveBeenCalledTimes(0);
+    expect(loop.isPaused()).toBe(true);
+  });
+
+  it('resume() restores tickFn invocation on the next update()', () => {
+    const tickSpy = vi.fn(() => GameOutcome.None);
+    const world = createWorldState(1);
+    const loop = createGameLoop(tickSpy, world);
+    loop.pause();
+    loop.update(MS_PER_TICK * 5);
+    loop.resume();
+    loop.update(MS_PER_TICK);
+    expect(tickSpy).toHaveBeenCalledTimes(1);
+    expect(loop.isPaused()).toBe(false);
+  });
+
+  it('resume() resets accumulator so there is NO catch-up burst', () => {
+    const tickSpy = vi.fn(() => GameOutcome.None);
+    const world = createWorldState(1);
+    const loop = createGameLoop(tickSpy, world);
+    // Run once to advance accumulator near a tick boundary
+    loop.update(MS_PER_TICK - 1);     // accumulator = MS_PER_TICK - 1, 0 ticks
+    loop.pause();
+    loop.update(MS_PER_TICK * 100);   // paused — no-op; accumulator preserved internally BUT ignored on resume
+    loop.resume();                    // resume resets accumulator to 0
+    loop.update(MS_PER_TICK - 1);     // 0 ticks (accumulator rebuilds from zero)
+    expect(tickSpy).toHaveBeenCalledTimes(0);
+    loop.update(1);                   // crosses boundary → exactly 1 tick
+    expect(tickSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('pause() is idempotent', () => {
+    const world = createWorldState(1);
+    const loop = createGameLoop(() => GameOutcome.None, world);
+    loop.pause();
+    loop.pause();
+    expect(loop.isPaused()).toBe(true);
+  });
+
+  it('resume() on a running loop is idempotent', () => {
+    const world = createWorldState(1);
+    const loop = createGameLoop(() => GameOutcome.None, world);
+    loop.resume();
+    expect(loop.isPaused()).toBe(false);
+  });
+
+  it('getIsPaused opt still gates ticks independently of pause()/resume()', () => {
+    const tickSpy = vi.fn(() => GameOutcome.None);
+    const world = createWorldState(1);
+    let externallyPaused = true;
+    const loop = createGameLoop(tickSpy, world, { getIsPaused: () => externallyPaused });
+    loop.update(MS_PER_TICK);
+    expect(tickSpy).toHaveBeenCalledTimes(0);  // gated by getIsPaused
+    externallyPaused = false;
+    loop.update(MS_PER_TICK);
+    expect(tickSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('determinism — accumulator + tick composition', () => {
   it('two loops with same seed and same update schedule produce identical world state (SCEN-06)', async () => {
     // Use the real tick from src/sim/tick.ts to verify end-to-end determinism.

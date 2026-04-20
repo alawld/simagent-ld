@@ -20,6 +20,12 @@ export const MAX_CATCHUP_TICKS = 5;
 export interface GameLoop {
   update(dtMs: number): void;
   readonly accumulatorMs: number;
+  /** Phase 9 Plan 06 — first-class pause. Sets internal paused flag; update() is a total no-op while paused. */
+  pause(): void;
+  /** Phase 9 Plan 06 — clears paused flag; resets accumulator to 0 to prevent catch-up burst. */
+  resume(): void;
+  /** Phase 9 Plan 06 — returns current paused flag value. */
+  isPaused(): boolean;
 }
 
 /** Phase 8/9 extension seam for createGameLoop. All callbacks are optional for backward compat. */
@@ -48,16 +54,20 @@ export function createGameLoop(
   opts?: GameLoopOpts,
 ): GameLoop {
   const getMsPerTick  = opts?.getMsPerTick ?? (() => MS_PER_TICK);
-  const getIsPaused   = opts?.getIsPaused  ?? (() => false);
+  const getIsPaused   = opts?.getIsPaused;
   const onBeforeTick  = opts?.onBeforeTick;
   const onAfterDrain  = opts?.onAfterDrain;
   const onTickOutcome = opts?.onTickOutcome;
 
   let accumulatorMs = 0;
+  let paused = false;  // Phase 9 Plan 06 — imperative pause flag
 
   return {
     update(dtMs: number): void {
-      if (getIsPaused()) return;                        // Phase 9 pause seam
+      // Phase 9 Plan 06: imperative pause gate — total no-op, no accumulator advance.
+      if (paused) return;
+      // Backward-compat predicate gate (honor existing getIsPaused opt).
+      if (getIsPaused?.() === true) return;
       const msPerTick = getMsPerTick();                 // queried once per frame
       accumulatorMs += dtMs;
       // PRD §3 spiral-of-death guard: dynamic clamp honors variable speed.
@@ -77,6 +87,20 @@ export function createGameLoop(
     },
     get accumulatorMs() {
       return accumulatorMs;
+    },
+
+    // Phase 9 Plan 06 — first-class pause/resume
+    pause(): void {
+      paused = true;
+    },
+    resume(): void {
+      paused = false;
+      // Do NOT carry accumulated delta across the pause boundary — stale delta would
+      // cause a burst of catch-up ticks that break determinism. Reset to 0.
+      accumulatorMs = 0;
+    },
+    isPaused(): boolean {
+      return paused;
     },
   };
 }
