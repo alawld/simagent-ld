@@ -11,7 +11,7 @@
 //   getIsPaused    - queried once per frame; Phase 9 wires pause state.
 //   Spiral-of-death clamp = getMsPerTick() × MAX_CATCHUP_TICKS (dynamic, honors variable speed).
 import type { WorldState } from '../sim/types.js';
-import type { GameOutcome } from '../sim/game-over.js';
+import { GameOutcome } from '../sim/game-over.js';
 import type { SimCommand } from '../sim/commands.js';
 
 export const MS_PER_TICK = 50;
@@ -30,6 +30,14 @@ export interface GameLoopOpts {
   getMsPerTick?: () => number;
   /** Phase 9 seam: pause gate. Default: () => false. */
   getIsPaused?: () => boolean;
+  /** Phase 9 seam: fires after world.commandQueue.splice(0) returns, before tickFn runs.
+   *  Receives the just-drained commands so render-layer callers can push into inputLog
+   *  for replay or debugging. Fired every tick (even if no commands — array may be empty). */
+  onAfterDrain?: (cmds: readonly SimCommand[]) => void;
+  /** Phase 9 seam: fires after tickFn returns, only when outcome !== GameOutcome.None.
+   *  Triggers break out of the accumulator loop THIS frame after normal accumulator decrement,
+   *  preventing subsequent ticks from firing while the render layer handles win/lose transition. */
+  onTickOutcome?: (outcome: GameOutcome) => void;
 }
 
 type TickFn = (world: WorldState, commands: readonly SimCommand[]) => GameOutcome;
@@ -39,9 +47,11 @@ export function createGameLoop(
   world: WorldState,
   opts?: GameLoopOpts,
 ): GameLoop {
-  const getMsPerTick = opts?.getMsPerTick ?? (() => MS_PER_TICK);
-  const getIsPaused  = opts?.getIsPaused  ?? (() => false);
-  const onBeforeTick = opts?.onBeforeTick;
+  const getMsPerTick  = opts?.getMsPerTick ?? (() => MS_PER_TICK);
+  const getIsPaused   = opts?.getIsPaused  ?? (() => false);
+  const onBeforeTick  = opts?.onBeforeTick;
+  const onAfterDrain  = opts?.onAfterDrain;
+  const onTickOutcome = opts?.onTickOutcome;
 
   let accumulatorMs = 0;
 
@@ -56,8 +66,13 @@ export function createGameLoop(
       while (accumulatorMs >= msPerTick) {
         onBeforeTick?.(world);                          // Phase 8: copyWorldState seam
         const cmds = world.commandQueue.splice(0);
-        tickFn(world, cmds);
+        onAfterDrain?.(cmds);                           // Phase 9: inputLog seam
+        const outcome = tickFn(world, cmds);
         accumulatorMs -= msPerTick;
+        if (outcome !== GameOutcome.None && onTickOutcome !== undefined) {
+          onTickOutcome(outcome);
+          break; // stop firing further ticks this frame
+        }
       }
     },
     get accumulatorMs() {

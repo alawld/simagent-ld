@@ -255,6 +255,84 @@ describe('createGameLoop — Phase 8 opts', () => {
   });
 });
 
+describe('GameLoopOpts Phase 9 seams', () => {
+  it('onAfterDrain fires with the drained commands array in order', () => {
+    const world = createWorldState(42);
+    world.commandQueue.push(makeNoOp(1), makeNoOp(2));
+    const drainedArrays: (readonly SimCommand[])[] = [];
+    const loop = createGameLoop(makeSpyTick().fn, world, {
+      onAfterDrain: (cmds) => { drainedArrays.push(cmds); },
+    });
+    loop.update(MS_PER_TICK);
+    expect(drainedArrays.length).toBe(1);
+    expect(drainedArrays[0]!.length).toBe(2);
+    expect(drainedArrays[0]![0]!.issuedAtTick).toBe(1);
+    expect(drainedArrays[0]![1]!.issuedAtTick).toBe(2);
+    expect(world.commandQueue.length).toBe(0);
+  });
+
+  it('onTickOutcome does NOT fire when tickFn returns None', () => {
+    const world = createWorldState(42);
+    const { fn } = makeSpyTick(); // always returns None
+    const outcomeSpy = vi.fn();
+    const loop = createGameLoop(fn, world, { onTickOutcome: outcomeSpy });
+    loop.update(MS_PER_TICK * 3);
+    expect(outcomeSpy).toHaveBeenCalledTimes(0);
+  });
+
+  it('onTickOutcome fires exactly once and breaks accumulator loop when tickFn returns Victory', () => {
+    const world = createWorldState(42);
+    let callCount = 0;
+    const tickFn = (): typeof GameOutcome[keyof typeof GameOutcome] => {
+      callCount += 1;
+      return callCount >= 2 ? GameOutcome.Victory : GameOutcome.None;
+    };
+    const outcomeSpy = vi.fn();
+    const loop = createGameLoop(tickFn, world, { onTickOutcome: outcomeSpy });
+    // 4 ticks worth of time: tickFn should only fire 2 times (break on Victory)
+    loop.update(MS_PER_TICK * 4);
+    expect(callCount).toBe(2);
+    expect(outcomeSpy).toHaveBeenCalledTimes(1);
+    expect(outcomeSpy).toHaveBeenCalledWith(GameOutcome.Victory);
+    // 2 ticks were consumed (1 None + 1 Victory); 2 ticks remain in accumulator
+    expect(loop.accumulatorMs).toBe(MS_PER_TICK * 2);
+  });
+
+  it('onTickOutcome fires on Defeat and MutualDestruction identically', () => {
+    for (const outcome of [GameOutcome.Defeat, GameOutcome.MutualDestruction]) {
+      const world = createWorldState(42);
+      let callCount = 0;
+      const tickFn = (): typeof GameOutcome[keyof typeof GameOutcome] => {
+        callCount += 1;
+        return callCount >= 2 ? outcome : GameOutcome.None;
+      };
+      const outcomeSpy = vi.fn();
+      const loop = createGameLoop(tickFn, world, { onTickOutcome: outcomeSpy });
+      loop.update(MS_PER_TICK * 4);
+      expect(callCount).toBe(2);
+      expect(outcomeSpy).toHaveBeenCalledTimes(1);
+      expect(outcomeSpy).toHaveBeenCalledWith(outcome);
+      expect(loop.accumulatorMs).toBe(MS_PER_TICK * 2);
+    }
+  });
+
+  it('backward-compat: createGameLoop with only onBeforeTick compiles and runs', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    const loop = createGameLoop(fn, world, { onBeforeTick: () => {} });
+    loop.update(MS_PER_TICK);
+    expect(calls.length).toBe(1);
+  });
+
+  it('backward-compat: createGameLoop with no opts compiles and runs', () => {
+    const world = createWorldState(42);
+    const { fn, calls } = makeSpyTick();
+    const loop = createGameLoop(fn, world);
+    loop.update(MS_PER_TICK);
+    expect(calls.length).toBe(1);
+  });
+});
+
 describe('determinism — accumulator + tick composition', () => {
   it('two loops with same seed and same update schedule produce identical world state (SCEN-06)', async () => {
     // Use the real tick from src/sim/tick.ts to verify end-to-end determinism.
