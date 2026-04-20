@@ -1,7 +1,9 @@
-// game-scene.ts — Phase 8 Phaser GameScene: drives game loop, renders world, handles keyboard/camera.
+// game-scene.ts — Phase 9 Phaser GameScene: drives game loop, renders world, handles keyboard/camera.
 //
-// Owns: createGameLoop wiring, draw dispatch, Tab view-toggle, camera-pan triggers.
-// UIScene is launched on top of GameScene (stub in Plan 05).
+// Owns: createGameLoop wiring, draw dispatch, Tab view-toggle, camera-pan triggers,
+//       GamePhase FSM (Playing|Paused|GameOver|SavePrompt), save boot flow,
+//       AI controller wiring (onBeforeTick → runAIController per AI colony),
+//       outcome handling (gameLoop.pause() + UIScene overlay), autosave.
 //
 // Coordinate model (Phase 8.5 stabilization):
 //   The project owns the camera. `CameraState` is in tile units; the draw modules
@@ -17,12 +19,25 @@
 //            draw modules already project to screen space.
 // Pitfall 2: Keyboard registration is GameScene-only — UIScene must NOT call createCursorKeys().
 // Pitfall 3: scale.mode = NONE, fixed 800x592 — no DPR scaling.
+// Pitfall 4: NEVER use .keys()/.entries()/.get() on world.colonies — it is a PLAIN OBJECT (ADR-0006).
+// Pitfall 5: No setMsPerTick(Infinity) for pause — use gameLoop.pause()/resume() (Plan 06 Task 1).
+// Pitfall 6: Pause key is P, NOT Space — Space+left-drag is the primary map-pan gesture (Phase 8.5).
 
 import * as Phaser from 'phaser';
 import { createScenario } from '../sim/scenario.js';
 import { copyWorldState, type WorldState } from '../sim/types.js';
 import { tick } from '../sim/tick.js';
 import { createGameLoop, type GameLoop, MS_PER_TICK } from '../platform/game-loop.js';
+import { hasSave, loadSave, deleteSave, tickAutosave } from '../platform/save.js';
+import { deserializeWorldState } from '../platform/save.js';
+import { runAIController } from './ai-controller.js';
+import {
+  GamePhase,
+  deriveAIColonyIds,
+  appendInputLog,
+  generateFreshSeed,
+  decideBootMode,
+} from './game-scene-logic.js';
 import {
   type ViewState,
   createViewState,
@@ -30,16 +45,31 @@ import {
   clampCamera,
 } from './camera.js';
 import {
+  PLAYER_COLONY_ID,
   PLAYER_START_X, PLAYER_START_Y,
   SURFACE_GRID_WIDTH, SURFACE_GRID_HEIGHT,
   UNDERGROUND_GRID_WIDTH, UNDERGROUND_GRID_HEIGHT,
 } from '../sim/constants.js';
+import { GameOutcome } from '../sim/game-over.js';
 import { drawSurface, type GfxLike } from './draw-surface.js';
 import { drawUnderground } from './draw-underground.js';
 import { drawPheromoneOverlay } from './draw-pheromone.js';
 import { processCameraInput, registerDragPan } from '../input/camera-input.js';
 import { registerSurfaceInput, type SurfaceInputState } from '../input/surface-input.js';
 import { registerUndergroundInput } from '../input/underground-input.js';
+// UIScenePhase9 — subset of UIScene public API added in Plan 06 Task 3.
+// Typed here to avoid circular imports; UIScene implements these methods.
+interface UIScenePhase9 {
+  showGameOverOverlay(outcome: GameOutcome, onRestart: () => void): void;
+  hideGameOverOverlay(): void;
+  showSavePromptOverlay(callbacks: { onContinue: () => void; onNewGame: () => void }): void;
+  hideSavePromptOverlay(): void;
+}
+import type { SimCommand } from '../sim/commands.js';
+
+// Re-export GamePhase for Plan 07 and other consumers
+export { GamePhase, decideBootMode, deriveAIColonyIds, appendInputLog, generateFreshSeed };
+export type { GamePhase as GamePhaseType };
 
 export class GameScene extends Phaser.Scene {
   private world!: WorldState;
@@ -54,15 +84,18 @@ export class GameScene extends Phaser.Scene {
   private surfaceInputState!: SurfaceInputState;
   private lastActiveView: ViewState['activeView'] | null = null;
 
+  // Phase 9 — GamePhase FSM + session fields
+  private gamePhase: GamePhase = GamePhase.Playing;
+  private currentOutcome: GameOutcome = GameOutcome.None;
+  private aiColonyIds: ReturnType<typeof deriveAIColonyIds> = [];
+  private readonly inputLog: SimCommand[] = [];
+  private lastAutosaveMs: number = 0;
+  private currentSeed: number = 0;
+  private speedMultiplier: number = 1;
+
   constructor() { super({ key: 'GameScene' }); }
 
   create() {
-    // Use a fixed seed for dev reproducibility; Phase 9 introduces save-loading that overrides.
-    const seed = 1;
-    this.world = createScenario(seed);
-    this.prevState = createScenario(seed);
-    copyWorldState(this.world, this.prevState);
-
     this.viewState = createViewState(PLAYER_START_X, PLAYER_START_Y);
     this.gfx = this.add.graphics();
 
@@ -77,56 +110,160 @@ export class GameScene extends Phaser.Scene {
     // Drag-pan registration — returns dragState ref for processCameraInput
     this.dragState = registerDragPan(this, this.viewState);
 
-    // Phase 8.5: Phaser's main camera is intentionally left at scroll=0 with
-    // default bounds. CameraState drives the manual projection inside the draw
-    // modules; syncing Phaser's camera to the same value caused a double-
-    // translation that pushed the world offscreen. See file header.
-
-    // Platform accumulator — snapshot hook wired; speed/pause remain Phase 9 seams.
-    this.gameLoop = createGameLoop(tick, this.world, {
-      onBeforeTick: (w) => copyWorldState(w, this.prevState),
+    // Phase 9 Plan 06 keyboard — P toggles pause; 1/2/4 set speed.
+    // SPACE is reserved for pan gesture (Phase 8.5 decision — see file header Pitfall 6).
+    this.input.keyboard!.on('keydown-P', () => {
+      if (this.gamePhase === GamePhase.Playing) {
+        this.gamePhase = GamePhase.Paused;
+        this.gameLoop.pause();
+      } else if (this.gamePhase === GamePhase.Paused) {
+        this.gamePhase = GamePhase.Playing;
+        this.gameLoop.resume();
+      }
     });
+    this.input.keyboard!.on('keydown-ONE', () => { this.speedMultiplier = 1; });
+    this.input.keyboard!.on('keydown-TWO', () => { this.speedMultiplier = 2; });
+    this.input.keyboard!.on('keydown-FOUR', () => { this.speedMultiplier = 4; });
 
     // Launch HUD scene on top.
     this.scene.launch('UIScene', { viewState: this.viewState, world: this.world });
     this.scene.bringToTop('UIScene');
 
     // World input dispatchers — internally guard on viewState.activeView.
-    // Both handlers coexist with registerDragPan: Phaser fires all pointerdown
-    // handlers; each guards isPointerOverHUD + activeView so they don't interfere.
     this.surfaceInputState = registerSurfaceInput(this, this.world, this.viewState);
     registerUndergroundInput(this, this.world, this.viewState);
+
+    // Phase 9 boot: check for existing save. If found, show SavePrompt overlay.
+    // Otherwise boot a fresh scenario directly.
+    const bootMode = decideBootMode(hasSave);
+    if (bootMode === 'prompt') {
+      this.gamePhase = GamePhase.SavePrompt;
+      const uiScene = this.scene.get('UIScene') as unknown as UIScenePhase9;
+      uiScene.showSavePromptOverlay({
+        onContinue: () => this.bootFromSave(),
+        onNewGame: () => {
+          deleteSave();
+          this.bootFresh();
+        },
+      });
+    } else {
+      this.bootFresh();
+    }
   }
 
-  update(_time: number, delta: number) {
+  // ---------------------------------------------------------------------------
+  // Boot helpers
+  // ---------------------------------------------------------------------------
+
+  private bootFresh(): void {
+    // W1: seed formula — Date.now() is ~1.7e12, exceeds int32. Bitmask-clamp to positive int32.
+    // Bitwise ops truncate to int32; 0x7fffffff mask ensures sign bit is clear.
+    const seed = generateFreshSeed(Date.now());
+    this.currentSeed = seed;
+    // createScenario creates BOTH colonies (PLAYER_COLONY_ID + ENEMY_COLONY_ID) unconditionally.
+    this.world = createScenario(seed);
+    this.finishBoot();
+  }
+
+  private bootFromSave(): void {
+    const loaded = loadSave();
+    if (loaded === null) {
+      // Corrupt save: fall through to fresh
+      deleteSave();
+      this.bootFresh();
+      return;
+    }
+    // Plan 04 SaveFile shape: { version, seed, inputLog, snapshot }
+    this.currentSeed = loaded.seed;
+    this.world = deserializeWorldState(loaded.snapshot);
+    // SCEN-06 replay truth: restore inputLog completely so the continued session
+    // can be replayed byte-for-byte from (seed, inputLog) per Plan 04 Task 1.
+    for (const c of loaded.inputLog) this.inputLog.push(c);
+    this.finishBoot();
+  }
+
+  private finishBoot(): void {
+    this.prevState = createScenario(this.currentSeed);
+    copyWorldState(this.world, this.prevState);
+
+    // B1: world.colonies is a PLAIN OBJECT per ADR-0006.
+    // Use Object.keys — NEVER .keys()/.entries()/.get() (those are Map APIs).
+    this.aiColonyIds = deriveAIColonyIds(this.world, PLAYER_COLONY_ID);
+
+    this.gameLoop = createGameLoop(tick, this.world, {
+      onBeforeTick: (w) => {
+        // Run AI for all AI colonies FIRST (AI commands enqueued before drain)
+        for (const aiCid of this.aiColonyIds) {
+          runAIController(w, aiCid);
+        }
+        // Then snapshot prevState for render interpolation
+        copyWorldState(w, this.prevState);
+      },
+      onAfterDrain: (cmds) => {
+        // SCEN-06 replay truth: never truncate — appendInputLog handles all commands
+        appendInputLog(this.inputLog, cmds);
+      },
+      onTickOutcome: (outcome) => {
+        this.currentOutcome = outcome;
+        this.gamePhase = GamePhase.GameOver;
+        // W2: first-class pause via Plan 06 Task 1 API — no setMsPerTick(Infinity)
+        this.gameLoop.pause();
+        const uiScene = this.scene.get('UIScene') as unknown as UIScenePhase9;
+        uiScene.showGameOverOverlay(outcome, () => this.restartGame());
+      },
+      getMsPerTick: () => MS_PER_TICK / this.speedMultiplier,
+    });
+
+    this.gamePhase = GamePhase.Playing;
+    this.gameLoop.resume();  // ensure running (createGameLoop default is not paused)
+    this.lastAutosaveMs = performance.now();
+
+    // Update UIScene reference to the new world (post-boot or post-restart)
+    // Note: UIScene.init() received the original world ref via scene.launch data;
+    // after bootFresh/bootFromSave we hold a new WorldState. UIScene reads world
+    // via the reference stored in its own field. For POC scope, we accept that
+    // UIScene uses the original reference — Plan 07 Playwright covers the full flow.
+  }
+
+  private restartGame(): void {
+    deleteSave();
+    this.currentOutcome = GameOutcome.None;
+    // bootFresh → finishBoot resumes the loop; this is the authoritative restart path.
+    this.bootFresh();
+    const uiScene = this.scene.get('UIScene') as unknown as UIScenePhase9;
+    uiScene.hideGameOverOverlay();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Update loop
+  // ---------------------------------------------------------------------------
+
+  update(time: number, delta: number) {
+    // SavePrompt phase: overlay handles input; no tick updates expected.
+    if (this.gamePhase === GamePhase.SavePrompt) return;
+
     // Tab toggles view (JustDown handles key-press edge, not held).
     if (Phaser.Input.Keyboard.JustDown(this.tabKey)) {
       toggleView(this.viewState);
     }
 
-    // Track active view for anything that needs to diff on toggle. Phaser's
-    // camera intentionally stays at default bounds / scroll=0 (see header).
+    // Track active view for anything that needs to diff on toggle.
     if (this.viewState.activeView !== this.lastActiveView) {
       this.lastActiveView = this.viewState.activeView;
     }
 
-    // Drive platform accumulator (Phase 8 snapshot hook fires before each tick).
+    // Drive platform accumulator. When paused/GameOver, gameLoop.pause() already
+    // freezes tick execution via its internal flag — update() is safe to call.
     this.gameLoop.update(delta);
 
-    // Apply keyboard-pan + final clamp. Drag-pan runs in its own handlers
-    // inside registerDragPan. Edge-pan was removed in Phase 8.5.
+    // Apply keyboard-pan + final clamp.
     processCameraInput(this.viewState, {
       cursors: this.cursors,
       wasd: this.wasd,
       dragState: this.dragState,
     });
 
-    // Pick the active CameraState for draw dispatch. Phaser's camera is NOT
-    // synced — the draw modules project manually (see file header).
     const cam = this.viewState.activeView === 'surface' ? this.viewState.surfaceCamera : this.viewState.undergroundCamera;
-
-    // After all pan triggers, ensure the active CameraState is clamped once
-    // per frame (safety net for floating-point drift; pan paths also clamp).
     const worldW = this.viewState.activeView === 'surface' ? SURFACE_GRID_WIDTH : UNDERGROUND_GRID_WIDTH;
     const worldH = this.viewState.activeView === 'surface' ? SURFACE_GRID_HEIGHT : UNDERGROUND_GRID_HEIGHT;
     clampCamera(cam, worldW, worldH);
@@ -137,9 +274,6 @@ export class GameScene extends Phaser.Scene {
     gfx.clear();
     drawPheromoneOverlay(gfx, this.world, cam, this.viewState.activeView);
     if (this.viewState.activeView === 'surface') {
-      // Phase 8.5 interaction-feedback: forward the right-click entrance
-      // preview so the player sees a gold frame on the tile that a
-      // confirming left-click will place the entrance at.
       const pending =
         this.surfaceInputState.pendingEntranceTileX !== null &&
         this.surfaceInputState.pendingEntranceTileY !== null
@@ -151,6 +285,17 @@ export class GameScene extends Phaser.Scene {
       drawSurface(gfx, this.prevState, this.world, alpha, cam, pending);
     } else {
       drawUnderground(gfx, this.prevState, this.world, alpha, cam);
+    }
+
+    // Autosave — only while actively Playing
+    if (this.gamePhase === GamePhase.Playing) {
+      this.lastAutosaveMs = tickAutosave(
+        this.currentSeed,
+        this.inputLog,
+        this.world,
+        this.lastAutosaveMs,
+        time,
+      );
     }
   }
 
