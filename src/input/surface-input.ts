@@ -15,15 +15,24 @@ import { screenToTile } from '../render/camera.js';
 import type { FoodPile } from '../sim/food.js';
 import type { MarkFoodPileCommand, DesignateEntranceCommand } from '../sim/commands.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
-import { isPointerOverHUD } from './camera-input.js';
+import { isPointerOverHUD, panInputState } from './camera-input.js';
 
 // ---------------------------------------------------------------------------
 // SurfaceInputState — mutable per-registration state
 // ---------------------------------------------------------------------------
 
-interface SurfaceInputState {
+/**
+ * Exported so the render layer (draw-surface.ts) can read `pendingEntranceTileX`
+ * / `pendingEntranceTileY` and draw a preview outline on the tile the player
+ * right-clicked. Phase 8.5 interaction-feedback fix: before, the right-click
+ * preview was invisible and players had to remember the exact tile between
+ * right-click and the confirming left-click.
+ */
+export interface SurfaceInputState {
   /** Right-click preview state: null = no pending designation, number = tileX of pending entrance. */
   pendingEntranceTileX: number | null;
+  /** TileY companion to pendingEntranceTileX — needed so the render layer can outline the right cell. */
+  pendingEntranceTileY: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -49,10 +58,19 @@ export function findFoodPileAt(world: WorldState, tileX: number, tileY: number):
  * Handles a left-click on the surface view.
  *
  * Priority order:
- *   1. If pendingEntranceTileX matches the clicked tileX → push DesignateEntranceCommand and reset.
+ *   1. If the clicked tile matches the pending entrance preview in BOTH X and Y,
+ *      push DesignateEntranceCommand and clear the preview.
  *   2. Else → try food-pile mark at the clicked tile.
  *
  * No-ops if: activeView !== 'surface', pointer over HUD, or tile out of bounds.
+ *
+ * Phase 8.5 fix: confirmation previously matched only `tileX`, which meant a
+ * player could right-click to preview tile (X, Y1), left-click a different row
+ * (X, Y2) on the same column, and still confirm — but the command fired with
+ * the second tile's Y. The preview frame and the placed entrance could
+ * disagree. Confirmation now requires both tile coordinates to match the
+ * previewed tile exactly; a non-matching left-click falls through to food-pile
+ * mark and leaves the preview intact so the player can try again.
  */
 export function handleSurfaceLeftClick(
   world: WorldState,
@@ -63,11 +81,20 @@ export function handleSurfaceLeftClick(
 ): void {
   if (viewState.activeView !== 'surface') return;
   if (isPointerOverHUD(screenX, screenY)) return;
+  // Pan-mode guard: while Space is held or a pan gesture is already in flight,
+  // the left-click is the pan trigger — not a world action.
+  if (panInputState.spaceHeld || panInputState.isPanning) return;
   const { tileX, tileY } = screenToTile(screenX, screenY, viewState.surfaceCamera);
   if (tileX < 0 || tileY < 0) return;
 
-  // Entrance designation confirmation: left-click on the same tileX that was right-clicked.
-  if (state.pendingEntranceTileX !== null && state.pendingEntranceTileX === tileX) {
+  // Entrance designation confirmation: left-click on the exact tile that was
+  // previewed by a prior right-click (both X and Y must match).
+  if (
+    state.pendingEntranceTileX !== null &&
+    state.pendingEntranceTileY !== null &&
+    state.pendingEntranceTileX === tileX &&
+    state.pendingEntranceTileY === tileY
+  ) {
     const cmd: DesignateEntranceCommand = {
       type: 'DesignateEntrance',
       colonyId: PLAYER_COLONY_ID,
@@ -77,6 +104,7 @@ export function handleSurfaceLeftClick(
     };
     world.commandQueue.push(cmd);
     state.pendingEntranceTileX = null;
+    state.pendingEntranceTileY = null;
     return;
   }
 
@@ -119,10 +147,8 @@ export function handleSurfaceRightClick(
   if (isPointerOverHUD(screenX, screenY)) return;
   const { tileX, tileY } = screenToTile(screenX, screenY, viewState.surfaceCamera);
   if (tileX < 0 || tileY < 0) return;
-  // Suppress unused-variable warning for tileY — it isn't stored in the preview because
-  // DesignateEntranceCommand will recalculate it from the confirmation click coords.
-  void tileY;
   state.pendingEntranceTileX = tileX;
+  state.pendingEntranceTileY = tileY;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,8 +170,11 @@ export function registerSurfaceInput(
   scene: Phaser.Scene,
   world: WorldState,
   viewState: ViewState,
-): void {
-  const state: SurfaceInputState = { pendingEntranceTileX: null };
+): SurfaceInputState {
+  const state: SurfaceInputState = {
+    pendingEntranceTileX: null,
+    pendingEntranceTileY: null,
+  };
   scene.input.on('pointerdown', (pointer: Phaser.Input.Pointer) => {
     if (pointer.leftButtonDown()) {
       handleSurfaceLeftClick(world, viewState, pointer.x, pointer.y, state);
@@ -153,4 +182,5 @@ export function registerSurfaceInput(
       handleSurfaceRightClick(world, viewState, pointer.x, pointer.y, state);
     }
   });
+  return state;
 }

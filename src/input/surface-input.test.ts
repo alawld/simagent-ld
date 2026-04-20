@@ -10,12 +10,17 @@
 //   - Both handlers are no-ops when pointer is over a HUD zone.
 //   - Tile out-of-bounds (tileX/Y < 0) → no command.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   findFoodPileAt,
   handleSurfaceLeftClick,
   handleSurfaceRightClick,
 } from './surface-input.js';
+import { panInputState, resetPanInputStateForTests } from './camera-input.js';
+
+beforeEach(() => {
+  resetPanInputStateForTests();
+});
 import type { WorldState } from '../sim/types.js';
 import type { ViewState } from '../render/camera.js';
 import { VIEWPORT_WIDTH_TILES, VIEWPORT_HEIGHT_TILES } from '../render/camera.js';
@@ -78,9 +83,9 @@ function makeWorld(overrides: {
   } as unknown as WorldState;
 }
 
-/** A SurfaceInputState equivalent (the private interface in surface-input.ts). */
-function makeState(pendingEntranceTileX: number | null = null) {
-  return { pendingEntranceTileX };
+/** A SurfaceInputState equivalent (the exported interface in surface-input.ts). */
+function makeState(pendingEntranceTileX: number | null = null, pendingEntranceTileY: number | null = null) {
+  return { pendingEntranceTileX, pendingEntranceTileY };
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +180,30 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
     expect(world.commandQueue).toHaveLength(0);
   });
 
+  it('is a no-op while panInputState.spaceHeld is true (Space+left-drag is pan, not world action)', () => {
+    const world = makeWorld({
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20, isMarkedPriority: false }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+    panInputState.spaceHeld = true;
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+  });
+
+  it('is a no-op while panInputState.isPanning is true (mid-pan left-click is pan continuation)', () => {
+    const world = makeWorld({
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20, isMarkedPriority: false }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+    panInputState.isPanning = true;
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+  });
+
   it('is a no-op when tileX < 0 (out-of-bounds click)', () => {
     const world = makeWorld({ foodPiles: [] });
     const vs = makeViewState('surface', 64, 64);
@@ -194,10 +223,10 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
 // ---------------------------------------------------------------------------
 
 describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
-  it('pushes DesignateEntranceCommand and clears preview when tileX matches pending', () => {
+  it('pushes DesignateEntranceCommand and clears preview when clicked tile matches pending (X and Y)', () => {
     const world = makeWorld({ tick: 3 });
     const vs = makeViewState('surface', 64, 64);
-    const state = makeState(15); // pending entrance at tileX=15
+    const state = makeState(15, 30); // pending entrance at tile (15, 30)
     const { x, y } = tileToScreen(15, 30, 64, 64);
     handleSurfaceLeftClick(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(1);
@@ -208,17 +237,33 @@ describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
     expect(cmd.surfaceTileY).toBe(30);
     expect(cmd.issuedAtTick).toBe(3);
     expect(state.pendingEntranceTileX).toBeNull();
+    expect(state.pendingEntranceTileY).toBeNull();
   });
 
   it('does NOT push DesignateEntrance when clicked tileX differs from pending', () => {
     const world = makeWorld({ foodPiles: [] });
     const vs = makeViewState('surface', 64, 64);
-    const state = makeState(15); // pending entrance at tileX=15
+    const state = makeState(15, 30); // pending entrance at (15, 30)
     const { x, y } = tileToScreen(20, 30, 64, 64); // click at tileX=20
     handleSurfaceLeftClick(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
     // Preview persists (not cleared on mismatch)
     expect(state.pendingEntranceTileX).toBe(15);
+    expect(state.pendingEntranceTileY).toBe(30);
+  });
+
+  it('does NOT push DesignateEntrance when clicked tileY differs from pending (same column, different row)', () => {
+    // Phase 8.5 regression guard: this was the reported "preview shows on tile
+    // A, but confirm fires on tile B in the same column" bug.
+    const world = makeWorld({ foodPiles: [] });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState(15, 30); // pending entrance at (15, 30)
+    const { x, y } = tileToScreen(15, 45, 64, 64); // same column, row 45
+    handleSurfaceLeftClick(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
+    // Preview persists (not cleared on mismatch)
+    expect(state.pendingEntranceTileX).toBe(15);
+    expect(state.pendingEntranceTileY).toBe(30);
   });
 
   it('falls through to food-pile check when tileX does not match pending', () => {
@@ -226,7 +271,7 @@ describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
       foodPiles: [{ foodPileId: 99, tileX: 20, tileY: 30, isMarkedPriority: false }],
     });
     const vs = makeViewState('surface', 64, 64);
-    const state = makeState(15); // pending entrance at tileX=15
+    const state = makeState(15, 30); // pending entrance at (15, 30)
     const { x, y } = tileToScreen(20, 30, 64, 64); // click at food pile tileX=20 != 15
     handleSurfaceLeftClick(world, vs, x, y, state);
     // Should push MarkFoodPile (not DesignateEntrance)
@@ -235,6 +280,7 @@ describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
     expect(cmd.type).toBe('MarkFoodPile');
     // Preview still persists
     expect(state.pendingEntranceTileX).toBe(15);
+    expect(state.pendingEntranceTileY).toBe(30);
   });
 });
 
@@ -243,13 +289,14 @@ describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
 // ---------------------------------------------------------------------------
 
 describe('handleSurfaceRightClick', () => {
-  it('sets pendingEntranceTileX to the clicked tileX', () => {
+  it('sets pendingEntranceTileX and pendingEntranceTileY to the clicked tile', () => {
     const world = makeWorld();
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
     const { x, y } = tileToScreen(40, 50, 64, 64);
     handleSurfaceRightClick(world, vs, x, y, state);
     expect(state.pendingEntranceTileX).toBe(40);
+    expect(state.pendingEntranceTileY).toBe(50);
   });
 
   it('is a no-op when activeView is underground', () => {
@@ -277,12 +324,13 @@ describe('handleSurfaceRightClick', () => {
     expect(state.pendingEntranceTileX).toBeNull();
   });
 
-  it('overwrites an existing pending entrance with the new tileX', () => {
+  it('overwrites an existing pending entrance with the new tile (X and Y)', () => {
     const world = makeWorld();
     const vs = makeViewState('surface', 64, 64);
-    const state = makeState(10); // previous pending at tileX=10
+    const state = makeState(10, 20); // previous pending at (10, 20)
     const { x, y } = tileToScreen(40, 50, 64, 64);
     handleSurfaceRightClick(world, vs, x, y, state);
     expect(state.pendingEntranceTileX).toBe(40);
+    expect(state.pendingEntranceTileY).toBe(50);
   });
 });
