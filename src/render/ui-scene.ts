@@ -113,22 +113,26 @@ export class UIScene extends Phaser.Scene {
     this.queenLabelText.setScrollFactor(0);
 
     // Triangle vertex labels — static text, created once.
+    // Phase 8.5 HUD cleanup: offsets tightened so every label renders INSIDE
+    // HUD.TRIANGLE (x: [8,128), y: [456,576)). The old offsets placed text
+    // above/beside the zone (e.g. Forage at y=452, Dig at x=-4) which let
+    // pointer clicks on the visible text fall through to world input.
     this.triangleLabels = [
       this.add.text(
-        TRIANGLE_VERTICES.forage.x - 20,
-        TRIANGLE_VERTICES.forage.y - 16,
+        TRIANGLE_VERTICES.forage.x - 18,
+        TRIANGLE_VERTICES.forage.y - 12,
         'Forage',
         { color: '#ffffff', fontSize: '10px' },
       ),
       this.add.text(
-        TRIANGLE_VERTICES.dig.x - 20,
-        TRIANGLE_VERTICES.dig.y + 4,
+        TRIANGLE_VERTICES.dig.x - 6,
+        TRIANGLE_VERTICES.dig.y - 12,
         'Dig',
         { color: '#ffffff', fontSize: '10px' },
       ),
       this.add.text(
-        TRIANGLE_VERTICES.fight.x - 4,
-        TRIANGLE_VERTICES.fight.y + 4,
+        TRIANGLE_VERTICES.fight.x - 28,
+        TRIANGLE_VERTICES.fight.y - 12,
         'Fight',
         { color: '#ffffff', fontSize: '10px' },
       ),

@@ -26,8 +26,18 @@ export const QUEEN_EGG_INTERVAL_TICKS = 300;
 /** PRD §9c — Minimum food units (fp) the colony must hold for queen to lay. */
 export const QUEEN_EGG_FOOD_THRESHOLD = 768; // 3 × FP_ONE
 
-/** PRD §9c — Ticks an ant can survive with no food before dying. */
-export const STARVATION_GRACE_TICKS = 100;
+/**
+ * PRD §9c — Ticks an ant can survive with no food before dying.
+ *
+ * Phase 8.5 stabilization (2026-04-19): raised from 100 → 300 (5s → 15s at
+ * 20Hz). While the UI is still being stabilized, the early-game starvation
+ * pressure was felt as "the queen keeps dying before I can figure out how to
+ * feed her". The PRD (02 §4a, §4c) keeps the 100-tick target for final
+ * balance; rebalance back toward it once the interface is trustworthy. Do
+ * NOT read this value as load-bearing for the equilibrium formula — it is
+ * prototype-stage tuning.
+ */
+export const STARVATION_GRACE_TICKS = 300;
 
 /** PRD §9c — Ticks between colony-level food reconcile sweeps. */
 export const RECONCILE_INTERVAL_TICKS = 100;
@@ -162,8 +172,17 @@ export const ENEMY_START_X = 104;
 /** Phase 7 PRD §6b — Enemy colony starting tile Y on the surface grid. */
 export const ENEMY_START_Y = 64;
 
-/** Phase 7 PRD §6b — Starting food units (FP) for each colony. */
-export const STARTING_FOOD = 500;
+/**
+ * Phase 7 PRD §6b — Starting food units (FP) for each colony.
+ *
+ * Phase 8.5 stabilization (2026-04-19): raised from 500 → 1280 (≈2.0 → 5.0
+ * food units) so the queen starts above QUEEN_EGG_FOOD_THRESHOLD (768 FP =
+ * 3.0) and can lay her first egg immediately, rather than stalling until
+ * workers bring food back. Like STARVATION_GRACE_TICKS, this is prototype-
+ * stage tuning to relax early-game pressure while the UI is being
+ * stabilized; the PRD (02 §6b) retains the 500 target for final balance.
+ */
+export const STARTING_FOOD = 1280;
 
 /** Phase 7 PRD §6b — Number of worker ants each colony starts with. */
 export const STARTING_WORKERS = 3;

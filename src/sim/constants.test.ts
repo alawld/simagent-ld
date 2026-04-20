@@ -59,8 +59,8 @@ describe('PRD §9c lifecycle tick constants', () => {
     expect(QUEEN_EGG_FOOD_THRESHOLD).toBe(768);
   });
 
-  it('STARVATION_GRACE_TICKS === 100', () => {
-    expect(STARVATION_GRACE_TICKS).toBe(100);
+  it('STARVATION_GRACE_TICKS === 300 (Phase 8.5 stabilization bump from PRD target 100)', () => {
+    expect(STARVATION_GRACE_TICKS).toBe(300);
   });
 
   it('RECONCILE_INTERVAL_TICKS === 100', () => {
@@ -242,8 +242,8 @@ describe('Phase 7 scenario generation constants (PRD §6a, §6b)', () => {
     expect(ENEMY_START_Y).toBe(64);
   });
 
-  it('STARTING_FOOD === 500', () => {
-    expect(STARTING_FOOD).toBe(500);
+  it('STARTING_FOOD === 1280 (Phase 8.5 stabilization bump from PRD target 500)', () => {
+    expect(STARTING_FOOD).toBe(1280);
   });
 
   it('STARTING_WORKERS === 3', () => {
