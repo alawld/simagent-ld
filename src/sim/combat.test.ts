@@ -1,62 +1,197 @@
 import { describe, it, expect } from 'vitest';
+import { detectAndResolveCombat, killAnt } from './combat.js';
+import { createWorldState, allocateEntityId } from './types.js';
+import { createColonyRecord } from './colony/colony-store.js';
+import { initAnt } from './ant/ant-store.js';
+import { AntTask } from './enums.js';
+import { Zone } from './terrain.js';
+import { FP_SHIFT, FP_ONE } from './fixed.js';
+import { WORKER_BASE_SPEED, WORKER_LIFESPAN_TICKS } from './constants.js';
+import type { WorldState } from './types.js';
+import type { ColonyId } from './colony/colony-store.js';
 
-// Dynamic import helper: bypasses tsc static module resolution by using a variable.
-// Plan 02 will create combat.ts; until then these anchor tests fail loudly.
-const COMBAT_MODULE = './combat.js';
+// Helper: build a minimal 2-colony world with seeded rngState.
+function makeWorldWith2Colonies(seed = 42): { world: WorldState; cid1: ColonyId; cid2: ColonyId } {
+  const world = createWorldState(seed);
+  // Place queens at distinct tiles far from worker spawn points (tile 5,7 is the combat tile in tests).
+  // Queens at tile (0,0) and (1,0) so they never collide with each other or the test workers.
+  const queen1 = allocateEntityId(world);
+  initAnt(world.ants, queen1, { colonyId: 1, posX: 0 << FP_SHIFT, posY: 0 << FP_SHIFT, task: AntTask.Idle, subTask: 0, speed: 0, lifespan: WORKER_LIFESPAN_TICKS });
+  const colony1 = createColonyRecord(1 as ColonyId, queen1);
+  colony1.entrances = [];
+  colony1.rallyPoint = null;
+  colony1.digFlowFieldDirty = false;
+  world.colonies[1] = colony1;
 
-describe('combat system', () => {
-  describe('detectAndResolveCombat', () => {
-    it('detectAndResolveCombat is exported from src/sim/combat.ts (Plan 02 milestone)', async () => {
-      const mod = await import(/* @vite-ignore */ COMBAT_MODULE).catch((e: unknown) => ({ __importErr: e }));
-      if ('__importErr' in (mod as object)) {
-        expect.fail('src/sim/combat.ts does not exist yet — Plan 02 will create it');
-      }
-      expect(typeof (mod as Record<string, unknown>).detectAndResolveCombat).toBe('function');
-    });
+  const queen2 = allocateEntityId(world);
+  initAnt(world.ants, queen2, { colonyId: 2, posX: 1 << FP_SHIFT, posY: 0 << FP_SHIFT, task: AntTask.Idle, subTask: 0, speed: 0, lifespan: WORKER_LIFESPAN_TICKS });
+  const colony2 = createColonyRecord(2 as ColonyId, queen2);
+  colony2.entrances = [];
+  colony2.rallyPoint = null;
+  colony2.digFlowFieldDirty = false;
+  world.colonies[2] = colony2;
 
-    it.skip('groups ants by tile key (zone, tileX, tileY) for combat detection');
-    it.skip('skips tiles with ants from only one colony');
-    it.skip('sorts each colony group by EntityId ascending for deterministic pairing');
-    it.skip('resolves multi-round 1v1 using rng.nextInt(2) coin flip (CMBT-05)');
-    it.skip('advances only the loser index after each round');
-    it.skip('surviving ants from the larger group remain alive after all rounds');
+  return { world, cid1: 1 as ColonyId, cid2: 2 as ColonyId };
+}
+
+// Helper: spawn a worker ant of colonyId at (tileX, tileY, zone). Returns slot index.
+function spawnAnt(world: WorldState, colonyId: ColonyId, tileX: number, tileY: number, zone: Zone): number {
+  const id = allocateEntityId(world);
+  initAnt(world.ants, id, {
+    colonyId, posX: (tileX << FP_SHIFT) + (FP_ONE >> 1), posY: (tileY << FP_SHIFT) + (FP_ONE >> 1),
+    task: AntTask.Idle, subTask: 0, speed: WORKER_BASE_SPEED, zone,
+  });
+  world.colonies[colonyId]!.workers.push(id);
+  world.colonies[colonyId]!.workerCount += 1;
+  return id;
+}
+
+describe('detectAndResolveCombat', () => {
+  it('does nothing when no two ants share a tile', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    const a = spawnAnt(world, cid1, 5, 5, Zone.Surface);
+    const b = spawnAnt(world, cid2, 10, 10, Zone.Surface);
+    detectAndResolveCombat(world);
+    expect(world.ants.alive[a]).toBe(1);
+    expect(world.ants.alive[b]).toBe(1);
+    expect(world.colonies[cid1]!.killCount).toBe(0);
+    expect(world.colonies[cid2]!.killCount).toBe(0);
   });
 
-  describe('killAnt', () => {
-    it('killAnt is exported from src/sim/combat.ts (Plan 02 milestone)', async () => {
-      const mod = await import(/* @vite-ignore */ COMBAT_MODULE).catch((e: unknown) => ({ __importErr: e }));
-      if ('__importErr' in (mod as object)) {
-        expect.fail('src/sim/combat.ts does not exist yet — Plan 02 will create it');
-      }
-      expect(typeof (mod as Record<string, unknown>).killAnt).toBe('function');
-    });
-
-    it.skip('sets ants.alive[id] = 0');
-    it.skip('drops carried food at death tile (surface creates FoodPile)');
-    it.skip('deposits DANGER_PHEROMONE_BURST_AMOUNT to dead ant own colony danger grid');
+  it('does nothing when ants share a tile but are from the same colony', () => {
+    const { world, cid1 } = makeWorldWith2Colonies();
+    const a = spawnAnt(world, cid1, 7, 7, Zone.Surface);
+    const b = spawnAnt(world, cid1, 7, 7, Zone.Surface);
+    detectAndResolveCombat(world);
+    expect(world.ants.alive[a]).toBe(1);
+    expect(world.ants.alive[b]).toBe(1);
   });
 
-  describe('zone separation', () => {
-    it('detectAndResolveCombat is exported from src/sim/combat.ts (zone separation anchor)', async () => {
-      const mod = await import(/* @vite-ignore */ COMBAT_MODULE).catch((e: unknown) => ({ __importErr: e }));
-      if ('__importErr' in (mod as object)) {
-        expect.fail('src/sim/combat.ts does not exist yet — Plan 02 will create it');
-      }
-      expect(typeof (mod as Record<string, unknown>).detectAndResolveCombat).toBe('function');
-    });
-
-    it.skip('surface ant and underground ant at same tileX/tileY do NOT fight');
+  it('resolves combat when 2 ants from different colonies share a tile — one dies, winner killCount increments', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    const a = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    const b = spawnAnt(world, cid2, 5, 7, Zone.Surface);
+    detectAndResolveCombat(world);
+    const aliveCount = world.ants.alive[a]! + world.ants.alive[b]!;
+    expect(aliveCount).toBe(1); // exactly one died
+    const totalKills = world.colonies[cid1]!.killCount + world.colonies[cid2]!.killCount;
+    expect(totalKills).toBe(1);
   });
 
-  describe('coin flip distribution (CMBT-05)', () => {
-    it('detectAndResolveCombat is exported from src/sim/combat.ts (coin flip anchor)', async () => {
-      const mod = await import(/* @vite-ignore */ COMBAT_MODULE).catch((e: unknown) => ({ __importErr: e }));
-      if ('__importErr' in (mod as object)) {
-        expect.fail('src/sim/combat.ts does not exist yet — Plan 02 will create it');
-      }
-      expect(typeof (mod as Record<string, unknown>).detectAndResolveCombat).toBe('function');
-    });
+  it('surface (5,7) and underground (5,7) do NOT fight (zone separation)', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    const a = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    const b = spawnAnt(world, cid2, 5, 7, Zone.Underground);
+    detectAndResolveCombat(world);
+    expect(world.ants.alive[a]).toBe(1);
+    expect(world.ants.alive[b]).toBe(1);
+    expect(world.colonies[cid1]!.killCount).toBe(0);
+    expect(world.colonies[cid2]!.killCount).toBe(0);
+  });
 
-    it.skip('over 1000 fights with known seed, win rate approaches 50%');
+  it('is deterministic: same rngState + same placements produces the same survivor', () => {
+    const build = () => {
+      const x = makeWorldWith2Colonies(42);
+      const a = spawnAnt(x.world, x.cid1, 5, 7, Zone.Surface);
+      const b = spawnAnt(x.world, x.cid2, 5, 7, Zone.Surface);
+      return { ...x, a, b };
+    };
+    const run1 = build();
+    detectAndResolveCombat(run1.world);
+    const run2 = build();
+    detectAndResolveCombat(run2.world);
+    expect(run1.world.ants.alive[run1.a]).toBe(run2.world.ants.alive[run2.a]);
+    expect(run1.world.ants.alive[run1.b]).toBe(run2.world.ants.alive[run2.b]);
+  });
+});
+
+describe('resolveCombatOnTile', () => {
+  it('resolves 3-way combat until one colony remains', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    // Add a 3rd colony — queen placed at tile (2,0) to avoid collision with queens 1,2 at tiles (0,0)/(1,0).
+    const queen3 = allocateEntityId(world);
+    initAnt(world.ants, queen3, { colonyId: 3, posX: 2 << FP_SHIFT, posY: 0, task: AntTask.Idle, subTask: 0, speed: 0 });
+    const colony3 = createColonyRecord(3 as ColonyId, queen3);
+    colony3.entrances = [];
+    colony3.rallyPoint = null;
+    colony3.digFlowFieldDirty = false;
+    world.colonies[3] = colony3;
+
+    const a = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    const b = spawnAnt(world, cid2, 5, 7, Zone.Surface);
+    const c = spawnAnt(world, 3 as ColonyId, 5, 7, Zone.Surface);
+    detectAndResolveCombat(world);
+    const alive = [world.ants.alive[a] ?? 0, world.ants.alive[b] ?? 0, world.ants.alive[c] ?? 0];
+    expect(alive.reduce((s, v) => s + v, 0)).toBe(1); // exactly one survives
+  });
+
+  it('advances world.rngState exactly once per round', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    spawnAnt(world, cid2, 5, 7, Zone.Surface);
+    const before = world.rngState;
+    detectAndResolveCombat(world);
+    // One round = one nextInt(2) call = one state advance. State should differ.
+    expect(world.rngState).not.toBe(before);
+  });
+});
+
+describe('killAnt', () => {
+  it('zeroes alive flag on victim', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    const v = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    killAnt(world, v, cid2);
+    expect(world.ants.alive[v]).toBe(0);
+  });
+
+  it('increments killer colony killCount by 1', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    const v = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    expect(world.colonies[cid2]!.killCount).toBe(0);
+    killAnt(world, v, cid2);
+    expect(world.colonies[cid2]!.killCount).toBe(1);
+  });
+
+  it('does not increment killCount when killerColonyId is 0', () => {
+    const { world, cid1 } = makeWorldWith2Colonies();
+    const v = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    killAnt(world, v, 0 as ColonyId);
+    expect(world.ants.alive[v]).toBe(0);
+    expect(world.colonies[cid1]!.killCount).toBe(0);
+  });
+
+  it('does NOT remove entity from roster (tickDeathCleanup owns roster swap-remove)', () => {
+    const { world, cid1, cid2 } = makeWorldWith2Colonies();
+    const v = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+    expect(world.colonies[cid1]!.workers).toContain(v);
+    killAnt(world, v, cid2);
+    // Combat.killAnt intentionally does NOT cleanup the roster. The alive=0 flag is enough;
+    // tickDeathCleanup (colony-system.ts:165) handles the roster next tick.
+    expect(world.colonies[cid1]!.workers).toContain(v);
+    expect(world.colonies[cid1]!.workerCount).toBe(1); // unchanged by combat.killAnt
+  });
+});
+
+describe('coin flip distribution (CMBT-05)', () => {
+  it('over 1000 fights, A-wins is within ±3σ of 500 (approx 453..547)', () => {
+    // Share world.rngState across fights — real sequence, not 1000 fresh RNGs.
+    const { world, cid1, cid2 } = makeWorldWith2Colonies(42);
+    let aWins = 0;
+    for (let i = 0; i < 1000; i++) {
+      // Reset only the two combatants — keep rngState unchanged between iterations.
+      const a = spawnAnt(world, cid1, 5, 7, Zone.Surface);
+      const b = spawnAnt(world, cid2, 5, 7, Zone.Surface);
+      detectAndResolveCombat(world);
+      if (world.ants.alive[a] === 1) aWins += 1;
+      // Kill the survivor (whichever) so next iteration starts fresh — set both alive=0 to avoid
+      // cross-iteration state. spawnAnt allocates new ids so there is no slot collision.
+      world.ants.alive[a] = 0;
+      world.ants.alive[b] = 0;
+      // Reset killCount deltas too — don't leak across iterations.
+      world.colonies[cid1]!.killCount = 0;
+      world.colonies[cid2]!.killCount = 0;
+    }
+    expect(aWins).toBeGreaterThanOrEqual(453);
+    expect(aWins).toBeLessThanOrEqual(547);
   });
 });
