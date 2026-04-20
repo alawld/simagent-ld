@@ -1,7 +1,13 @@
-// ui-scene.ts — Phase 8 UIScene: full HUD implementation.
+// ui-scene.ts — Phase 9 UIScene: full HUD + GameOver/SavePrompt overlays.
 //
 // Renders per-frame: colony stats, behavior triangle widget, minimap, view-toggle button,
 // and the context menu (when visible).
+//
+// Phase 9 Plan 06 additions:
+//   - showGameOverOverlay / hideGameOverOverlay — Victory/Defeat/MutualDestruction screen
+//   - showSavePromptOverlay / hideSavePromptOverlay — Continue or New Game on refresh
+//   - window.__phase9_ui.activeOverlay — published for Plan 07 Playwright observability
+//   - SAVE_PROMPT_CONTINUE_RECT / SAVE_PROMPT_NEW_GAME_RECT / GAME_OVER_RESTART_RECT exports
 //
 // Two-scene topology: UIScene runs on top of GameScene. Phaser camera for UIScene is
 // non-scrolling by default, so HUD elements stay screen-fixed.
@@ -18,6 +24,43 @@ import type { ViewState } from './camera.js';
 import { toggleView } from './camera.js';
 import type { WorldState } from '../sim/types.js';
 import { HUD } from './sprites.js';
+import { GameOutcome } from '../sim/game-over.js';
+import { formatOutcomeTitle, formatKillStatsSubtitle } from './ui-scene-logic.js';
+import { PLAYER_COLONY_ID as _PLAYER_COLONY_ID } from '../sim/constants.js';
+
+// Re-export pure helpers for Plan 07 and external consumers
+export { formatOutcomeTitle, formatKillStatsSubtitle };
+
+// ---------------------------------------------------------------------------
+// Plan 07 Playwright observability contract
+// ---------------------------------------------------------------------------
+
+export type ActiveOverlay = 'none' | 'save-prompt' | 'game-over';
+
+declare global {
+  interface Window {
+    __phase9_ui?: { activeOverlay: ActiveOverlay };
+  }
+}
+
+/** Publishes current overlay state to window.__phase9_ui for Playwright observability.
+ *  Guarded by typeof window check so Vitest (Node) contexts don't crash. */
+function setActiveOverlay(next: ActiveOverlay): void {
+  if (typeof window !== 'undefined') {
+    window.__phase9_ui = { activeOverlay: next };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Overlay button rects — exported for Plan 07 Playwright coordinate-based clicks
+// ---------------------------------------------------------------------------
+
+/** Canvas-local rect for the SavePrompt "Continue" button. */
+export const SAVE_PROMPT_CONTINUE_RECT = { x: 300, y: 280, w: 120, h: 32 } as const;
+/** Canvas-local rect for the SavePrompt "New Game" button. */
+export const SAVE_PROMPT_NEW_GAME_RECT = { x: 300, y: 320, w: 120, h: 32 } as const;
+/** Canvas-local rect for the GameOver "Restart" button. */
+export const GAME_OVER_RESTART_RECT    = { x: 300, y: 320, w: 120, h: 32 } as const;
 import {
   createTriangleDragState,
   drawTriangle,
@@ -72,6 +115,10 @@ export class UIScene extends Phaser.Scene {
   private viewToggleText!: Phaser.GameObjects.Text;
   private contextMenuLabels!: Phaser.GameObjects.Text[];
   private dragState!: TriangleDragState;
+
+  // Phase 9 Plan 06 — overlay groups (null = overlay not currently shown)
+  private gameOverGroup: Phaser.GameObjects.GameObject[] = [];
+  private savePromptGroup: Phaser.GameObjects.GameObject[] = [];
 
   constructor() { super({ key: 'UIScene' }); }
 
@@ -223,6 +270,14 @@ export class UIScene extends Phaser.Scene {
       this.dragState.targetRatio = screenToBarycentric(pointer.x, pointer.y);
     });
 
+    // Belt-and-suspenders: clear overlay window state on scene shutdown to
+    // prevent stale __phase9_ui surviving a scene restart.
+    this.events.on('shutdown', () => {
+      this.hideGameOverOverlay();
+      this.hideSavePromptOverlay();
+      setActiveOverlay('none');
+    });
+
     this.input.on('pointerup', () => {
       if (this.dragState.isDragging) {
         // Emit exactly one SetBehaviorRatioCommand per drag session (T-08-12).
@@ -333,6 +388,157 @@ export class UIScene extends Phaser.Scene {
         label.setVisible(false);
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 9 Plan 06 — GameOver overlay
+  // ---------------------------------------------------------------------------
+
+  public showGameOverOverlay(outcome: GameOutcome, onRestart: () => void): void {
+    this.hideGameOverOverlay(); // clear any prior instance first
+
+    const W = 800;
+    const H = 592;
+
+    // Semi-transparent background — input-blocking to absorb clicks behind overlay.
+    const bg = this.add.rectangle(W / 2, H / 2, W, H, 0x000000, 0.6);
+    bg.setInteractive();
+    bg.setDepth(20);
+
+    const { text: titleText, color: titleColor } = formatOutcomeTitle(outcome);
+    const title = this.add.text(W / 2, H / 2 - 60, titleText, {
+      fontSize: '40px',
+      fontFamily: 'monospace',
+      color: '#' + titleColor.toString(16).padStart(6, '0'),
+    });
+    title.setOrigin(0.5);
+    title.setDepth(21);
+
+    // Kill stats subtitle — read via plain-object bracket access (ADR-0006)
+    const playerColony = this.world.colonies[_PLAYER_COLONY_ID];
+    const killCount = playerColony?.killCount ?? 0;
+    const subtitle = this.add.text(W / 2, H / 2 - 10, formatKillStatsSubtitle(killCount), {
+      fontSize: '18px',
+      fontFamily: 'monospace',
+      color: '#cccccc',
+    });
+    subtitle.setOrigin(0.5);
+    subtitle.setDepth(21);
+
+    // Restart button
+    const btnR = GAME_OVER_RESTART_RECT;
+    const btnBg = this.add.rectangle(
+      btnR.x + btnR.w / 2, btnR.y + btnR.h / 2,
+      btnR.w, btnR.h,
+      0x444444, 1,
+    );
+    btnBg.setInteractive();
+    btnBg.setDepth(21);
+    btnBg.on('pointerdown', () => {
+      onRestart();
+    });
+
+    const btnLabel = this.add.text(btnR.x + btnR.w / 2, btnR.y + btnR.h / 2, 'Restart', {
+      fontSize: '16px',
+      fontFamily: 'monospace',
+      color: '#ffffff',
+    });
+    btnLabel.setOrigin(0.5);
+    btnLabel.setDepth(22);
+
+    this.gameOverGroup = [bg, title, subtitle, btnBg, btnLabel];
+    setActiveOverlay('game-over');
+  }
+
+  public hideGameOverOverlay(): void {
+    for (const obj of this.gameOverGroup) obj.destroy();
+    this.gameOverGroup = [];
+    setActiveOverlay('none');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 9 Plan 06 — SavePrompt overlay
+  // ---------------------------------------------------------------------------
+
+  public showSavePromptOverlay(callbacks: { onContinue: () => void; onNewGame: () => void }): void {
+    this.hideSavePromptOverlay(); // clear any prior instance first
+
+    const W = 800;
+    const H = 592;
+
+    // Semi-transparent background
+    const bg = this.add.rectangle(W / 2, H / 2, W, H, 0x000000, 0.7);
+    bg.setInteractive();
+    bg.setDepth(20);
+
+    const title = this.add.text(W / 2, H / 2 - 80, 'Resume saved game?', {
+      fontSize: '28px',
+      fontFamily: 'monospace',
+      color: '#ffffff',
+    });
+    title.setOrigin(0.5);
+    title.setDepth(21);
+
+    const subtitle = this.add.text(W / 2, H / 2 - 40, 'Found a previous session. Continue or start new?', {
+      fontSize: '14px',
+      fontFamily: 'monospace',
+      color: '#aaaaaa',
+    });
+    subtitle.setOrigin(0.5);
+    subtitle.setDepth(21);
+
+    // Continue button
+    const contR = SAVE_PROMPT_CONTINUE_RECT;
+    const contBg = this.add.rectangle(
+      contR.x + contR.w / 2, contR.y + contR.h / 2,
+      contR.w, contR.h,
+      0x226622, 1,
+    );
+    contBg.setInteractive();
+    contBg.setDepth(21);
+    contBg.on('pointerdown', () => {
+      this.hideSavePromptOverlay();
+      callbacks.onContinue();
+    });
+
+    const contLabel = this.add.text(contR.x + contR.w / 2, contR.y + contR.h / 2, 'Continue', {
+      fontSize: '16px',
+      fontFamily: 'monospace',
+      color: '#ffffff',
+    });
+    contLabel.setOrigin(0.5);
+    contLabel.setDepth(22);
+
+    // New Game button
+    const ngR = SAVE_PROMPT_NEW_GAME_RECT;
+    const ngBg = this.add.rectangle(
+      ngR.x + ngR.w / 2, ngR.y + ngR.h / 2,
+      ngR.w, ngR.h,
+      0x662222, 1,
+    );
+    ngBg.setInteractive();
+    ngBg.setDepth(21);
+    ngBg.on('pointerdown', () => {
+      this.hideSavePromptOverlay();
+      callbacks.onNewGame();
+    });
+
+    const ngLabel = this.add.text(ngR.x + ngR.w / 2, ngR.y + ngR.h / 2, 'New Game', {
+      fontSize: '16px',
+      fontFamily: 'monospace',
+      color: '#ffffff',
+    });
+    ngLabel.setOrigin(0.5);
+    ngLabel.setDepth(22);
+
+    this.savePromptGroup = [bg, title, subtitle, contBg, contLabel, ngBg, ngLabel];
+    setActiveOverlay('save-prompt');
+  }
+
+  public hideSavePromptOverlay(): void {
+    for (const obj of this.savePromptGroup) obj.destroy();
+    this.savePromptGroup = [];
+    setActiveOverlay('none');
   }
 
   private isInsideRect(
