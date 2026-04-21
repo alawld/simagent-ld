@@ -23,7 +23,11 @@ import {
   resetUndergroundInputState,
   type UndergroundInputState,
 } from './underground-input.js';
-import { contextMenuState, hideContextMenu } from '../render/context-menu-state.js';
+import {
+  contextMenuState,
+  hideContextMenu,
+  applyPendingContextMenuShow,
+} from '../render/context-menu-state.js';
 import { panInputState, resetPanInputStateForTests } from './camera-input.js';
 import { UndergroundTileState, ugSet, createUndergroundGrid } from '../sim/terrain.js';
 import type { WorldState } from '../sim/types.js';
@@ -53,11 +57,14 @@ function makeViewState(
 
 /**
  * Convert tile coords to screen pixel coords for the underground camera.
- * screenX = (tileX - (camX - vw/2)) * TILE_SIZE_PX
+ * Mirrors the renderer's integer-tile snap so tests hit the pixel the player
+ * sees the tile at.
  */
 function tileToScreen(tileX: number, tileY: number, camX: number, camY: number): { x: number; y: number } {
-  const px = (tileX - (camX - VIEWPORT_WIDTH_TILES / 2)) * TILE_SIZE_PX;
-  const py = (tileY - (camY - VIEWPORT_HEIGHT_TILES / 2)) * TILE_SIZE_PX;
+  const left = Math.floor(camX - VIEWPORT_WIDTH_TILES / 2);
+  const top = Math.floor(camY - VIEWPORT_HEIGHT_TILES / 2);
+  const px = (tileX - left) * TILE_SIZE_PX;
+  const py = (tileY - top) * TILE_SIZE_PX;
   return { x: px, y: py };
 }
 
@@ -98,6 +105,7 @@ function makeState(isDragging = false, lastX = -1, lastY = -1) {
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
+  // hideContextMenu clears visible + pendingHide + pendingShow.
   hideContextMenu();
   contextMenuState.screenX = 0;
   contextMenuState.screenY = 0;
@@ -270,6 +278,30 @@ describe('handleUndergroundLeftClick', () => {
     expect(state.lastMarkedTileY).toBe(10);
   });
 
+  it('does NOT push MarkDigTile when ant-activity panel pendingHide is set (popup click-away race)', async () => {
+    // Scenario: player opens HUD ant-activity popup, then clicks on the
+    // underground map to dismiss it. UIScene's pointerdown handler sets
+    // pendingHide=true before returning. The subsequent underground-input
+    // pointerdown must observe the click as HUD-consumed and drop it —
+    // otherwise the dismissal click would also mark the tile for digging.
+    const { showAntActivityPanel, requestHideAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({ tick: 7 });
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+
+    showAntActivityPanel();
+    requestHideAntActivityPanel();
+    try {
+      handleUndergroundLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+      expect(state.isDragging).toBe(false);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
   it('suppresses click without mutating menu state when menu is visible', () => {
     // UIScene owns menu dismissal (requestHideContextMenu → applied next frame).
     // handleUndergroundLeftClick must NOT flip `visible` synchronously or it
@@ -403,7 +435,11 @@ describe('handleUndergroundRightClick', () => {
     expect(cmd.issuedAtTick).toBe(2);
   });
 
-  it('sets contextMenuState.visible=true for an Open tunnel-end tile', () => {
+  it('requests a deferred show for an Open tunnel-end tile (anchor stored immediately, visible flipped on next update)', () => {
+    // Deferred show is required because UIScene's pointerdown handler runs in
+    // the same dispatch as this one. If visible flipped synchronously, UIScene
+    // would see visible=true on the SAME right-click event and interpret it as
+    // a menu item selection — the bug this deferred-show pattern exists to fix.
     const world = makeWorld();
     const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
     // (5,5) Open; N (5,4) stays Solid → tunnel end
@@ -411,12 +447,65 @@ describe('handleUndergroundRightClick', () => {
     const vs = makeViewState('underground', 64, 32);
     const { x, y } = tileToScreen(5, 5, 64, 32);
     handleUndergroundRightClick(world, vs, x, y);
-    expect(contextMenuState.visible).toBe(true);
+    // Immediately after the handler: visible is still false, pendingShow is true,
+    // and the anchor (tile + screen coords) is stored for rendering on next frame.
+    expect(contextMenuState.visible).toBe(false);
+    expect(contextMenuState.pendingShow).toBe(true);
     expect(contextMenuState.anchorTileX).toBe(5);
     expect(contextMenuState.anchorTileY).toBe(5);
     expect(contextMenuState.screenX).toBeCloseTo(x);
     expect(contextMenuState.screenY).toBeCloseTo(y);
     expect(world.commandQueue).toHaveLength(0);
+    // On the next frame, UIScene.update calls applyPendingContextMenuShow and
+    // the menu becomes visible to the renderer.
+    applyPendingContextMenuShow();
+    expect(contextMenuState.visible).toBe(true);
+    expect(contextMenuState.pendingShow).toBe(false);
+  });
+
+  it('cross-scene race: a pointerdown handler running after handleUndergroundRightClick sees visible=false for this same dispatch', () => {
+    // This is the exact scenario the deferred-show pattern defends against.
+    // UIScene's pointerdown handler runs in the same JS dispatch as the
+    // underground-input pointerdown handler. It MUST NOT see visible=true from
+    // the show that is pending for the next frame, or it would misinterpret
+    // the right-click as a menu-item selection (the menu anchor is at the
+    // pointer, so the click lands on the first item).
+    const world = makeWorld();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 5, 5, UndergroundTileState.Open);
+    const vs = makeViewState('underground', 64, 32);
+    const { x, y } = tileToScreen(5, 5, 64, 32);
+
+    handleUndergroundRightClick(world, vs, x, y);
+
+    // Simulate the "UIScene handler running second in the same dispatch"
+    // observing the state. It must see visible=false so its menu-selection
+    // branch does not fire on this right-click.
+    const visibleAtSecondHandlerEntry = contextMenuState.visible;
+    expect(visibleAtSecondHandlerEntry).toBe(false);
+
+    // No PlaceChamberCommand should have been pushed by either handler
+    // on this dispatch — only the anchor metadata is set for next-frame render.
+    expect(world.commandQueue).toHaveLength(0);
+  });
+
+  it('menu remains visible across multiple frames after pendingShow applies (no auto-hide)', () => {
+    // Once the menu is shown on frame N+1, it stays visible until an explicit
+    // hide is requested (menu selection, click outside, or view toggle). This
+    // gives the player time to read the items and pick one.
+    const world = makeWorld();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 5, 5, UndergroundTileState.Open);
+    const vs = makeViewState('underground', 64, 32);
+    const { x, y } = tileToScreen(5, 5, 64, 32);
+    handleUndergroundRightClick(world, vs, x, y);
+    applyPendingContextMenuShow();
+    expect(contextMenuState.visible).toBe(true);
+    // Multiple frames pass with no pointerdown — menu stays visible.
+    applyPendingContextMenuShow(); // no-op on second call
+    expect(contextMenuState.visible).toBe(true);
+    applyPendingContextMenuShow();
+    expect(contextMenuState.visible).toBe(true);
   });
 
   it('does NOT open context menu for an Open tile that is NOT a tunnel end', () => {

@@ -30,6 +30,8 @@ import {
   HUD,
   TILE_SIZE_PX,
 } from '../render/sprites.js';
+import { ANT_ACTIVITY_PANEL } from '../render/ant-activity.js';
+import { antActivityPanelState } from '../render/ant-activity-panel-state.js';
 import {
   type ViewState,
   type CameraState,
@@ -116,12 +118,34 @@ export function resetDragState(dragState: DragState): void {
  * Inclusion rule: x in [rect.x, rect.x + rect.w) and y in [rect.y, rect.y + rect.h).
  */
 export function isPointerOverHUD(px: number, py: number): boolean {
-  const zones = [
+  // Ant-activity popup dismissal consumes the ENTIRE pointerdown dispatch
+  // regardless of where the click landed. When UIScene's pointerdown handler
+  // detects a click outside the panel (including anywhere on the world map),
+  // it calls requestHideAntActivityPanel() which sets pendingHide=true.
+  // A subsequent world-input handler running in the same Phaser dispatch
+  // must observe this click as "HUD-consumed" and drop it — otherwise the
+  // same click that dismissed the popup would also mark food, place a
+  // rally, designate an entrance, or mark underground digging.
+  //
+  // Returning true unconditionally here is correct because pendingHide is
+  // only true for the single tick/frame between request and apply; the
+  // next frame's UIScene.update calls applyPendingAntActivityPanelHide
+  // and clears both `pendingHide` and `visible`.
+  if (antActivityPanelState.pendingHide) {
+    return true;
+  }
+
+  const zones: Array<{ x: number; y: number; w: number; h: number }> = [
     HUD.STATS,
     HUD.TRIANGLE,
     HUD.MINIMAP,
     HUD.VIEW_TOGGLE,
-  ] as const;
+  ];
+  // Visible-but-not-dismissing: only the panel rect itself is masked, so
+  // clicks outside it still reach UIScene for dismissal handling.
+  if (antActivityPanelState.visible) {
+    zones.push(ANT_ACTIVITY_PANEL);
+  }
   for (const zone of zones) {
     if (
       px >= zone.x &&

@@ -58,13 +58,16 @@ function makeViewState(
 
 /**
  * Convert tile coords to screen pixel coords given the surface camera at (camX, camY).
- * screenX = (tileX - (camX - vw/2)) * TILE_SIZE_PX
- * (center of tile: add 0.5 * TILE_SIZE_PX; but surface-input hits the top-left pixel of tile via
- *  Math.floor, so we use the first pixel of the tile.)
+ * Mirrors the renderer's integer-tile snap (`Math.floor(cam.x - vw/2)`) so tests
+ * target the pixel the player would actually see the tile at. Using the raw
+ * fractional camera here caused a 1-tile drift whenever the half-viewport was
+ * fractional (e.g. VIEWPORT_HEIGHT_TILES=37 → vh/2 = 18.5).
  */
 function tileToScreen(tileX: number, tileY: number, camX: number, camY: number): { x: number; y: number } {
-  const px = (tileX - (camX - VIEWPORT_WIDTH_TILES / 2)) * TILE_SIZE_PX;
-  const py = (tileY - (camY - VIEWPORT_HEIGHT_TILES / 2)) * TILE_SIZE_PX;
+  const left = Math.floor(camX - VIEWPORT_WIDTH_TILES / 2);
+  const top = Math.floor(camY - VIEWPORT_HEIGHT_TILES / 2);
+  const px = (tileX - left) * TILE_SIZE_PX;
+  const py = (tileY - top) * TILE_SIZE_PX;
   return { x: px, y: py };
 }
 
@@ -136,17 +139,17 @@ describe('findFoodPileAt', () => {
   it('returns the pile at the exact tile coordinate', () => {
     const world = makeWorld({
       foodPiles: [
-        { foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false },
-        { foodPileId: 2, tileX: 30, tileY: 40, isMarkedPriority: false },
-        { foodPileId: 3, tileX: 50, tileY: 60, isMarkedPriority: true },
+        { foodPileId: 1, tileX: 10, tileY: 20 },
+        { foodPileId: 2, tileX: 30, tileY: 40 },
+        { foodPileId: 3, tileX: 50, tileY: 60 },
       ],
     });
-    expect(findFoodPileAt(world, 30, 40)).toEqual({ foodPileId: 2, tileX: 30, tileY: 40, isMarkedPriority: false });
+    expect(findFoodPileAt(world, 30, 40)).toEqual({ foodPileId: 2, tileX: 30, tileY: 40 });
   });
 
   it('returns null when no pile is at the given tile', () => {
     const world = makeWorld({
-      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 20 }],
     });
     expect(findFoodPileAt(world, 11, 20)).toBeNull();
   });
@@ -159,8 +162,8 @@ describe('findFoodPileAt', () => {
   it('returns first match when multiple piles share coords (edge case)', () => {
     const world = makeWorld({
       foodPiles: [
-        { foodPileId: 1, tileX: 5, tileY: 5, isMarkedPriority: false },
-        { foodPileId: 2, tileX: 5, tileY: 5, isMarkedPriority: true },
+        { foodPileId: 1, tileX: 5, tileY: 5 },
+        { foodPileId: 2, tileX: 5, tileY: 5 },
       ],
     });
     const result = findFoodPileAt(world, 5, 5);
@@ -176,7 +179,7 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
   it('pushes MarkFoodPileCommand for a pile at the clicked tile', () => {
     const world = makeWorld({
       tick: 5,
-      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20 }],
     });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
@@ -192,7 +195,7 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
   });
 
   it('pushes no command when no food pile exists at the clicked tile', () => {
-    const world = makeWorld({ foodPiles: [{ foodPileId: 1, tileX: 5, tileY: 5, isMarkedPriority: false }] });
+    const world = makeWorld({ foodPiles: [{ foodPileId: 1, tileX: 5, tileY: 5 }] });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
     const { x, y } = tileToScreen(6, 5, 64, 64);
@@ -201,7 +204,7 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
   });
 
   it('is a no-op when activeView is underground', () => {
-    const world = makeWorld({ foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false }] });
+    const world = makeWorld({ foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 20 }] });
     const vs = makeViewState('underground', 64, 64);
     const state = makeState();
     const { x, y } = tileToScreen(10, 20, 64, 64);
@@ -210,7 +213,7 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
   });
 
   it('is a no-op when pointer is over HUD TRIANGLE zone', () => {
-    const world = makeWorld({ foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false }] });
+    const world = makeWorld({ foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 20 }] });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
     // HUD.TRIANGLE zone — use a point guaranteed inside it.
@@ -222,7 +225,7 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
 
   it('is a no-op while panInputState.spaceHeld is true (Space+left-drag is pan, not world action)', () => {
     const world = makeWorld({
-      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20 }],
     });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
@@ -234,7 +237,7 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
 
   it('is a no-op while panInputState.isPanning is true (mid-pan left-click is pan continuation)', () => {
     const world = makeWorld({
-      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20 }],
     });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
@@ -255,6 +258,110 @@ describe('handleSurfaceLeftClick — food pile mark', () => {
     // screenX < -624; use screenX=-640
     handleSurfaceLeftClick(world, vs, -640, 0, state);
     expect(world.commandQueue).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleSurfaceLeftClick — ant-activity popup dismissal race
+// ---------------------------------------------------------------------------
+
+describe('handleSurfaceLeftClick — ant-activity popup dismissal must not fall through', () => {
+  // Scenario reproduction:
+  //   1. Player opens the HUD ant-activity popup by clicking `Ants`.
+  //   2. Player clicks on the surface map to dismiss the popup.
+  //   3. UIScene's pointerdown handler runs first, detects the outside click,
+  //      calls requestHideAntActivityPanel() (pendingHide=true), and returns.
+  //   4. surface-input's pointerdown handler runs second in the same Phaser
+  //      dispatch — it consults isPointerOverHUD(screenX, screenY).
+  //   5. With the race fix, pendingHide short-circuits isPointerOverHUD to
+  //      return true regardless of (screenX, screenY), so handleSurfaceLeftClick
+  //      early-returns without pushing a MarkFoodPile / SetRallyPoint command.
+  it('does NOT push MarkFoodPile when pendingHide is set (popup click-away race)', async () => {
+    const { showAntActivityPanel, requestHideAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({
+      tick: 5,
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20 }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+
+    showAntActivityPanel();
+    requestHideAntActivityPanel();
+    try {
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('does NOT push SetRallyPoint on empty-tile fallthrough when pendingHide is set', async () => {
+    const { showAntActivityPanel, requestHideAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({
+      tick: 1,
+      foodPiles: [], // empty tile → would normally trigger SetRallyPoint
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+
+    showAntActivityPanel();
+    requestHideAntActivityPanel();
+    try {
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('does NOT push DesignateEntrance confirmation when pendingHide is set', async () => {
+    const { showAntActivityPanel, requestHideAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({ tick: 3 });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState(15, 30); // pending entrance preview at (15, 30)
+    const { x, y } = tileToScreen(15, 30, 64, 64);
+
+    showAntActivityPanel();
+    requestHideAntActivityPanel();
+    try {
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+      // Preview also preserved — a dismissal click should not eat the
+      // player's pending entrance selection.
+      expect(state.pendingEntranceTileX).toBe(15);
+      expect(state.pendingEntranceTileY).toBe(30);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('processes clicks normally after pendingHide is cleared (state cleanup)', async () => {
+    const { showAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({
+      tick: 5,
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20 }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+
+    // Simulate a full open→dismiss→next-frame cycle.
+    showAntActivityPanel();
+    hideAntActivityPanel(); // simulates applyPendingAntActivityPanelHide at next frame
+    try {
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(1);
+      const cmd = world.commandQueue[0] as { type: string };
+      expect(cmd.type).toBe('MarkFoodPile');
+    } finally {
+      hideAntActivityPanel();
+    }
   });
 });
 
@@ -308,7 +415,7 @@ describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
 
   it('falls through to food-pile check when tileX does not match pending', () => {
     const world = makeWorld({
-      foodPiles: [{ foodPileId: 99, tileX: 20, tileY: 30, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 99, tileX: 20, tileY: 30 }],
     });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState(15, 30); // pending entrance at (15, 30)
@@ -330,7 +437,7 @@ describe('handleSurfaceLeftClick — entrance designation confirmation', () => {
 
 describe('handleSurfaceRightClick', () => {
   it('sets pendingEntranceTileX and pendingEntranceTileY to the clicked tile', () => {
-    const world = makeWorld();
+    const world = makeWorld({ surfaceWidth: 128, surfaceHeight: 128 });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState();
     const { x, y } = tileToScreen(40, 50, 64, 64);
@@ -365,13 +472,60 @@ describe('handleSurfaceRightClick', () => {
   });
 
   it('overwrites an existing pending entrance with the new tile (X and Y)', () => {
-    const world = makeWorld();
+    const world = makeWorld({ surfaceWidth: 128, surfaceHeight: 128 });
     const vs = makeViewState('surface', 64, 64);
     const state = makeState(10, 20); // previous pending at (10, 20)
     const { x, y } = tileToScreen(40, 50, 64, 64);
     handleSurfaceRightClick(world, vs, x, y, state);
     expect(state.pendingEntranceTileX).toBe(40);
     expect(state.pendingEntranceTileY).toBe(50);
+  });
+
+  // Phase 9 playability bug: right-clicking a food pile was previewing an
+  // entrance box even though DesignateEntrance rejects food-pile tiles. The
+  // preview is now suppressed on any tile the sim will reject.
+  it('does NOT set entrance preview on a food pile tile', () => {
+    const world = makeWorld({
+      surfaceWidth: 128,
+      surfaceHeight: 128,
+      foodPiles: [{ foodPileId: 1, tileX: 40, tileY: 50 }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(40, 50, 64, 64);
+    handleSurfaceRightClick(world, vs, x, y, state);
+    expect(state.pendingEntranceTileX).toBeNull();
+    expect(state.pendingEntranceTileY).toBeNull();
+  });
+
+  it('does NOT set entrance preview on a tile already occupied by an entrance', () => {
+    const colony = makeColony({ entrances: [{ surfaceTileX: 40, surfaceTileY: 50 }] });
+    const world = makeWorld({
+      surfaceWidth: 128,
+      surfaceHeight: 128,
+      colonies: { [PLAYER_COLONY_ID]: colony } as unknown as WorldState['colonies'],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(40, 50, 64, 64);
+    handleSurfaceRightClick(world, vs, x, y, state);
+    expect(state.pendingEntranceTileX).toBeNull();
+    expect(state.pendingEntranceTileY).toBeNull();
+  });
+
+  it('previewing an invalid tile does NOT clear an existing valid preview', () => {
+    const world = makeWorld({
+      surfaceWidth: 128,
+      surfaceHeight: 128,
+      foodPiles: [{ foodPileId: 1, tileX: 40, tileY: 50 }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState(10, 20); // prior valid preview
+    const { x, y } = tileToScreen(40, 50, 64, 64);
+    handleSurfaceRightClick(world, vs, x, y, state);
+    // Invalid click is a no-op — prior preview survives for the player's follow-up
+    expect(state.pendingEntranceTileX).toBe(10);
+    expect(state.pendingEntranceTileY).toBe(20);
   });
 });
 
@@ -388,7 +542,7 @@ describe('isEmptySurfaceTile', () => {
   it('returns false when tile has a food pile', () => {
     const world = makeWorld({
       surfaceWidth: 128, surfaceHeight: 4,
-      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 1, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 1 }],
     });
     expect(isEmptySurfaceTile(world, 10, 1)).toBe(false);
   });
@@ -448,7 +602,7 @@ describe('surface-input rally-point fall-through (SURF-04)', () => {
     const world = makeWorld({
       tick: 0,
       surfaceWidth: 128, surfaceHeight: 4,
-      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 1, isMarkedPriority: false }],
+      foodPiles: [{ foodPileId: 1, tileX: 10, tileY: 1 }],
     });
     const vs = makeViewState('surface', 64, 2);
     const state = makeState();

@@ -6,7 +6,13 @@
 //
 // HUD-02 contract — PRD §6c (04-PRD-playable-game-loop.md:908):
 //   - 200×24 rect at (8, 8) with semi-transparent dark background (0x000000, α=0.6)
-//   - Ant count = workerCount + eggCount + larvaeCount + (queen alive ? 1 : 0)
+//   - Ant count = workerCount + (queen alive ? 1 : 0)
+//     Phase 9 fix: eggs + larvae are deliberately excluded. The player's mental
+//     model of "how many ants do I have" is "how many can act right now" — brood
+//     are incapable until they hatch and promote. Folding them in made the
+//     headline number confidently wrong (e.g. "Ants: 20" while only 5 workers
+//     could forage or dig). A separate brood indicator can be added later if
+//     the information is worth restoring.
 //   - Food stored = foodStored >> FP_SHIFT, green-tinted indicator
 //   - Queen health = visual bar derived from queenStarvationTimer / STARVATION_GRACE_TICKS
 //     * green  when pct > 50  (healthy)
@@ -38,7 +44,6 @@ export const HUD_STATS_COLORS = {
   barCritical:     0xcc3322,
   antsTextCss:     '#ffffff',
   foodTextCss:     '#22bb44',
-  queenTextCss:    '#ffffff',
 } as const;
 
 export const HUD_STATS_LAYOUT = {
@@ -54,7 +59,10 @@ export const HUD_STATS_LAYOUT = {
 export function computeHudStats(world: WorldState, colony: ColonyRecord): HudStats {
   const queenAlive  = isAlive(world.ants, colony.queenEntityId);
   const queenBit    = queenAlive ? 1 : 0;
-  const antCount    = colony.workerCount + colony.eggCount + colony.larvaeCount + queenBit;
+  // Phase 9 fix: count capable ants only (workers + living queen). Eggs and
+  // larvae are excluded because they cannot execute any task; folding them in
+  // produced a "total headcount" the player read as "usable headcount".
+  const antCount    = colony.workerCount + queenBit;
   const foodDisplay = colony.foodStored >> FP_SHIFT;
 
   let queenHealthPct = 0;

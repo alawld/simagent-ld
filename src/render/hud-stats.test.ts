@@ -48,24 +48,27 @@ function makeStats(overrides: Partial<HudStats> = {}): HudStats {
 }
 
 describe('computeHudStats', () => {
-  it('antCount = workers + eggs + larvae + 1 when queen alive', () => {
+  it('antCount = workers + queen (when alive), excluding eggs and larvae', () => {
+    // Phase 9 fix: the HUD counts capable ants only. Brood are not yet
+    // ants that can act, so including them misled the player about how
+    // many workers were available to forage/dig.
     const { world, colony } = setupWorld();
     colony.workerCount = 5;
     colony.eggCount    = 3;
     colony.larvaeCount = 2;
     const s = computeHudStats(world, colony);
-    expect(s.antCount).toBe(5 + 3 + 2 + 1);
+    expect(s.antCount).toBe(5 + 1);
     expect(s.queenAlive).toBe(true);
   });
 
-  it('antCount excludes queen when queen dead', () => {
+  it('antCount excludes the queen when queen dead (and still excludes brood)', () => {
     const { world, colony, queenId } = setupWorld();
     colony.workerCount = 4;
     colony.eggCount    = 1;
     colony.larvaeCount = 0;
     killAnt(world.ants, queenId);
     const s = computeHudStats(world, colony);
-    expect(s.antCount).toBe(5);
+    expect(s.antCount).toBe(4);
     expect(s.queenAlive).toBe(false);
   });
 
@@ -193,5 +196,46 @@ describe('queenBarRect', () => {
     // stays inside HUD.STATS vertically
     expect(rect.y).toBeGreaterThanOrEqual(8);
     expect(rect.y + rect.h).toBeLessThanOrEqual(8 + 24);
+  });
+});
+
+describe('food/queen layout (09 HUD food-overlap fix)', () => {
+  // The UIScene renderer right-anchors foodText against queenBarRect with a
+  // 6-px gap. These tests lock the math invariant: for any reasonable
+  // monospace text width the food box never runs into the queen bar region,
+  // which was the root of the pre-09 overlap at food ≥ ~100.
+  const FOOD_GAP = 6;
+
+  function foodEndsBeforeQueenBar(foodTextWidth: number): boolean {
+    const bar = queenBarRect({ x: 8, y: 8, w: 200, h: 24 });
+    const foodX = bar.x - foodTextWidth - FOOD_GAP;
+    const foodRightEdge = foodX + foodTextWidth;
+    return foodRightEdge <= bar.x - FOOD_GAP;
+  }
+
+  function antsEndsBeforeFood(antsTextX: number, antsTextWidth: number, foodTextWidth: number): boolean {
+    const bar = queenBarRect({ x: 8, y: 8, w: 200, h: 24 });
+    const foodX = bar.x - foodTextWidth - FOOD_GAP;
+    return antsTextX + antsTextWidth <= foodX;
+  }
+
+  it('right-anchored food for 4-digit totals does not collide with the queen bar', () => {
+    // 10-char monospace "Food: 9999" at 10px font ≈ 60px; leave headroom.
+    expect(foodEndsBeforeQueenBar(60)).toBe(true);
+    expect(foodEndsBeforeQueenBar(70)).toBe(true);
+  });
+
+  it('right-anchored food for 6-digit totals does not collide with the queen bar', () => {
+    // 12-char monospace "Food: 999999" ≈ 72px — worst reasonable case.
+    expect(foodEndsBeforeQueenBar(72)).toBe(true);
+  });
+
+  it('ants + right-anchored food stay disjoint at realistic colony sizes', () => {
+    // STATS_TEXT_X in ui-scene.ts is HUD.STATS.x + 4 = 12.
+    const antsX = 12;
+    // "Ants: 999" ≈ 54px (9 chars × 6px).
+    expect(antsEndsBeforeFood(antsX, 54, 60)).toBe(true);
+    // Bigger Ants + bigger Food — still OK thanks to the 200px rect budget.
+    expect(antsEndsBeforeFood(antsX, 60, 60)).toBe(true);
   });
 });

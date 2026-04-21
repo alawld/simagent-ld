@@ -187,6 +187,81 @@ describe('isPointerOverHUD', () => {
       expect(isPointerOverHUD(400, 300)).toBe(false);
     });
   });
+
+  describe('ant-activity popup — dynamic mask', () => {
+    // The panel rect only contributes to the HUD mask while antActivityPanelState
+    // reports visible (including the deferred-hide pending state). This prevents
+    // the dismissal click from falling through to world-input handlers in the
+    // same Phaser dispatch — see ant-activity-panel-state.ts.
+    //
+    // Imports are scoped to this block to keep the existing test cases using
+    // only the original import set.
+    it('does NOT mask the panel rect when panel is hidden', async () => {
+      const { antActivityPanelState, hideAntActivityPanel } =
+        await import('../render/ant-activity-panel-state.js');
+      const { ANT_ACTIVITY_PANEL } = await import('../render/ant-activity.js');
+      hideAntActivityPanel();
+      expect(antActivityPanelState.visible).toBe(false);
+      // Panel rect is safely outside every other HUD zone, so this is a
+      // clean conditional-mask test.
+      expect(isPointerOverHUD(
+        ANT_ACTIVITY_PANEL.x + 5,
+        ANT_ACTIVITY_PANEL.y + 5,
+      )).toBe(false);
+    });
+
+    it('masks the panel rect when panel is visible', async () => {
+      const { showAntActivityPanel, hideAntActivityPanel } =
+        await import('../render/ant-activity-panel-state.js');
+      const { ANT_ACTIVITY_PANEL } = await import('../render/ant-activity.js');
+      showAntActivityPanel();
+      try {
+        expect(isPointerOverHUD(
+          ANT_ACTIVITY_PANEL.x + 5,
+          ANT_ACTIVITY_PANEL.y + 5,
+        )).toBe(true);
+      } finally {
+        hideAntActivityPanel();
+      }
+    });
+
+    it('masks every screen position while pendingHide is set (deferred-hide race guard)', async () => {
+      // Regression test for the dismissal race. When UIScene's pointerdown
+      // handler sees a click outside the panel, it calls
+      // requestHideAntActivityPanel() and returns. A subsequent world-input
+      // handler running later in the SAME Phaser dispatch consults
+      // isPointerOverHUD with the raw screen coords; those coords may be
+      // anywhere on the map. isPointerOverHUD must return true for the
+      // entire canvas during pendingHide so the world handler drops the
+      // click (otherwise it would also mark food / place rally / designate
+      // entrance / mark underground dig).
+      const {
+        showAntActivityPanel,
+        requestHideAntActivityPanel,
+        hideAntActivityPanel,
+        antActivityPanelState,
+      } = await import('../render/ant-activity-panel-state.js');
+      const { ANT_ACTIVITY_PANEL } = await import('../render/ant-activity.js');
+      showAntActivityPanel();
+      requestHideAntActivityPanel();
+      try {
+        expect(antActivityPanelState.visible).toBe(true);
+        expect(antActivityPanelState.pendingHide).toBe(true);
+        // Panel rect itself — masked.
+        expect(isPointerOverHUD(
+          ANT_ACTIVITY_PANEL.x + 5,
+          ANT_ACTIVITY_PANEL.y + 5,
+        )).toBe(true);
+        // Deep middle of the world map — must ALSO be masked during
+        // pendingHide so the dismissal click is fully consumed.
+        expect(isPointerOverHUD(400, 300)).toBe(true);
+        // A point near a map edge — also masked.
+        expect(isPointerOverHUD(50, 300)).toBe(true);
+      } finally {
+        hideAntActivityPanel();
+      }
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
