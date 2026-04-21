@@ -10,10 +10,12 @@
 
 import { describe, it, expect } from 'vitest';
 import { createScenario } from './scenario.js';
+import { tick } from './tick.js';
 import { isAlive } from './ant/ant-store.js';
 import { AntTask, PheromoneType } from './enums.js';
 import { pheromoneGridKey } from './pheromone/pheromone-store.js';
 import { FP_SHIFT } from './fixed.js';
+import { UndergroundTileState, ugGet } from './terrain.js';
 import {
   PLAYER_COLONY_ID,
   ENEMY_COLONY_ID,
@@ -30,6 +32,7 @@ import {
   SURFACE_GRID_HEIGHT,
   UNDERGROUND_GRID_WIDTH,
   UNDERGROUND_GRID_HEIGHT,
+  ENTRANCE_SHAFT_DEPTH,
 } from './constants.js';
 
 describe('createScenario', () => {
@@ -164,10 +167,11 @@ describe('createScenario', () => {
       }
     });
 
-    it('all food piles have isMarkedPriority === false', () => {
+    it('fresh scenario has no priorityFoodPileId set on any colony', () => {
       const world = createScenario(42);
-      for (const pile of world.foodPiles) {
-        expect(pile.isMarkedPriority).toBe(false);
+      for (const key in world.colonies) {
+        const colony = world.colonies[key as unknown as number]!;
+        expect(colony.priorityFoodPileId).toBeNull();
       }
     });
   });
@@ -217,7 +221,8 @@ describe('createScenario', () => {
       expect(Object.prototype.hasOwnProperty.call(pile, 'foodPileId')).toBe(true);
       expect(Object.prototype.hasOwnProperty.call(pile, 'tileX')).toBe(true);
       expect(Object.prototype.hasOwnProperty.call(pile, 'tileY')).toBe(true);
-      expect(Object.prototype.hasOwnProperty.call(pile, 'isMarkedPriority')).toBe(true);
+      // Phase 9: priority lives on ColonyRecord, not on the pile itself.
+      expect(Object.prototype.hasOwnProperty.call(pile, 'isMarkedPriority')).toBe(false);
       expect(Object.prototype.hasOwnProperty.call(pile, 'quantity')).toBe(false);
     });
   });
@@ -241,24 +246,31 @@ describe('createScenario', () => {
       );
     });
 
-    it('player underground grid starts all-Solid (all zeros)', () => {
+    // Phase 9 playability: each colony's starting shaft tiles (2 tiles at the
+    // entrance column) are pre-excavated Open so ants can transit underground
+    // on tick 0. Every other tile remains Solid.
+    it('player underground grid is all-Solid except the starting shaft', () => {
       const world = createScenario(42);
-      const data = world.undergroundGrids[PLAYER_COLONY_ID]!.data;
-      let allSolid = true;
-      for (let i = 0; i < data.length; i++) {
-        if (data[i] !== 0) { allSolid = false; break; }
+      const ug = world.undergroundGrids[PLAYER_COLONY_ID]!;
+      for (let y = 0; y < UNDERGROUND_GRID_HEIGHT; y++) {
+        for (let x = 0; x < UNDERGROUND_GRID_WIDTH; x++) {
+          const isShaft = x === PLAYER_START_X && y < ENTRANCE_SHAFT_DEPTH;
+          const expected = isShaft ? UndergroundTileState.Open : UndergroundTileState.Solid;
+          expect(ugGet(ug, x, y)).toBe(expected);
+        }
       }
-      expect(allSolid).toBe(true);
     });
 
-    it('enemy underground grid starts all-Solid (all zeros)', () => {
+    it('enemy underground grid is all-Solid except the starting shaft', () => {
       const world = createScenario(42);
-      const data = world.undergroundGrids[ENEMY_COLONY_ID]!.data;
-      let allSolid = true;
-      for (let i = 0; i < data.length; i++) {
-        if (data[i] !== 0) { allSolid = false; break; }
+      const ug = world.undergroundGrids[ENEMY_COLONY_ID]!;
+      for (let y = 0; y < UNDERGROUND_GRID_HEIGHT; y++) {
+        for (let x = 0; x < UNDERGROUND_GRID_WIDTH; x++) {
+          const isShaft = x === ENEMY_START_X && y < ENTRANCE_SHAFT_DEPTH;
+          const expected = isShaft ? UndergroundTileState.Open : UndergroundTileState.Solid;
+          expect(ugGet(ug, x, y)).toBe(expected);
+        }
       }
-      expect(allSolid).toBe(true);
     });
 
     it('mutating player underground tile does not affect enemy underground tile', () => {
@@ -273,14 +285,41 @@ describe('createScenario', () => {
   // -------------------------------------------------------------------------
 
   describe('Phase 3 colony extensions', () => {
-    it('player colony entrances is an empty array', () => {
+    // Phase 9 playability: each colony starts with one pre-excavated open
+    // entrance at its start column so the forage loop closes on tick 0
+    // (aligns with Phase 8 Stabilization Memo item #4).
+    it('player colony has one starting open entrance at its start column', () => {
       const world = createScenario(42);
-      expect(world.colonies[PLAYER_COLONY_ID]!.entrances).toEqual([]);
+      const entrances = world.colonies[PLAYER_COLONY_ID]!.entrances;
+      expect(entrances.length).toBe(1);
+      expect(entrances[0]!.surfaceTileX).toBe(PLAYER_START_X);
+      expect(entrances[0]!.surfaceTileY).toBe(PLAYER_START_Y);
+      expect(entrances[0]!.isOpen).toBe(true);
     });
 
-    it('enemy colony entrances is an empty array', () => {
+    it('enemy colony has one starting open entrance at its start column', () => {
       const world = createScenario(42);
-      expect(world.colonies[ENEMY_COLONY_ID]!.entrances).toEqual([]);
+      const entrances = world.colonies[ENEMY_COLONY_ID]!.entrances;
+      expect(entrances.length).toBe(1);
+      expect(entrances[0]!.surfaceTileX).toBe(ENEMY_START_X);
+      expect(entrances[0]!.surfaceTileY).toBe(ENEMY_START_Y);
+      expect(entrances[0]!.isOpen).toBe(true);
+    });
+
+    it('player colony starting-shaft tiles are Open in underground grid', () => {
+      const world = createScenario(42);
+      const ug = world.undergroundGrids[PLAYER_COLONY_ID]!;
+      for (let sy = 0; sy < ENTRANCE_SHAFT_DEPTH; sy++) {
+        expect(ugGet(ug, PLAYER_START_X, sy)).toBe(UndergroundTileState.Open);
+      }
+    });
+
+    it('enemy colony starting-shaft tiles are Open in underground grid', () => {
+      const world = createScenario(42);
+      const ug = world.undergroundGrids[ENEMY_COLONY_ID]!;
+      for (let sy = 0; sy < ENTRANCE_SHAFT_DEPTH; sy++) {
+        expect(ugGet(ug, ENEMY_START_X, sy)).toBe(UndergroundTileState.Open);
+      }
     });
 
     it('player colony digFlowFieldDirty === false', () => {
@@ -307,9 +346,10 @@ describe('createScenario', () => {
       const world = createScenario(42);
       const player = world.colonies[PLAYER_COLONY_ID]!;
       const enemy  = world.colonies[ENEMY_COLONY_ID]!;
-      // Push into player entrances; enemy must remain empty
+      const enemyStart = enemy.entrances.length;
+      // Push into player entrances; enemy's array length must not change.
       player.entrances.push({ entranceId: 99, surfaceTileX: 0, surfaceTileY: 0, isOpen: false });
-      expect(enemy.entrances.length).toBe(0);
+      expect(enemy.entrances.length).toBe(enemyStart);
     });
   });
 
@@ -373,6 +413,156 @@ describe('createScenario', () => {
           expect(grid.width).toBe(UNDERGROUND_GRID_WIDTH);
           expect(grid.height).toBe(UNDERGROUND_GRID_HEIGHT);
         }
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 09 foraging-autonomy memo: both colonies bootstrap food gathering
+  // without any player input. Prior to the outward-wander fallback,
+  // SearchingFood foragers stood still on an empty pheromone grid, the
+  // starting food pool drained in ~640 ticks, and queens starved before
+  // any autonomous discovery could happen.
+  // -------------------------------------------------------------------------
+
+  describe('autonomous forage bootstrap (09 foraging-autonomy memo)', () => {
+    it('both queens survive ≥2000 ticks with no commands issued', () => {
+      // Starting foodStored = 1280. Queen consumes 2/tick. Without food
+      // influx the colony pool hits 0 at tick ~640, starvation grace is
+      // 300 ticks → queen would die at ~940. Surviving past 2000 ticks
+      // is only possible if foragers autonomously bring food back.
+      const world = createScenario(42);
+      for (let t = 0; t < 2000; t++) {
+        tick(world, []);
+      }
+      const player = world.colonies[PLAYER_COLONY_ID]!;
+      const enemy  = world.colonies[ENEMY_COLONY_ID]!;
+      expect(world.ants.alive[player.queenEntityId]).toBe(1);
+      expect(world.ants.alive[enemy.queenEntityId]).toBe(1);
+      expect(player.defeated).toBe(false);
+      expect(enemy.defeated).toBe(false);
+    });
+
+    it('pheromone food-trail grids were laid at some point during 1500 ticks — foragers discovered piles', () => {
+      // The carry-only deposit rule (PHER-03) means the surface food-trail
+      // grid can only accumulate strength if at least one forager picked
+      // food up and started carrying it. Rather than sample a specific tick
+      // (trails decay to 0 between round trips), we track the peak trail
+      // total observed over the run — any non-zero peak proves the bootstrap
+      // loop closed at least once for each colony.
+      const world = createScenario(42);
+      const peak: Record<number, number> = {
+        [PLAYER_COLONY_ID]: 0,
+        [ENEMY_COLONY_ID]: 0,
+      };
+      for (let t = 0; t < 1500; t++) {
+        tick(world, []);
+        for (const cid of [PLAYER_COLONY_ID, ENEMY_COLONY_ID]) {
+          const grid = world.pheromoneGrids[pheromoneGridKey(cid, PheromoneType.FoodTrail, 'surface')]!;
+          let totalStrength = 0;
+          for (let i = 0; i < grid.data.length; i++) totalStrength += grid.data[i]!;
+          if (totalStrength > peak[cid]!) peak[cid] = totalStrength;
+        }
+      }
+      expect(peak[PLAYER_COLONY_ID]).toBeGreaterThan(0);
+      expect(peak[ENEMY_COLONY_ID]).toBeGreaterThan(0);
+    });
+
+    it('route reuse (09 pheromone-reacquisition memo): searchers stay near the trail once it exists', () => {
+      // Run the full scenario until trail+forager population coexist, then
+      // sample over a window of ticks. The memo's contract is that
+      // sampleForagingDirection's widened reacquisition + explore suppression
+      // should keep SearchingFood foragers near the trail geometry instead
+      // of scattering uniformly across the map.
+      //
+      // Measure: over a 300-tick window after bootstrap, count the number of
+      // (tick, searcher) samples where the searcher is within REACQUIRE_RADIUS
+      // (3 Manhattan) of any active trail cell. If route reuse is working at
+      // all, this fraction must be substantially higher than the uniform
+      // baseline.
+      const world = createScenario(42);
+      const REACQUIRE_RADIUS = 3;
+      const trailKey = pheromoneGridKey(
+        PLAYER_COLONY_ID, PheromoneType.FoodTrail, 'surface',
+      );
+
+      // Phase A — tick forward until pheromone exists and stays alive for 10
+      // consecutive ticks (confirms the forage loop is actively maintained,
+      // not a one-shot deposit that immediately decays).
+      let aliveStreak = 0;
+      let bootstrapTick = -1;
+      for (let t = 0; t < 2000 && bootstrapTick === -1; t++) {
+        tick(world, []);
+        const grid = world.pheromoneGrids[trailKey]!;
+        let total = 0;
+        for (let i = 0; i < grid.data.length; i++) total += grid.data[i]!;
+        aliveStreak = total > 0 ? aliveStreak + 1 : 0;
+        if (aliveStreak >= 10) bootstrapTick = t + 1;
+      }
+      expect(bootstrapTick).toBeGreaterThan(0);
+
+      // Phase B — measure searcher-near-trail frequency over the next 300 ticks.
+      let searcherTicks = 0;
+      let nearTrailTicks = 0;
+      for (let w = 0; w < 300; w++) {
+        tick(world, []);
+        const player = world.colonies[PLAYER_COLONY_ID]!;
+        const grid = world.pheromoneGrids[trailKey]!;
+        // Skip ticks where no trail exists (between round trips).
+        let totalStrength = 0;
+        for (let i = 0; i < grid.data.length; i++) totalStrength += grid.data[i]!;
+        if (totalStrength === 0) continue;
+        for (const wid of player.workers) {
+          if (world.ants.alive[wid] !== 1) continue;
+          if (world.ants.foodCarrying[wid]! > 0) continue; // only searchers
+          searcherTicks++;
+          const ax = world.ants.posX[wid]! >> 8;
+          const ay = world.ants.posY[wid]! >> 8;
+          let nearby = false;
+          for (let dy = -REACQUIRE_RADIUS; dy <= REACQUIRE_RADIUS && !nearby; dy++) {
+            const absY = dy < 0 ? -dy : dy;
+            const xRange = REACQUIRE_RADIUS - absY;
+            for (let dx = -xRange; dx <= xRange && !nearby; dx++) {
+              const tx = ax + dx;
+              const ty = ay + dy;
+              if (tx < 0 || ty < 0 || tx >= grid.width || ty >= grid.height) continue;
+              if (grid.data[ty * grid.width + tx]! > 0) nearby = true;
+            }
+          }
+          if (nearby) nearTrailTicks++;
+        }
+      }
+      expect(searcherTicks).toBeGreaterThan(0);
+      // Route reuse means searchers cluster near the trail significantly more
+      // often than a uniform-over-map baseline (few percent of tiles have
+      // trail at any moment). Assert a substantial share.
+      // Threshold: nearTrailTicks > 25% of searcherTicks, written as integer
+      // comparison (nearTrailTicks * 4 > searcherTicks) to satisfy the
+      // sim/ no-float-literal rule.
+      expect(nearTrailTicks * 4).toBeGreaterThan(searcherTicks);
+    });
+
+    it('both colonies collect food — queens or chambers hold food after 1500 ticks', () => {
+      // After 1500 ticks, each colony should have either:
+      //   (a) non-zero colony.foodStored (a round trip already completed), or
+      //   (b) at least one worker carrying food (delivery in progress).
+      // Either proves the forage loop is closing autonomously.
+      const world = createScenario(42);
+      for (let t = 0; t < 1500; t++) {
+        tick(world, []);
+      }
+      for (const cid of [PLAYER_COLONY_ID, ENEMY_COLONY_ID]) {
+        const colony = world.colonies[cid]!;
+        let workersCarrying = 0;
+        for (let i = 0; i < colony.workers.length; i++) {
+          const wid = colony.workers[i]!;
+          if (world.ants.alive[wid] === 1 && world.ants.foodCarrying[wid]! > 0) {
+            workersCarrying += 1;
+          }
+        }
+        const chamberFood = colony.chambers.reduce((s, c) => s + c.foodStored, 0);
+        const evidence = colony.foodStored > 0 || chamberFood > 0 || workersCarrying > 0;
+        expect(evidence).toBe(true);
       }
     });
   });

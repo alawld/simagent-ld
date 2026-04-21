@@ -11,6 +11,7 @@
 
 import type { EntityId } from '../types.js';
 import type { ChamberType } from '../enums.js';
+import type { FoodPileId } from '../food.js';
 import type { NestEntrance } from './entrance.js';
 import {
   DEFAULT_BEHAVIOR_RATIO,
@@ -131,6 +132,15 @@ export interface ColonyRecord {
    *  Incremented inside combat.killAnt (Plan 02) when ants from this colony win a combat round.
    *  Initialized to 0 in createColonyRecord. Round-trips through copyWorldState + save. */
   killCount: number;
+
+  /** Phase 9 / PRD §3d — exclusive per-colony priority food target.
+   *  Single FoodPileId the player has selected as "send my foragers here first", or null
+   *  when no pile is prioritized. Replaces the previous shared FoodPile.isMarkedPriority
+   *  flag so (a) enemy colonies no longer read the player's mark and (b) selecting a new
+   *  pile is an exclusive redirect, not an additive toggle of the shared flag.
+   *  Read by routeForagerPriority; mutated by the MarkFoodPile command handler.
+   *  Initialized to null in createColonyRecord. Round-trips through copyWorldState + save. */
+  priorityFoodPileId: FoodPileId | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +195,7 @@ export function createColonyRecord(colonyId: ColonyId, queenEntityId: EntityId):
     defeated:              false,
     reconcileCountdown:    RECONCILE_INTERVAL_TICKS,
     killCount:             0,
+    priorityFoodPileId:    null,
   }) as unknown as ColonyRecord;
 }
 

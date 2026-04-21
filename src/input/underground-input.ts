@@ -25,7 +25,7 @@ import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import type { MarkDigTileCommand, CancelDigMarkCommand } from '../sim/commands.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import { isPointerOverHUD, panInputState } from './camera-input.js';
-import { contextMenuState } from '../render/context-menu-state.js';
+import { contextMenuState, requestShowContextMenu } from '../render/context-menu-state.js';
 
 // ---------------------------------------------------------------------------
 // UndergroundInputState — mutable per-registration state
@@ -236,12 +236,15 @@ export function handleUndergroundRightClick(
   }
 
   if (tileState === UndergroundTileState.Open && isTunnelEnd(world, tileX, tileY, PLAYER_COLONY_ID)) {
-    // Open tunnel end → show context menu (UNDR-04).
-    contextMenuState.visible = true;
-    contextMenuState.screenX = screenX;
-    contextMenuState.screenY = screenY;
-    contextMenuState.anchorTileX = tileX;
-    contextMenuState.anchorTileY = tileY;
+    // Open tunnel end → request context menu for next frame (UNDR-04).
+    // Deferred show: UIScene's pointerdown handler runs in the same dispatch as
+    // this one and would otherwise see visible=true and mis-interpret this same
+    // right-click as a menu-item selection (the menu is anchored at the click).
+    // requestShowContextMenu stores the anchor but defers the visible flip to
+    // the next UIScene.update frame. See context-menu-state.ts for the full
+    // rationale — the SHOW race is symmetric with the HIDE race that module
+    // already defends against.
+    requestShowContextMenu(screenX, screenY, tileX, tileY);
   }
   // Solid / BeingDug / non-tunnel-end Open → no-op (including no context menu).
 }

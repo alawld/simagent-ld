@@ -164,3 +164,144 @@ export function sampleGradient(
 
   return { dx: bestDx, dy: bestDy };
 }
+
+// ---------------------------------------------------------------------------
+// sampleForagingDirection — 09 pheromone-reacquisition memo
+// ---------------------------------------------------------------------------
+//
+// A pheromone-first refinement of sampleGradient for SearchingFood foragers.
+// Three behavior layers:
+//
+//   1. Strong local trail (max 4-neighbor ≥ TRAIL_STRONG_THRESHOLD):
+//      always exploit, never consume the 10% random-explore roll. Once a
+//      route is established and reinforced, foragers commit to it rather than
+//      discarding it on coin flips. As the trail fades (decay is 2%/tick,
+//      single deposit 512 → threshold 128 in ~70 ticks), the branch drops
+//      out and exploration resumes naturally — no permanent route lock.
+//
+//   2. Weak local trail (0 < max 4-neighbor < TRAIL_STRONG_THRESHOLD):
+//      current behavior — 10% random explore / 90% exploit. Preserves the
+//      search-and-verify behavior for marginal or decaying trails.
+//
+//   3. No immediate trail (max 4-neighbor === 0):
+//      widen the scan to REACQUIRE_RADIUS Manhattan tiles. If any cell in
+//      that diamond has pheromone, step toward the strongest one (ties →
+//      closer tile → fixed scan order). This is the reacquisition lever —
+//      a forager that drifts 2–3 tiles off a trail no longer has to wander
+//      randomly until it happens to stumble back onto it.
+//
+// RNG consumption:
+//   - Layer 1: 0 calls.
+//   - Layer 2: 1 call (nextInt(100)); explore branch adds 1 more (nextInt(4)).
+//   - Layer 3: 0 calls.
+//   - Empty fallback: 0 calls.
+// Variable consumption is deterministic given (grid, tileX, tileY) — no
+// external state. The ant-system call site preserves its own RNG stream.
+//
+// Future compatibility (memo §"Future Compatibility"): the thresholds read
+// live pheromone values; once food is exhausted and trails decay under
+// PHEROMONE_FLOOR snap, cells clear to 0 and layer 3 shrinks to empty →
+// layer 4 (wander) takes over. No permanent memory, no lock.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pheromone strength at which a single 4-neighbor cell counts as a "strong"
+ * trail worth following without random-explore interference. FOOD_TRAIL_DEPOSIT
+ * is 512 and decay is ~2%/tick; 128 (FP_ONE/2) corresponds to a trail cell
+ * that's been decaying for ~70 ticks since its last deposit. Below this, the
+ * trail is fading and exploration resumes its 10% share.
+ */
+const TRAIL_STRONG_THRESHOLD = 128;
+
+/**
+ * Manhattan radius scanned for trail reacquisition when no immediate-neighbor
+ * trail exists. Chosen small enough to keep the scan cheap (24 cells at r=3)
+ * and to stay "local" per the memo's "local information driving decisions"
+ * principle. Larger radii would start to feel like memory.
+ */
+const REACQUIRE_RADIUS = 3;
+
+/**
+ * Return the direction a SearchingFood forager should move based on the
+ * pheromone gradient at (tileX, tileY), with stronger trail commitment and
+ * wider reacquisition than sampleGradient.
+ *
+ * Returns {0, 0} when no pheromone is within REACQUIRE_RADIUS — callers fall
+ * through to the wander-fallback branch.
+ *
+ * @param grid   Pheromone grid to read neighbor strengths from.
+ * @param tileX  Tile X of the forager (integer).
+ * @param tileY  Tile Y of the forager (integer).
+ * @param rng    Deterministic world Rng.
+ */
+export function sampleForagingDirection(
+  grid: PheromoneGrid,
+  tileX: number,
+  tileY: number,
+  rng: Rng,
+): { dx: number; dy: number } {
+  // Layer 1 / 2: immediate-neighbor scan (DIRS order: up, down, left, right).
+  let bestStrength = 0;
+  let bestDx = 0;
+  let bestDy = 0;
+  for (let d = 0; d < 4; d++) {
+    const dir = DIRS[d]!;
+    const s = phGet(grid, tileX + dir.dx, tileY + dir.dy);
+    if (s > bestStrength) {
+      bestStrength = s;
+      bestDx = dir.dx;
+      bestDy = dir.dy;
+    }
+  }
+
+  // Layer 1 — strong trail: exploit, no random roll.
+  if (bestStrength >= TRAIL_STRONG_THRESHOLD) {
+    return { dx: bestDx, dy: bestDy };
+  }
+
+  // Layer 2 — weak trail: sampleGradient's original 10% explore / 90% exploit.
+  if (bestStrength > 0) {
+    if (rng.nextInt(100) < EXPLORE_RATE_PERCENT) {
+      const idx = rng.nextInt(4);
+      const dir = DIRS[idx]!;
+      return { dx: dir.dx, dy: dir.dy };
+    }
+    return { dx: bestDx, dy: bestDy };
+  }
+
+  // Layer 3 — no immediate trail: widen scan to REACQUIRE_RADIUS Manhattan.
+  // Scan order: top-to-bottom, left-to-right for deterministic tie-break.
+  let reStrength = 0;
+  let reDist = REACQUIRE_RADIUS + 1;
+  let reDx = 0;
+  let reDy = 0;
+  for (let dy = -REACQUIRE_RADIUS; dy <= REACQUIRE_RADIUS; dy++) {
+    const absY = dy < 0 ? -dy : dy;
+    const xRange = REACQUIRE_RADIUS - absY;
+    for (let dx = -xRange; dx <= xRange; dx++) {
+      const absX = dx < 0 ? -dx : dx;
+      const dist = absX + absY;
+      if (dist <= 1) continue; // immediate neighbors already handled.
+      const s = phGet(grid, tileX + dx, tileY + dy);
+      if (s === 0) continue;
+      if (s > reStrength || (s === reStrength && dist < reDist)) {
+        reStrength = s;
+        reDist = dist;
+        reDx = dx;
+        reDy = dy;
+      }
+    }
+  }
+
+  if (reStrength > 0) {
+    const absX = reDx < 0 ? -reDx : reDx;
+    const absY = reDy < 0 ? -reDy : reDy;
+    if (absX >= absY) {
+      return { dx: reDx > 0 ? 1 : -1, dy: 0 };
+    }
+    return { dx: 0, dy: reDy > 0 ? 1 : -1 };
+  }
+
+  // No trail within REACQUIRE_RADIUS — caller falls through to wander.
+  return { dx: 0, dy: 0 };
+}

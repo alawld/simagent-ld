@@ -12,7 +12,7 @@
 
 import { sgGet, SurfaceTileState } from '../sim/terrain.js';
 import { isAlive } from '../sim/ant/ant-store.js';
-import { FP_SHIFT } from '../sim/fixed.js';
+import { FP_ONE } from '../sim/fixed.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { WorldState } from '../sim/types.js';
 import {
@@ -25,6 +25,7 @@ import {
   COLOR_PLAYER_COLONY,
   COLOR_ENEMY_COLONY,
   COLOR_QUEEN_OUTLINE,
+  COLOR_RALLY_POINT,
 } from './sprites.js';
 import type { CameraState } from './camera.js';
 
@@ -123,12 +124,20 @@ export function drawSurfaceEntities(
   // --- Food piles ---
   // Phase 8.5 readability: add a 1-px dark outline to separate the green pile
   // circle from the green grass tile underneath.
+  //
+  // Per Phase 9 food-mark fix: the "marked" flag was moved off the shared
+  // FoodPile entity (which is not per-colony) onto ColonyRecord. The HUD
+  // renders the PLAYER colony's perspective only — enemy priority targets
+  // stay invisible so the player can't read the enemy AI's intent.
+  const playerColony = curr.colonies[PLAYER_COLONY_ID];
+  const playerPriorityPileId = playerColony ? playerColony.priorityFoodPileId : null;
   for (const pile of curr.foodPiles) {
     const sx = (pile.tileX - left) * TILE_SIZE_PX;
     const sy = (pile.tileY - top)  * TILE_SIZE_PX;
     // Trivial viewport cull
     if (sx < -TILE_SIZE_PX || sx > canvasW || sy < -TILE_SIZE_PX || sy > canvasH) continue;
-    const color = pile.isMarkedPriority ? COLOR_FOOD_PILE_MARKED : COLOR_FOOD_PILE_NORMAL;
+    const isPlayerMarked = playerPriorityPileId !== null && pile.foodPileId === playerPriorityPileId;
+    const color = isPlayerMarked ? COLOR_FOOD_PILE_MARKED : COLOR_FOOD_PILE_NORMAL;
     const cx = sx + TILE_SIZE_PX / 2;
     const cy = sy + TILE_SIZE_PX / 2;
     const r  = TILE_SIZE_PX / 2 - 2;
@@ -161,11 +170,14 @@ export function drawSurfaceEntities(
     if (!isAlive(curr.ants, id)) continue;
     if (curr.ants.zone[id] !== 0) continue; // surface only
 
-    // Interpolate position: fixed-point → pixel
-    const prevPxX = (prev.ants.posX[id]! >> FP_SHIFT) * TILE_SIZE_PX;
-    const currPxX = (curr.ants.posX[id]! >> FP_SHIFT) * TILE_SIZE_PX;
-    const prevPxY = (prev.ants.posY[id]! >> FP_SHIFT) * TILE_SIZE_PX;
-    const currPxY = (curr.ants.posY[id]! >> FP_SHIFT) * TILE_SIZE_PX;
+    // Interpolate position: fixed-point → pixel. Multiply BEFORE dividing so
+    // sub-tile precision survives — truncating with `>> FP_SHIFT` first would
+    // snap the ant to its tile's upper-left corner and it would appear
+    // pinned to tile origins instead of moving smoothly within a tile.
+    const prevPxX = (prev.ants.posX[id]! * TILE_SIZE_PX) / FP_ONE;
+    const currPxX = (curr.ants.posX[id]! * TILE_SIZE_PX) / FP_ONE;
+    const prevPxY = (prev.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
+    const currPxY = (curr.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
 
     const screenX = prevPxX + (currPxX - prevPxX) * alpha - left * TILE_SIZE_PX;
     const screenY = prevPxY + (currPxY - prevPxY) * alpha - top  * TILE_SIZE_PX;
@@ -189,6 +201,31 @@ export function drawSurfaceEntities(
     } else {
       gfx.fillStyle(color, 1);
       gfx.fillRect(screenX - 3, screenY - 3, 6, 6);
+    }
+  }
+
+  // --- Rally-point marker (Phase 9 usability fix) ---
+  // Player-colony only: a crosshair on the rally tile so the fight-control loop
+  // is visible and discoverable. Distinct from every other surface symbol:
+  //   - food piles         → filled green circle w/ dark outline
+  //   - marked food pile   → filled gold circle
+  //   - entrance           → dark hole w/ dirt rim (filled rects)
+  //   - queen              → gold strokeCircle around a filled body
+  //   - pending entrance   → gold 2-px tile frame
+  //   - rally point        → white crosshair: + bars across the tile, center dot
+  // Enemy colonies' rally points are never drawn (leaks AI intent).
+  if (playerColony && playerColony.rallyPoint !== null) {
+    const rp = playerColony.rallyPoint;
+    const sx = (rp.tileX - left) * TILE_SIZE_PX;
+    const sy = (rp.tileY - top)  * TILE_SIZE_PX;
+    if (sx > -TILE_SIZE_PX && sx < canvasW && sy > -TILE_SIZE_PX && sy < canvasH) {
+      gfx.fillStyle(COLOR_RALLY_POINT, 1);
+      // Horizontal bar across the tile (leave 1-px edges so adjacent tiles don't fuse)
+      gfx.fillRect(sx + 1, sy + 7, TILE_SIZE_PX - 2, 2);
+      // Vertical bar across the tile
+      gfx.fillRect(sx + 7, sy + 1, 2, TILE_SIZE_PX - 2);
+      // Center square accent — makes the crosshair pop against busy backgrounds
+      gfx.fillRect(sx + 6, sy + 6, 4, 4);
     }
   }
 

@@ -25,7 +25,7 @@ import type { SurfaceGrid, UndergroundGrid } from '../sim/terrain.js';
 import { createSurfaceGrid, createUndergroundGrid } from '../sim/terrain.js';
 import type { PheromoneGrid } from '../sim/pheromone/pheromone-store.js';
 import { createPheromoneGrid } from '../sim/pheromone/pheromone-store.js';
-import type { FoodPile } from '../sim/food.js';
+import type { FoodPile, FoodPileId } from '../sim/food.js';
 import { MAX_ENTITIES } from '../sim/constants.js';
 
 export const SAVE_FORMAT_VERSION = 1 as const;
@@ -47,7 +47,7 @@ export class SaveVersionMismatchError extends Error {
 
 interface SerializedAnts {
   count: number;   // we persist capacity = MAX_ENTITIES; no separate count field exists on AntComponents
-  // All 17 Int32Array fields as plain number[]:
+  // All 18 Int32Array fields as plain number[]:
   posX: number[]; posY: number[]; colonyId: number[];
   task: number[]; subTask: number[]; speed: number[];
   foodCarrying: number[]; starvationTimer: number[];
@@ -55,6 +55,10 @@ interface SerializedAnts {
   zone: number[];
   digTileX: number[]; digTileY: number[]; digTicksRemaining: number[];
   targetPosX: number[]; targetPosY: number[];
+  // Phase 9 / 09 digger-reassignment memo — per-ant SearchingFood leash wave.
+  // Optional for backward compatibility with pre-Phase-9 saves; deserializer
+  // treats absent as zero-init (base wave).
+  searchWave?: number[];
 }
 
 interface SerializedColony {
@@ -70,6 +74,7 @@ interface SerializedColony {
   rallyPoint: { tileX: number; tileY: number } | null;
   digFlowFieldDirty: boolean;
   killCount: number;   // Plan 09-01
+  priorityFoodPileId: FoodPileId | null;  // Phase 9 / PRD §3d — per-colony priority food target
 }
 
 interface SerializedGrid { width: number; height: number; data: number[] }
@@ -125,6 +130,7 @@ function serializeAnts(a: AntComponents): SerializedAnts {
     digTicksRemaining: Array.from(a.digTicksRemaining),
     targetPosX:        Array.from(a.targetPosX),
     targetPosY:        Array.from(a.targetPosY),
+    searchWave:        Array.from(a.searchWave),
   };
 }
 
@@ -151,6 +157,7 @@ function serializeColony(c: ColonyRecord): SerializedColony {
     rallyPoint:           c.rallyPoint === null ? null : { ...c.rallyPoint },
     digFlowFieldDirty:    c.digFlowFieldDirty,
     killCount:            c.killCount,
+    priorityFoodPileId:   c.priorityFoodPileId,
   };
 }
 
@@ -228,6 +235,11 @@ function deserializeAnts(saved: SerializedAnts, capacity: number): AntComponents
   copyIntoInt32(a.digTicksRemaining, saved.digTicksRemaining);
   copyIntoInt32(a.targetPosX, saved.targetPosX);
   copyIntoInt32(a.targetPosY, saved.targetPosY);
+  // Phase 9: pre-Phase-9 saves omit searchWave — createAntComponents already
+  // zero-initialized the field (base wave), so skip the copy when absent.
+  if (saved.searchWave !== undefined) {
+    copyIntoInt32(a.searchWave, saved.searchWave);
+  }
   return a;
 }
 
@@ -254,6 +266,7 @@ function deserializeColony(s: SerializedColony): ColonyRecord {
   c.rallyPoint           = s.rallyPoint === null ? null : { ...s.rallyPoint };
   c.digFlowFieldDirty    = s.digFlowFieldDirty;
   c.killCount            = s.killCount;
+  c.priorityFoodPileId   = s.priorityFoodPileId ?? null;
   return c;
 }
 

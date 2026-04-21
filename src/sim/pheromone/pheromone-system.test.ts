@@ -10,7 +10,7 @@
 // bans those globals in src/sim/. Wall-clock assertions live in bench/.
 
 import { describe, it, expect } from 'vitest';
-import { depositFoodTrail, tickPheromoneDecay, sampleGradient } from './pheromone-system.js';
+import { depositFoodTrail, tickPheromoneDecay, sampleGradient, sampleForagingDirection } from './pheromone-system.js';
 import { createPheromoneGrid, phGet, phSet } from './pheromone-store.js';
 import { Rng } from '../rng.js';
 import {
@@ -280,6 +280,163 @@ describe('sampleGradient (PHER-05)', () => {
     const expected = DIRS[expectedIdx]!;
 
     expect(result).toEqual({ dx: expected.dx, dy: expected.dy });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sampleForagingDirection — 09 pheromone-reacquisition memo
+// ---------------------------------------------------------------------------
+
+describe('sampleForagingDirection (09 pheromone-reacquisition memo)', () => {
+  // TRAIL_STRONG_THRESHOLD = 128 and REACQUIRE_RADIUS = 3 are file-private;
+  // tests below reference them through their observable behavior.
+
+  it('strong local trail (≥128) → always exploits, never consumes the explore roll', () => {
+    // A cell with strength ≥ 128 in a 4-neighbor slot should pull the forager
+    // every single tick regardless of the RNG seed, because the 10% random
+    // roll is suppressed. Over 1000 seeds the direction must be constant.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 6, 5, 500); // right neighbor of (5,5); well above threshold
+
+    for (let seed = 0; seed < 1000; seed++) {
+      const rng = new Rng(seed);
+      const dir = sampleForagingDirection(grid, 5, 5, rng);
+      expect(dir).toEqual({ dx: 1, dy: 0 });
+    }
+  });
+
+  it('strong local trail → does NOT consume any RNG (stream is untouched)', () => {
+    // Layer-1 behavior: no nextInt calls. Verify by advancing two identical
+    // RNG streams the same number of times, with sampleForagingDirection in
+    // between on one of them. The next nextInt value must match.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 5, 4, 500); // up neighbor; strong
+
+    const rngControl = new Rng(42);
+    const rngTest = new Rng(42);
+    rngControl.nextInt(100);
+    rngTest.nextInt(100);
+
+    sampleForagingDirection(grid, 5, 5, rngTest);
+
+    expect(rngTest.nextInt(1_000_000)).toBe(rngControl.nextInt(1_000_000));
+  });
+
+  it('weak local trail (1 ≤ s < 128) → preserves sampleGradient 10/90 behavior', () => {
+    // Over many seeds the explore branch should fire roughly 10% of the time.
+    // Set a single weak neighbor (below 128) as the only trail signal.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 6, 5, 100); // right neighbor — below threshold
+
+    let exploreCount = 0;
+    const TRIALS = 2000;
+    for (let seed = 0; seed < TRIALS; seed++) {
+      const rng = new Rng(seed);
+      const dir = sampleForagingDirection(grid, 5, 5, rng);
+      // Exploit direction is always {1, 0}. Anything else is explore.
+      if (!(dir.dx === 1 && dir.dy === 0)) exploreCount++;
+    }
+    // Explore is ~10% of 2000 = 200, but explore also picks right 25% of the
+    // time (indistinguishable from exploit). So the observable "non-right"
+    // share is 10% * 75% = 7.5%. 4σ of ~7.5% over 2000 = ~40.
+    const nonRight = exploreCount;
+    expect(nonRight).toBeGreaterThan(100); // must see some exploration
+    expect(nonRight).toBeLessThan(250);    // not dominated by it
+  });
+
+  it('no immediate trail, trail at Manhattan distance 2 → steps toward it', () => {
+    // No 4-neighbor trail at (5,5). A trail cell at (7,5) (distance 2, east).
+    // Reacquisition should step east.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 7, 5, 300);
+
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 1, dy: 0 });
+  });
+
+  it('no immediate trail, trail at Manhattan distance 3 → steps toward it', () => {
+    // Trail cell at (5, 2) (distance 3, north).
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 5, 2, 300);
+
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 0, dy: -1 });
+  });
+
+  it('no immediate trail, diagonal trail at (7, 6) (distance 3) → steps east', () => {
+    // Diagonal at distance 3 (|2|+|1|=3). |dx|>|dy| → east.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 7, 6, 300);
+
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 1, dy: 0 });
+  });
+
+  it('two wider-radius trails → steps toward the stronger one', () => {
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 7, 5, 100); // east, distance 2, weaker
+    phSet(grid, 5, 2, 500); // north, distance 3, stronger
+
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 0, dy: -1 });
+  });
+
+  it('two equal-strength wider-radius trails → prefers the closer one', () => {
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 7, 5, 300); // east, distance 2
+    phSet(grid, 5, 2, 300); // north, distance 3
+
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 1, dy: 0 }); // closer cell wins
+  });
+
+  it('trail just outside reacquire radius (distance 4) → returns (0,0)', () => {
+    // Forager must fall through to wander when the only trail is too far.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 9, 5, 500); // distance 4
+
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 0, dy: 0 });
+  });
+
+  it('empty grid → returns (0,0)', () => {
+    const grid = createPheromoneGrid(10, 10);
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng);
+    expect(dir).toEqual({ dx: 0, dy: 0 });
+  });
+
+  it('determinism: same seed + same grid → same output', () => {
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 6, 5, 50); // weak — triggers explore branch on some seeds
+    for (let seed = 0; seed < 50; seed++) {
+      const r1 = new Rng(seed);
+      const r2 = new Rng(seed);
+      expect(sampleForagingDirection(grid, 5, 5, r1))
+        .toEqual(sampleForagingDirection(grid, 5, 5, r2));
+    }
+  });
+
+  it('future-compat: trail that decays below REACQUIRE range reverts to (0,0)', () => {
+    // Memo §"Future Compatibility": once food caches deplete and trails fade,
+    // the function should return (0,0) so the colony goes back to wander.
+    // Simulate by running tickPheromoneDecay repeatedly until the trail cell
+    // drops below PHEROMONE_FLOOR (snaps to 0).
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 7, 5, FOOD_TRAIL_DEPOSIT);
+    // A single deposit of 512 decays to 0 in ~100 ticks. Run 200 ticks to be safe.
+    for (let t = 0; t < 200; t++) {
+      tickPheromoneDecay(grid, PHEROMONE_DECAY_FP);
+    }
+    expect(phGet(grid, 7, 5)).toBe(0);
+    const rng = new Rng(1);
+    expect(sampleForagingDirection(grid, 5, 5, rng)).toEqual({ dx: 0, dy: 0 });
   });
 });
 

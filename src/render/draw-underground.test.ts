@@ -209,6 +209,38 @@ describe('drawUndergroundEntities', () => {
     world = makeWorldWithUnderground();
   });
 
+  it('preserves sub-tile fixed-point precision when projecting underground ant position to pixels', () => {
+    // Regression: previous code did `(posX >> FP_SHIFT) * TILE_SIZE_PX`, which
+    // truncated sub-tile precision before multiplying by tile size. An ant
+    // inside the entrance/queen-chamber tile appeared pinned to the tile's
+    // upper-left corner while actually moving through it.
+    const antId = 0;
+    world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999; // make ant 0 a worker
+
+    const HALF_FP = 128; // 0.5 tile in fixed-point (FP_ONE = 256)
+    initAnt(world.ants, antId, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: (5 << FP_SHIFT) + HALF_FP, // tile 5.5
+      posY: (3 << FP_SHIFT) + HALF_FP, // tile 3.5
+      zone: 1,
+    });
+
+    const cam = makeCamera(5, 3, 20, 20);
+    drawUndergroundEntities(gfx, world, world, 0, cam);
+
+    const left = Math.floor(cam.x - cam.viewportWidth / 2);
+    const top  = Math.floor(cam.y - cam.viewportHeight / 2);
+    const expectedX = 5.5 * TILE_SIZE_PX - left * TILE_SIZE_PX - 3;
+    const expectedY = 3.5 * TILE_SIZE_PX - top  * TILE_SIZE_PX - 3;
+    const rects = gfx.callsOf('fillRect');
+    const workerRect = rects.find(r =>
+      r.args[2] === 6 && r.args[3] === 6 &&
+      Math.abs((r.args[0] as number) - expectedX) < 0.01 &&
+      Math.abs((r.args[1] as number) - expectedY) < 0.01,
+    );
+    expect(workerRect).toBeDefined();
+  });
+
   it('draws ant at (5,3) pixels matching posX=5<<FP_SHIFT, posY=3<<FP_SHIFT with zone=1', () => {
     const antId = 0;
     world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999; // make ant 0 a worker
@@ -323,6 +355,29 @@ describe('drawUndergroundEntities', () => {
     const eggCircles = gfx.callsOf('fillCircle');
     // At least one circle for the egg
     expect(eggCircles.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('does NOT draw enemy-colony ants even when underground in view (PRD §7b)', () => {
+    // Regression guard: prior revision rendered all zone=1 ants and just
+    // colored them by colony, which leaked enemy positions into the player's
+    // underground view (bug report §2, red flashing markers).
+    world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999; // no ant id matches
+    const enemyColonyId = 2;
+
+    const enemyId = 3;
+    initAnt(world.ants, enemyId, {
+      colonyId: enemyColonyId,
+      posX: 5 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      zone: 1, // underground
+    });
+
+    const cam = makeCamera(5, 5, 20, 20);
+    drawUndergroundEntities(gfx, world, world, 0, cam);
+
+    // No ant rects (6×6) should be issued — the enemy must be filtered out.
+    const antRects = gfx.callsOf('fillRect').filter(r => r.args[2] === 6 && r.args[3] === 6);
+    expect(antRects.length).toBe(0);
   });
 
   it('draws larvae as fillCircle with COLOR_ANT_LARVAE', () => {

@@ -7,11 +7,14 @@ import {
   hideContextMenu,
   requestHideContextMenu,
   applyPendingContextMenuHide,
+  requestShowContextMenu,
+  applyPendingContextMenuShow,
 } from './context-menu-state.js';
 
 beforeEach(() => {
   contextMenuState.visible     = false;
   contextMenuState.pendingHide = false;
+  contextMenuState.pendingShow = false;
   contextMenuState.screenX     = 0;
   contextMenuState.screenY     = 0;
   contextMenuState.anchorTileX = 0;
@@ -19,12 +22,60 @@ beforeEach(() => {
 });
 
 describe('hideContextMenu (immediate)', () => {
-  it('sets visible=false synchronously and clears pendingHide', () => {
+  it('sets visible=false synchronously and clears pendingHide and pendingShow', () => {
     contextMenuState.visible = true;
     contextMenuState.pendingHide = true;
+    contextMenuState.pendingShow = true;
     hideContextMenu();
     expect(contextMenuState.visible).toBe(false);
     expect(contextMenuState.pendingHide).toBe(false);
+    expect(contextMenuState.pendingShow).toBe(false);
+  });
+});
+
+describe('requestShowContextMenu (deferred)', () => {
+  it('stores anchor coords immediately but leaves visible=false until applyPendingContextMenuShow runs', () => {
+    requestShowContextMenu(120, 80, 10, 6);
+    // Anchor is set so the next frame knows where to render.
+    expect(contextMenuState.screenX).toBe(120);
+    expect(contextMenuState.screenY).toBe(80);
+    expect(contextMenuState.anchorTileX).toBe(10);
+    expect(contextMenuState.anchorTileY).toBe(6);
+    // visible stays false this frame so any cross-scene pointerdown handler
+    // running in the same dispatch does NOT see visible=true.
+    expect(contextMenuState.visible).toBe(false);
+    expect(contextMenuState.pendingShow).toBe(true);
+  });
+
+  it('applyPendingContextMenuShow flips visible to true and clears pendingShow', () => {
+    requestShowContextMenu(120, 80, 10, 6);
+    applyPendingContextMenuShow();
+    expect(contextMenuState.visible).toBe(true);
+    expect(contextMenuState.pendingShow).toBe(false);
+  });
+
+  it('applyPendingContextMenuShow is a no-op when no show is pending', () => {
+    expect(contextMenuState.visible).toBe(false);
+    applyPendingContextMenuShow();
+    expect(contextMenuState.visible).toBe(false);
+  });
+
+  it('prevents cross-scene race: second pointerdown handler in the same dispatch sees visible=false', () => {
+    // This is the exact bug the deferred-show pattern fixes. Scenario:
+    //   1. User right-clicks tunnel end.
+    //   2. Handler A (underground-input) calls requestShowContextMenu.
+    //   3. Handler B (UIScene pointerdown) runs in the SAME dispatch.
+    //      If visible flipped synchronously, B would see visible=true and
+    //      interpret the same right-click as a menu item selection — the
+    //      anchor is at the pointer, so the click lands on the first item.
+    // With deferred show, B sees visible=false and falls through correctly.
+    requestShowContextMenu(200, 150, 7, 3);
+    const visibleInSameDispatch = contextMenuState.visible;
+    expect(visibleInSameDispatch).toBe(false);
+
+    // Only on the next frame does the renderer observe visible=true.
+    applyPendingContextMenuShow();
+    expect(contextMenuState.visible).toBe(true);
   });
 });
 

@@ -233,10 +233,13 @@ export function clampCamera(cam: CameraState, worldW: number, worldH: number): v
  * Converts a screen pixel position (e.g., mouse cursor) to the tile coordinates
  * it corresponds to, given the current camera state.
  *
- * Algorithm (PRD §7a / RESEARCH §Screen-to-Tile Conversion):
- *   cameraPixelX = (cam.x - cam.viewportWidth/2) * TILE_SIZE_PX
- *   tileX = Math.floor((screenX + cameraPixelX) / TILE_SIZE_PX)
- *   (same for Y)
+ * Mirrors the renderer's integer-tile snap: draw-surface / draw-underground /
+ * draw-pheromone all compute `left = Math.floor(cam.x - viewportWidth/2)` so
+ * world tiles are drawn at integer-aligned pixel offsets. We apply the same
+ * floor here so a click lands on the tile the player sees. Using the raw
+ * fractional camera caused up to a ~15px drift between the rendered food
+ * pile and the tile `findFoodPileAt` resolved to, making clicks miss unless
+ * they struck near the tile center.
  *
  * @param screenX - Screen X in pixels (0 = left edge of canvas)
  * @param screenY - Screen Y in pixels (0 = top edge of canvas)
@@ -248,10 +251,10 @@ export function screenToTile(
   screenY: number,
   cam: CameraState,
 ): { tileX: number; tileY: number } {
-  const cameraPixelX = (cam.x - cam.viewportWidth / 2) * TILE_SIZE_PX;
-  const cameraPixelY = (cam.y - cam.viewportHeight / 2) * TILE_SIZE_PX;
+  const left = Math.floor(cam.x - cam.viewportWidth / 2);
+  const top = Math.floor(cam.y - cam.viewportHeight / 2);
   return {
-    tileX: Math.floor((screenX + cameraPixelX) / TILE_SIZE_PX),
-    tileY: Math.floor((screenY + cameraPixelY) / TILE_SIZE_PX),
+    tileX: Math.floor(screenX / TILE_SIZE_PX) + left,
+    tileY: Math.floor(screenY / TILE_SIZE_PX) + top,
   };
 }

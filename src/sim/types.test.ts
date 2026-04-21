@@ -182,6 +182,20 @@ describe('WorldState', () => {
         expect(dst.ants.targetPosX[0]).toBe(512);
         expect(dst.ants.targetPosY[0]).toBe(256);
       });
+
+      it('Phase 9 ant fields: searchWave copied (09 digger-reassignment memo)', () => {
+        // Leash wave is live sim state — if copyWorldState drops it, prevState
+        // drifts from curr and interpolation/tests that rely on WorldState
+        // equality after copy start lying.
+        src.ants.searchWave[0] = 3;
+        src.ants.searchWave[1] = 1;
+        copyWorldState(src, dst);
+        expect(dst.ants.searchWave[0]).toBe(3);
+        expect(dst.ants.searchWave[1]).toBe(1);
+        // Independence: mutating src must not affect dst.
+        src.ants.searchWave[0] = 0;
+        expect(dst.ants.searchWave[0]).toBe(3);
+      });
     });
 
     describe('colonies', () => {
@@ -338,24 +352,16 @@ describe('WorldState', () => {
       });
 
       it('foodPiles: add pile to src, copy, verify dst has it', () => {
-        src.foodPiles.push({ foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false });
+        src.foodPiles.push({ foodPileId: 1, tileX: 10, tileY: 20 });
         copyWorldState(src, dst);
         expect(dst.foodPiles.length).toBe(1);
         expect(dst.foodPiles[0]!.tileX).toBe(10);
         expect(dst.foodPiles[0]!.tileY).toBe(20);
       });
 
-      it('foodPiles: change isMarkedPriority, copy, verify dst updated', () => {
-        src.foodPiles.push({ foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false });
-        copyWorldState(src, dst);
-        src.foodPiles[0]!.isMarkedPriority = true;
-        copyWorldState(src, dst);
-        expect(dst.foodPiles[0]!.isMarkedPriority).toBe(true);
-      });
-
       it('foodPiles: shrink src array, copy, verify dst shrinks', () => {
-        src.foodPiles.push({ foodPileId: 1, tileX: 1, tileY: 1, isMarkedPriority: false });
-        src.foodPiles.push({ foodPileId: 2, tileX: 2, tileY: 2, isMarkedPriority: false });
+        src.foodPiles.push({ foodPileId: 1, tileX: 1, tileY: 1 });
+        src.foodPiles.push({ foodPileId: 2, tileX: 2, tileY: 2 });
         copyWorldState(src, dst);
         expect(dst.foodPiles.length).toBe(2);
         src.foodPiles.pop();
@@ -494,6 +500,27 @@ describe('WorldState', () => {
 
         copyWorldState(src, dst);
         expect(dst.colonies[1]!.killCount).toBe(5);
+      });
+
+      it('copyWorldState round-trips priorityFoodPileId (both a concrete id and null)', () => {
+        src.colonies[1] = createColonyRecord(1, 42);
+        src.colonies[1]!.entrances = [];
+        src.colonies[1]!.rallyPoint = null;
+        src.colonies[1]!.digFlowFieldDirty = false;
+        src.colonies[1]!.priorityFoodPileId = 7;
+
+        dst.colonies[1] = createColonyRecord(1, 42);
+        dst.colonies[1]!.entrances = [];
+        dst.colonies[1]!.rallyPoint = null;
+        dst.colonies[1]!.digFlowFieldDirty = false;
+        dst.colonies[1]!.priorityFoodPileId = 99;
+
+        copyWorldState(src, dst);
+        expect(dst.colonies[1]!.priorityFoodPileId).toBe(7);
+
+        src.colonies[1]!.priorityFoodPileId = null;
+        copyWorldState(src, dst);
+        expect(dst.colonies[1]!.priorityFoodPileId).toBeNull();
       });
     });
 

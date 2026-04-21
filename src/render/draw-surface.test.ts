@@ -29,6 +29,7 @@ import {
   COLOR_QUEEN_OUTLINE,
   COLOR_PLAYER_COLONY,
   COLOR_ENEMY_COLONY,
+  COLOR_RALLY_POINT,
 } from './sprites.js';
 import type { CameraState } from './camera.js';
 
@@ -186,24 +187,109 @@ describe('drawSurfaceEntities', () => {
   });
 
   it('draws 2 fillCircle calls for two food piles (one marked, one normal)', () => {
-    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5, isMarkedPriority: true  });
-    world.foodPiles.push({ foodPileId: 2, tileX: 6, tileY: 5, isMarkedPriority: false });
+    // Phase 9: "marked" means pile.foodPileId === playerColony.priorityFoodPileId.
+    const playerColony = createColonyRecord(PLAYER_COLONY_ID, 999);
+    playerColony.entrances = [];
+    playerColony.rallyPoint = null;
+    playerColony.digFlowFieldDirty = false;
+    playerColony.priorityFoodPileId = 1;
+    world.colonies[PLAYER_COLONY_ID] = playerColony;
+    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5 });
+    world.foodPiles.push({ foodPileId: 2, tileX: 6, tileY: 5 });
     const cam = makeCamera(5, 5, 20, 20);
     drawSurfaceEntities(gfx, world, world, 0, cam);
     const circles = gfx.callsOf('fillCircle');
     expect(circles.length).toBe(2);
   });
 
-  it('colors marked food pile with COLOR_FOOD_PILE_MARKED', () => {
-    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5, isMarkedPriority: true  });
-    world.foodPiles.push({ foodPileId: 2, tileX: 6, tileY: 5, isMarkedPriority: false });
+  it('colors the player colony priority pile with COLOR_FOOD_PILE_MARKED', () => {
+    const playerColony = createColonyRecord(PLAYER_COLONY_ID, 999);
+    playerColony.entrances = [];
+    playerColony.rallyPoint = null;
+    playerColony.digFlowFieldDirty = false;
+    playerColony.priorityFoodPileId = 1;
+    world.colonies[PLAYER_COLONY_ID] = playerColony;
+    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5 });
+    world.foodPiles.push({ foodPileId: 2, tileX: 6, tileY: 5 });
     const cam = makeCamera(5, 5, 20, 20);
     drawSurfaceEntities(gfx, world, world, 0, cam);
-    // Find fillStyle calls preceding fillCircle
     const markedStyles = gfx.callsOf('fillStyle').filter(c => c.args[0] === COLOR_FOOD_PILE_MARKED);
     const normalStyles = gfx.callsOf('fillStyle').filter(c => c.args[0] === COLOR_FOOD_PILE_NORMAL);
     expect(markedStyles.length).toBe(1);
     expect(normalStyles.length).toBe(1);
+  });
+
+  it('does not render an enemy colony priority pile as marked on the player HUD', () => {
+    // Enemy colony marks pile 1; player has no priority pile. The HUD must NOT
+    // highlight pile 1 — that would leak enemy AI intent to the player.
+    const playerColony = createColonyRecord(PLAYER_COLONY_ID, 999);
+    playerColony.entrances = [];
+    playerColony.rallyPoint = null;
+    playerColony.digFlowFieldDirty = false;
+    playerColony.priorityFoodPileId = null;
+    const enemyColonyId = PLAYER_COLONY_ID + 1;
+    const enemyColony = createColonyRecord(enemyColonyId, 888);
+    enemyColony.entrances = [];
+    enemyColony.rallyPoint = null;
+    enemyColony.digFlowFieldDirty = false;
+    enemyColony.priorityFoodPileId = 1;
+    world.colonies[PLAYER_COLONY_ID] = playerColony;
+    world.colonies[enemyColonyId] = enemyColony;
+    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5 });
+    const cam = makeCamera(5, 5, 20, 20);
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    const markedStyles = gfx.callsOf('fillStyle').filter(c => c.args[0] === COLOR_FOOD_PILE_MARKED);
+    expect(markedStyles.length).toBe(0);
+  });
+
+  it('preserves sub-tile fixed-point precision when projecting ant position to pixels', () => {
+    // Regression: previous code did `(posX >> FP_SHIFT) * TILE_SIZE_PX`, which
+    // truncated sub-tile precision before multiplying by tile size. An ant
+    // anywhere inside tile 10 (posX in [2560, 2815]) rendered at exactly the
+    // same pixel as one at tile 10's upper-left corner — visually pinning it.
+    // Fix: `(posX * TILE_SIZE_PX) / FP_ONE` preserves sub-tile offset.
+    const prev = createWorldState(1);
+    const curr = createWorldState(1);
+    const workerId = 0;
+    const colonyId = PLAYER_COLONY_ID;
+    const colony = createColonyRecord(colonyId, 99); // queen id 99 ≠ worker
+    colony.entrances = [];
+    colony.rallyPoint = null;
+    colony.digFlowFieldDirty = false;
+    curr.colonies[colonyId] = colony;
+    prev.colonies[colonyId] = colony;
+
+    // Ant at tile 10.5 on X (posX = 10*256 + 128 = 2688) — halfway through tile 10.
+    // Under the old buggy math this would render identically to posX=10<<FP_SHIFT.
+    const HALF_FP = 128;
+    initAnt(prev.ants, workerId, {
+      colonyId,
+      posX: (10 << FP_SHIFT) + HALF_FP,
+      posY: (5 << FP_SHIFT)  + HALF_FP,
+      zone: 0,
+    });
+    initAnt(curr.ants, workerId, {
+      colonyId,
+      posX: (10 << FP_SHIFT) + HALF_FP,
+      posY: (5 << FP_SHIFT)  + HALF_FP,
+      zone: 0,
+    });
+
+    const cam = makeCamera(10, 5, 20, 20);
+    drawSurfaceEntities(gfx, prev, curr, 0, cam);
+
+    const left = Math.floor(cam.x - cam.viewportWidth / 2);
+    const top  = Math.floor(cam.y - cam.viewportHeight / 2);
+    // posX in pixels = 10.5 * 16 = 168; screenX = 168 - left*16. Body 6×6 centered → x = screenX - 3.
+    const expectedScreenX = 10.5 * TILE_SIZE_PX - left * TILE_SIZE_PX;
+    const expectedScreenY = 5.5  * TILE_SIZE_PX - top  * TILE_SIZE_PX;
+    const rects = gfx.callsOf('fillRect');
+    const antRect = rects.find(r =>
+      r.args[2] === 6 && r.args[3] === 6 &&
+      Math.abs((r.args[0] as number) - (expectedScreenX - 3)) < 0.01 &&
+      Math.abs((r.args[1] as number) - (expectedScreenY - 3)) < 0.01,
+    );
+    expect(antRect).toBeDefined();
   });
 
   it('interpolates ant position at alpha=0.5 to halfway between prev and curr', () => {
@@ -329,6 +415,111 @@ describe('drawSurfaceEntities', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tests: rally-point marker (Phase 9 usability fix)
+// ---------------------------------------------------------------------------
+
+describe('drawSurfaceEntities — rally-point marker', () => {
+  let gfx: MockGfx;
+  let world: WorldState;
+
+  beforeEach(() => {
+    gfx = new MockGfx();
+    world = createWorldState(1);
+  });
+
+  function addPlayerColony(rallyPoint: { tileX: number; tileY: number } | null): void {
+    const colony = createColonyRecord(PLAYER_COLONY_ID, 999);
+    colony.entrances = [];
+    colony.rallyPoint = rallyPoint;
+    colony.digFlowFieldDirty = false;
+    colony.priorityFoodPileId = null;
+    world.colonies[PLAYER_COLONY_ID] = colony;
+  }
+
+  /** The rally marker is white fillRects. Identify them by fill color. */
+  function rallyRects(g: MockGfx): GfxCall[] {
+    const out: GfxCall[] = [];
+    let currentStyleIsRally = false;
+    for (const c of g.calls) {
+      if (c.method === 'fillStyle') {
+        currentStyleIsRally = c.args[0] === COLOR_RALLY_POINT;
+      } else if (c.method === 'fillRect' && currentStyleIsRally) {
+        out.push(c);
+      }
+    }
+    return out;
+  }
+
+  it('renders a rally marker when the player colony has a rally point', () => {
+    addPlayerColony({ tileX: 5, tileY: 5 });
+    const cam = makeCamera(5, 5, 20, 20);
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    expect(rallyRects(gfx).length).toBeGreaterThan(0);
+  });
+
+  it('renders no rally marker when rallyPoint is null', () => {
+    addPlayerColony(null);
+    const cam = makeCamera(5, 5, 20, 20);
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    expect(rallyRects(gfx).length).toBe(0);
+  });
+
+  it('rally marker moves with the rally point tile (camera-relative position)', () => {
+    addPlayerColony({ tileX: 10, tileY: 4 });
+    const cam = makeCamera(10, 4, 20, 20);
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    const rects = rallyRects(gfx);
+    expect(rects.length).toBeGreaterThan(0);
+    // Expected tile screen origin:
+    //   left = floor(10 - 10) = 0; top = floor(4 - 10) = -6
+    //   sx = (10 - 0) * 16 = 160; sy = (4 - (-6)) * 16 = 160
+    const left = Math.floor(cam.x - cam.viewportWidth  / 2);
+    const top  = Math.floor(cam.y - cam.viewportHeight / 2);
+    const sx = (10 - left) * TILE_SIZE_PX;
+    const sy = (4  - top)  * TILE_SIZE_PX;
+    // Every rally rect must land within that 16×16 tile.
+    for (const r of rects) {
+      const rx = r.args[0] as number;
+      const ry = r.args[1] as number;
+      expect(rx).toBeGreaterThanOrEqual(sx);
+      expect(ry).toBeGreaterThanOrEqual(sy);
+      expect(rx).toBeLessThan(sx + TILE_SIZE_PX);
+      expect(ry).toBeLessThan(sy + TILE_SIZE_PX);
+    }
+  });
+
+  it('rally marker disappears after rallyPoint is cleared', () => {
+    addPlayerColony({ tileX: 5, tileY: 5 });
+    const cam = makeCamera(5, 5, 20, 20);
+
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    expect(rallyRects(gfx).length).toBeGreaterThan(0);
+
+    // Simulate what ClearRallyPoint does in the sim.
+    world.colonies[PLAYER_COLONY_ID]!.rallyPoint = null;
+    gfx.reset();
+
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    expect(rallyRects(gfx).length).toBe(0);
+  });
+
+  it('does not render an enemy colony rally point on the player HUD', () => {
+    addPlayerColony(null);
+    const enemyId = PLAYER_COLONY_ID + 1;
+    const enemy = createColonyRecord(enemyId, 888);
+    enemy.entrances = [];
+    enemy.rallyPoint = { tileX: 5, tileY: 5 };
+    enemy.digFlowFieldDirty = false;
+    enemy.priorityFoodPileId = null;
+    world.colonies[enemyId] = enemy;
+
+    const cam = makeCamera(5, 5, 20, 20);
+    drawSurfaceEntities(gfx, world, world, 0, cam);
+    expect(rallyRects(gfx).length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests: drawSurface orchestrator
 // ---------------------------------------------------------------------------
 
@@ -336,7 +527,7 @@ describe('drawSurface', () => {
   it('calls both terrain and entity draws (terrain rects + entity draws present)', () => {
     const gfx = new MockGfx();
     const world = createWorldState(1);
-    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5, isMarkedPriority: false });
+    world.foodPiles.push({ foodPileId: 1, tileX: 5, tileY: 5 });
     const cam = makeCamera(5, 5, 10, 10);
     drawSurface(gfx, world, world, 0, cam);
     // Terrain fillRects should be present

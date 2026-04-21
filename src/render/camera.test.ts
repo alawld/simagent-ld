@@ -278,16 +278,18 @@ describe('clampCamera', () => {
 // ---------------------------------------------------------------------------
 
 describe('screenToTile', () => {
-  it('pointer at canvas center (400, 296) with camera at world center (64, 64) returns tile (64, 64)', () => {
-    // Camera center at tile (64, 64), viewport 50×37
-    // cameraPixelX = (64 - 25) * 16 = 39 * 16 = 624
-    // tileX = Math.floor((400 + 624) / 16) = Math.floor(1024 / 16) = 64
-    // cameraPixelY = (64 - 18.5) * 16 = 45.5 * 16 = 728
-    // tileY = Math.floor((296 + 728) / 16) = Math.floor(1024 / 16) = 64
+  it('pointer at canvas center (400, 296) with camera at world center (64, 64) returns the tile the renderer drew there', () => {
+    // Camera center at tile (64, 64), viewport 50×37.
+    //   Horizontal: cam.x=64, vw/2=25 (integer) → left = 64-25 = 39
+    //     tileX = floor(400/16) + 39 = 25 + 39 = 64
+    //   Vertical:   cam.y=64, vh/2=18.5 (fractional) → top = floor(45.5) = 45
+    //     tileY = floor(296/16) + 45 = 18 + 45 = 63
+    // The odd viewport height means the renderer draws tile 63 at screen
+    // y=288..303, so a click at y=296 hits tile 63 — not 64.
     const cam = makeCamera(64, 64);
     const result = screenToTile(400, 296, cam);
     expect(result.tileX).toBe(64);
-    expect(result.tileY).toBe(64);
+    expect(result.tileY).toBe(63);
   });
 
   it('pointer at (0, 0) with camera clamped to minimum (25, 18.5) returns tile (0, 0)', () => {
@@ -302,14 +304,15 @@ describe('screenToTile', () => {
     expect(result.tileY).toBe(0);
   });
 
-  it('round-trip: center tile pixel coordinates through screenToTile return same tile', () => {
-    // For tile (tx, ty), its pixel center is:
-    //   screenX = (tx - camLeft) * TILE_SIZE_PX + TILE_SIZE_PX/2
-    // where camLeft = cam.x - cam.viewportWidth/2
-    // After screenToTile, should recover (tx, ty)
+  it('round-trip: tile pixel coordinates through screenToTile return same tile', () => {
+    // For tile (tx, ty), the top-left pixel the renderer draws it at is:
+    //   screenX = (tx - camLeft) * TILE_SIZE_PX
+    // where camLeft = Math.floor(cam.x - cam.viewportWidth/2) — the
+    // integer-tile snap the renderer applies. screenToTile mirrors that
+    // floor, so any pixel inside the drawn tile must round-trip to (tx, ty).
     const cam = makeCamera(64, 64);
-    const camLeft = cam.x - cam.viewportWidth / 2;
-    const camTop = cam.y - cam.viewportHeight / 2;
+    const camLeft = Math.floor(cam.x - cam.viewportWidth / 2);
+    const camTop = Math.floor(cam.y - cam.viewportHeight / 2);
 
     // Test a specific tile inside the viewport: tile (70, 70)
     const tx = 70;
@@ -319,5 +322,31 @@ describe('screenToTile', () => {
     const result = screenToTile(screenX, screenY, cam);
     expect(result.tileX).toBe(tx);
     expect(result.tileY).toBe(ty);
+  });
+
+  it('fractional camera: clicks anywhere in a rendered tile resolve to that tile', () => {
+    // Regression: drag-pan and the 0.5-tile keyboard scroll leave cam.x
+    // fractional. The renderer snaps its tile offset with Math.floor(cam.x -
+    // viewportWidth/2), so visible tiles are integer-aligned. If screenToTile
+    // used the raw fractional camera instead, the tile it reports drifts up
+    // to a full tile away from what the player sees — which is why food-pile
+    // clicks only worked near the center of the drawn mark.
+    const cam = makeCamera(64.3, 64.7); // mid-pan / mid-scroll
+    const left = Math.floor(cam.x - cam.viewportWidth / 2); // renderer's floor
+    const top = Math.floor(cam.y - cam.viewportHeight / 2);
+
+    // Tile (70, 70) is drawn spanning screen px [(70-left)*16, (70-left+1)*16)
+    // horizontally — every click inside that span must resolve to tileX=70.
+    const tx = 70;
+    const ty = 70;
+    const tileLeftPx = (tx - left) * TILE_SIZE_PX;
+    const tileTopPx = (ty - top) * TILE_SIZE_PX;
+
+    // Four corners + center of the drawn tile all map to (70, 70)
+    for (const [dx, dy] of [[0, 0], [15, 0], [0, 15], [15, 15], [8, 8]]) {
+      const r = screenToTile(tileLeftPx + dx!, tileTopPx + dy!, cam);
+      expect(r.tileX).toBe(tx);
+      expect(r.tileY).toBe(ty);
+    }
   });
 });

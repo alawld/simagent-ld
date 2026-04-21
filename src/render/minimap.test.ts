@@ -4,7 +4,7 @@
 // Runs under Node with no Phaser.
 
 import { describe, it, expect } from 'vitest';
-import { HUD } from './sprites.js';
+import { HUD, COLOR_SURFACE_GRASS_PRIMARY, COLOR_SURFACE_DIRT } from './sprites.js';
 import { createViewState } from './camera.js';
 import {
   minimapClickToTile,
@@ -16,6 +16,7 @@ import {
 import type { GfxLike } from './draw-surface.js';
 import type { WorldState } from '../sim/types.js';
 import { PLAYER_COLONY_ID, PLAYER_START_X, PLAYER_START_Y } from '../sim/constants.js';
+import { SurfaceTileState, sgSet } from '../sim/terrain.js';
 
 // ---------------------------------------------------------------------------
 // MockGfx — records calls, does not render anything
@@ -189,6 +190,7 @@ const stubColonies: WorldState['colonies'] = {
     defeated: false, reconcileCountdown: 0,
     rallyPoint: null, digFlowFieldDirty: false,
     killCount: 0,
+    priorityFoodPileId: null,
   } as WorldState['colonies'][number],
 };
 
@@ -207,7 +209,7 @@ describe('drawMinimap smoke test', () => {
     // Should have at least: 1 background + 1 food pile + 1 colony + 4 viewport outline = 7
     expect(fillRects.length).toBeGreaterThanOrEqual(7);
 
-    // First fillRect is the black background covering the full minimap
+    // First fillRect is the grass background covering the full minimap
     const bg = fillRects[0]!;
     expect(bg.args[0]).toBe(HUD.MINIMAP.x);
     expect(bg.args[1]).toBe(HUD.MINIMAP.y);
@@ -218,5 +220,36 @@ describe('drawMinimap smoke test', () => {
   it('MINIMAP_SCALE_X and MINIMAP_SCALE_Y equal 1.25 for 128-tile world', () => {
     expect(MINIMAP_SCALE_X).toBeCloseTo(1.25, 5);
     expect(MINIMAP_SCALE_Y).toBeCloseTo(1.25, 5);
+  });
+
+  it('renders a surface overview (not a black box) — PRD §7a', () => {
+    // Regression: prior version hardcoded 0x000000 as the minimap background,
+    // so the minimap read as a black debug overlay. The fix uses grass as the
+    // base and overlays dirt tiles from world.surface.
+    const gfx = new MockGfx();
+    // Scatter a few dirt tiles so we can assert the dirt path fires
+    sgSet(stubSurface, 10, 10, SurfaceTileState.Dirt);
+    sgSet(stubSurface, 20, 30, SurfaceTileState.Dirt);
+    sgSet(stubSurface, 50, 50, SurfaceTileState.Dirt);
+
+    const world = makeMinimalWorld({ foodPiles: [], colonies: stubColonies });
+    const vs = createViewState(PLAYER_START_X, PLAYER_START_Y);
+    drawMinimap(gfx, world, vs);
+
+    const styles = gfx.callsOf('fillStyle');
+    // No black background anywhere
+    const hasBlack = styles.some(c => c.args[0] === 0x000000);
+    expect(hasBlack).toBe(false);
+    // A grass-color fillStyle is used for the base
+    const hasGrass = styles.some(c => c.args[0] === COLOR_SURFACE_GRASS_PRIMARY);
+    expect(hasGrass).toBe(true);
+    // A dirt-color fillStyle is issued because the surface has dirt tiles
+    const hasDirt = styles.some(c => c.args[0] === COLOR_SURFACE_DIRT);
+    expect(hasDirt).toBe(true);
+
+    // Cleanup so other tests see a clean surface
+    sgSet(stubSurface, 10, 10, SurfaceTileState.Grass);
+    sgSet(stubSurface, 20, 30, SurfaceTileState.Grass);
+    sgSet(stubSurface, 50, 50, SurfaceTileState.Grass);
   });
 });

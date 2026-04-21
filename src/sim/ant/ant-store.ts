@@ -1,6 +1,6 @@
 // ant-store.ts — PRD §1 Structure-of-Arrays (SoA) ant component storage.
 //
-// 17 parallel Int32Array fields indexed by EntityId — one slot per entity.
+// 18 parallel Int32Array fields indexed by EntityId — one slot per entity.
 // All arrays are allocated once in createAntComponents and NEVER reallocated
 // during the simulation tick loop (zero per-tick allocation in the ant subsystem).
 //
@@ -68,14 +68,21 @@ export interface AntComponents {
   readonly targetPosX:        Int32Array;
   /** Forager priority target Y in fixed-point units (-1 = no target). */
   readonly targetPosY:        Int32Array;
+  /**
+   * 09 SearchingFood leash wave index (0..SEARCH_LEASH_MAX_WAVE). Zero = base
+   * radius. Incremented when a SearchingFood ant is demoted for exceeding the
+   * current wave's radius; reset to 0 on a successful pickup. Per-ant state
+   * (not colony-memory) per the 09 digger-reassignment memo.
+   */
+  readonly searchWave:        Int32Array;
 }
 
 // ---------------------------------------------------------------------------
-// Factory — allocates all 17 arrays once; zero per-tick allocation guaranteed
+// Factory — allocates all 18 arrays once; zero per-tick allocation guaranteed
 // ---------------------------------------------------------------------------
 
 /**
- * Allocate 17 parallel Int32Arrays of length `maxEntities`.
+ * Allocate 18 parallel Int32Arrays of length `maxEntities`.
  * All slots are zero-initialized by the TypedArray spec, with the exception of
  * digTileX, digTileY, targetPosX, and targetPosY which are filled with -1
  * (sentinel meaning "no claimed tile" / "no target").
@@ -112,6 +119,8 @@ export function createAntComponents(maxEntities: number = MAX_ENTITIES): AntComp
     digTicksRemaining: new Int32Array(maxEntities), // zero = not digging (correct default)
     targetPosX,
     targetPosY,
+    // Phase 9 SearchingFood leash:
+    searchWave:        new Int32Array(maxEntities), // zero = base wave (correct default)
   };
 }
 
@@ -171,6 +180,7 @@ export function initAnt(ants: AntComponents, id: EntityId, spec: InitAntSpec): v
   ants.digTicksRemaining[id] = 0;
   ants.targetPosX[id]        = -1;
   ants.targetPosY[id]        = -1;
+  ants.searchWave[id]        = 0;
 }
 
 /**

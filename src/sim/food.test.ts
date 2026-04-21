@@ -11,22 +11,10 @@ describe('FoodPile interface', () => {
       foodPileId: 1 as FoodPileId,
       tileX: 24,
       tileY: 10,
-      isMarkedPriority: false,
     };
     expect(pile.foodPileId).toBe(1);
     expect(pile.tileX).toBe(24);
     expect(pile.tileY).toBe(10);
-    expect(pile.isMarkedPriority).toBe(false);
-  });
-
-  it('isMarkedPriority can be true', () => {
-    const pile: FoodPile = {
-      foodPileId: 2 as FoodPileId,
-      tileX: 64,
-      tileY: 20,
-      isMarkedPriority: true,
-    };
-    expect(pile.isMarkedPriority).toBe(true);
   });
 
   it('FoodPileId is a number type', () => {
@@ -35,11 +23,16 @@ describe('FoodPile interface', () => {
   });
 
   it('two FoodPile objects are independent', () => {
-    const pile1: FoodPile = { foodPileId: 1, tileX: 10, tileY: 20, isMarkedPriority: false };
-    const pile2: FoodPile = { foodPileId: 2, tileX: 30, tileY: 40, isMarkedPriority: true };
+    const pile1: FoodPile = { foodPileId: 1, tileX: 10, tileY: 20 };
+    const pile2: FoodPile = { foodPileId: 2, tileX: 30, tileY: 40 };
     expect(pile1.foodPileId).toBe(1);
     expect(pile2.foodPileId).toBe(2);
-    expect(pile1.isMarkedPriority).toBe(false);
-    expect(pile2.isMarkedPriority).toBe(true);
+    expect(pile1.tileX).toBe(10);
+    expect(pile2.tileX).toBe(30);
+  });
+
+  it('pile objects do not carry a priority flag (priority lives on ColonyRecord per Phase 9)', () => {
+    const pile: FoodPile = { foodPileId: 5, tileX: 0, tileY: 0 };
+    expect(Object.prototype.hasOwnProperty.call(pile, 'isMarkedPriority')).toBe(false);
   });
 });

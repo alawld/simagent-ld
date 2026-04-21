@@ -11,7 +11,7 @@
 
 import type { WorldState } from './types.js';
 import { createWorldState, allocateEntityId } from './types.js';
-import { createSurfaceGrid, createUndergroundGrid, SurfaceTileState } from './terrain.js';
+import { createSurfaceGrid, createUndergroundGrid, SurfaceTileState, UndergroundTileState, ugSet } from './terrain.js';
 import { initAnt } from './ant/ant-store.js';
 import { createColonyRecord } from './colony/colony-store.js';
 import { createPheromoneGrid, pheromoneGridKey } from './pheromone/pheromone-store.js';
@@ -37,6 +37,7 @@ import {
   UNDERGROUND_GRID_WIDTH,
   UNDERGROUND_GRID_HEIGHT,
   WORKER_LIFESPAN_TICKS,
+  ENTRANCE_SHAFT_DEPTH,
 } from './constants.js';
 
 // ---------------------------------------------------------------------------
@@ -91,10 +92,9 @@ function generateFoodPiles(world: WorldState, rng: Rng): void {
     if (tooCloseToExisting) continue;
 
     world.foodPiles.push({
-      foodPileId:       allocateEntityId(world),
+      foodPileId: allocateEntityId(world),
       tileX,
       tileY,
-      isMarkedPriority: false,
     });
   }
 }
@@ -140,6 +140,31 @@ function initColony(
   colony.rallyPoint        = null;
   colony.digFlowFieldDirty = false;
   colony.foodStored        = STARTING_FOOD;
+
+  // Phase 9 playability: seed each colony with one pre-excavated open entrance
+  // at the colony's start column so the forage loop closes on tick 0.
+  // Without this, STARTING_WORKERS foragers can pick up food on the surface
+  // but have no route underground to deposit — colony.foodStored never grows,
+  // the queen starves in a few hundred ticks, and the player cannot recover
+  // until they manually designate + excavate a shaft (which also requires
+  // manually shifting the behavior triangle to allocate diggers, since default
+  // is forage:10 / dig:0 / fight:0). The starting entrance is the minimum
+  // thing that makes the prototype playable out of the box. Aligns with the
+  // Phase 8 Stabilization Memo item #4 ("expose a more legible initial
+  // entrance/opening state").
+  const underground = world.undergroundGrids[colonyId];
+  if (underground) {
+    colony.entrances.push({
+      entranceId:   allocateEntityId(world),
+      surfaceTileX: startX,
+      surfaceTileY: startY,
+      isOpen:       true,
+    });
+    // Pre-excavate the shaft (underground tiles at the entrance column).
+    for (let sy = 0; sy < ENTRANCE_SHAFT_DEPTH; sy++) {
+      ugSet(underground, startX, sy, UndergroundTileState.Open);
+    }
+  }
 
   // Create STARTING_WORKERS workers at same tile as queen (PRD §6a step 7)
   for (let w = 0; w < STARTING_WORKERS; w++) {

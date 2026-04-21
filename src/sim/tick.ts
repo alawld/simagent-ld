@@ -42,6 +42,8 @@ import {
   tickPheromoneDeposit,
   tickAntMovement,
   tickDigExecution,
+  tickForagerActions,
+  tickSearchLeash,
   routeForagerPriority,
   updateFightAntTargets,
 } from './ant/ant-system.js';
@@ -56,6 +58,7 @@ import { ugGet, ugSet, UndergroundTileState } from './terrain.js';
 import { CHAMBER_DIMENSIONS } from './colony/chamber.js';
 import type { PendingChamber } from './colony/chamber.js';
 import type { ColonyId } from './colony/colony-store.js';
+import type { FoodPileId } from './food.js';
 
 // ---------------------------------------------------------------------------
 // Module-level scratch state — persists across ticks, not part of WorldState.
@@ -83,6 +86,7 @@ void (undefined as unknown as PendingChamber);
  *  7.  Lifecycle transitions
  *  8.  Behavior allocation (re-run per colony after lifecycle changes)
  *  9.  Recompute dig flow-fields for colonies with dirty flag (NEW in Phase 7)
+ *  9b. tickSearchLeash — release over-leashed SearchingFood ants (NEW in Phase 9, 09 memo)
  * 10.  Task assignment:
  *       10a. existing Phase 6 idle-reassignment
  *       10b. tickDigExecution — dig-worker state machine (Marked→BeingDug→Open) (NEW in Phase 7)
@@ -93,6 +97,7 @@ void (undefined as unknown as PendingChamber);
  * 14.  Pheromone deposit
  * 15.  Pheromone decay
  * 16.  Movement (zone-aware, extended in Phase 7 with DigFlowFields for pure direction reads)
+ * 16b. tickForagerActions — forager pickup (surface) + deposit (underground) (Phase 9 playability fix)
  * 17.  detectAndResolveCombat (NEW in Phase 9 / CMBT-04)
  * 18.  checkQueenDeath — game-over detection (NEW in Phase 9 / CMBT-06/07)
  * 19.  rngState writeback + world.tick increment
@@ -154,13 +159,24 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         break;
       }
       case 'MarkFoodPile': {
-        // PRD §3d — toggle isMarkedPriority on the matching food pile.
+        // PRD §3d — set the issuing colony's priority food target, or clear it
+        // if the player clicked the same pile that is already the active
+        // target (re-click toggles off). Exclusive per colony: selecting a
+        // different pile replaces the previous target — this is the
+        // "redirect" semantics the player expects, not an additive flag.
+        const colony = world.colonies[cmd.colonyId];
+        if (!colony) break;
+        let matched: FoodPileId | null = null;
         for (const pile of world.foodPiles) {
           if (pile.tileX === cmd.tileX && pile.tileY === cmd.tileY) {
-            pile.isMarkedPriority = !pile.isMarkedPriority;
+            matched = pile.foodPileId;
             break;
           }
         }
+        if (matched === null) break;
+        colony.priorityFoodPileId = (colony.priorityFoodPileId === matched)
+          ? null
+          : matched;
         break;
       }
       case 'CancelDigMark': {
@@ -410,6 +426,13 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   }
 
   // ---------------------------------------------------------------------------
+  // Step 9b: 09 digger-reassignment memo — SearchingFood leash.
+  // Release surface SearchingFood ants whose Manhattan distance from their
+  // nearest own-colony entrance exceeds the current wave radius. Runs BEFORE
+  // step 10a so demoted ants are re-evaluated the same tick under the current
+  // computedAllocation (fast triangle responsiveness).
+  tickSearchLeash(world);
+
   // Step 10: assignWorkerTasks
   //   10a: existing Phase 6 idle-reassignment (unchanged body from Phase 6 tick.ts step 9)
   //   10b: Phase 7 dig-worker state machine (claim + excavation countdown)
@@ -558,6 +581,14 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   //          Pure movement — no dig state transitions here (those ran at step 10b).
   // ---------------------------------------------------------------------------
   tickAntMovement(world, rng, digFlowFields);
+
+  // ---------------------------------------------------------------------------
+  // Step 16b: Forager arrival actions — pickup (surface) + deposit (underground).
+  //           antPickupFood / antDepositFood were unreachable from tick() in Phase 6;
+  //           this closes the foraging economy loop per PRD §4c / §4d.
+  //           Runs after movement so ants-that-just-arrived this tick act on arrival.
+  // ---------------------------------------------------------------------------
+  tickForagerActions(world);
 
   // ---------------------------------------------------------------------------
   // Step 17: combat detection + resolution (Phase 9 / CMBT-04) — runs after step 16 tickAntMovement.

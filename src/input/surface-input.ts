@@ -220,8 +220,11 @@ export function handleSetRallyPoint(
  *
  * Priority order:
  *   1. If the clicked tile matches the current rally-point tile, push ClearRallyPointCommand.
- *   2. Otherwise, set pendingEntranceTileX/Y for entrance designation preview.
- *      A subsequent left-click on the same tile confirms and pushes DesignateEntranceCommand.
+ *   2. Otherwise, if the tile is a valid entrance target, set pendingEntranceTileX/Y
+ *      for entrance designation preview. A subsequent left-click on the same tile
+ *      confirms and pushes DesignateEntranceCommand.
+ *   3. Invalid entrance tiles (food piles, existing colony entrances, out-of-bounds) do nothing —
+ *      the preview is suppressed so the UI never advertises a target the sim would reject.
  *
  * No-ops if: activeView !== 'surface', pointer over HUD, or tile out of bounds.
  *
@@ -254,7 +257,12 @@ export function handleSurfaceRightClick(
     }
   }
 
-  // Default: entrance designation preview
+  // Entrance preview — only on valid entrance target tiles. The sim rejects
+  // DesignateEntrance on food piles and tiles already occupied by any colony's
+  // entrance; previewing those would advertise a target the sim will silently
+  // drop and mislead the player. Invalid click: do nothing (no preview, no
+  // state change). isEmptySurfaceTile already does the bounds check.
+  if (!isEmptySurfaceTile(world, tileX, tileY)) return;
   state.pendingEntranceTileX = tileX;
   state.pendingEntranceTileY = tileY;
 }

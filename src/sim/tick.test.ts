@@ -393,6 +393,142 @@ describe('Step ordering observable proofs', () => {
     // No idleCount field on ColonyRecord — do NOT assert colony.idleCount
   });
 
+  // Test 13b: 09 digger-reassignment fix — dormant diggers are released to Idle
+  //           and reassigned toward the current allocation within 2 ticks.
+  it('Test 13b (09 digger-reassignment): worker stuck in Digging with no flow field is released and rehomed to Foraging', () => {
+    const colony = world.colonies[colonyId]!;
+    colony.workerCount = 1;
+    colony.eggCount = 0;
+    colony.larvaeCount = 0;
+
+    const wid = allocateEntityId(world);
+    // Pre-state: a Digging worker in MovingToTile. The colony has no underground
+    // grid and no flow field — the sticky-digger root cause from
+    // 09-DIGGER-REASSIGNMENT-BUG.md.
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: 100,
+      posY: 100,
+      task: AntTask.Digging,
+      subTask: 0, // MovingToTile
+    });
+    colony.workers.push(wid);
+
+    // Player has shifted the behavior triangle strongly toward forage.
+    colony.computedAllocation.forage = 1;
+    colony.computedAllocation.dig    = 0;
+    colony.computedAllocation.fight  = 0;
+    colony.computedAllocation.nurse  = 0;
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.dig    = 0;
+    colony.targetRatio.fight  = 0;
+
+    // Tick 1: step 10a sees Digging (not Idle) → skipped. Step 10b tickDigExecution
+    // runs and releases the sticky digger to AntTask.Idle.
+    tick(world, []);
+    expect(world.ants.task[wid]).toBe(AntTask.Idle);
+
+    // Tick 2: step 10a now sees AntTask.Idle → reassigns toward Foraging.
+    tick(world, []);
+    expect(world.ants.task[wid]).toBe(AntTask.Foraging);
+
+    // Census reflects reality.
+    expect(colony.taskCensus.forage).toBe(1);
+    expect(colony.taskCensus.dig).toBe(0);
+  });
+
+  // Test 13c: 09 digger-reassignment memo — sticky SearchingFood forager far
+  //           from the nest is released by step 9b (tickSearchLeash) once the
+  //           colony's taskCensus reflects the over-foraged state and the
+  //           triangle has shifted away from forage. Step 10a then re-homes
+  //           the released worker against the current allocation.
+  it('Test 13c (09 search-leash): over-leashed SearchingFood forager is demoted and re-homed when triangle shifts', () => {
+    const colony = world.colonies[colonyId]!;
+    colony.workerCount = 1;
+    colony.eggCount = 0;
+    colony.larvaeCount = 0;
+    colony.entrances = [{
+      entranceId:   allocateEntityId(world),
+      surfaceTileX: 0,
+      surfaceTileY: 0,
+      isOpen:       true,
+    }];
+    colony.rallyPoint = null;
+    colony.digFlowFieldDirty = false;
+
+    const wid = allocateEntityId(world);
+    // Forager 50 tiles from the entrance — well past the max leash (40).
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: 50 << FP_SHIFT,
+      posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+    });
+    colony.workers.push(wid);
+
+    // Player shifted the triangle: zero forage, all fight. Seed taskCensus
+    // to the over-foraged state so step 9b fires on tick 1 (normally
+    // taskCensus is written by the prior tick's step 10a — we skip that
+    // ramp-up to keep the test focused on the leash gate).
+    colony.computedAllocation.nurse  = 0;
+    colony.computedAllocation.forage = 0;
+    colony.computedAllocation.dig    = 0;
+    colony.computedAllocation.fight  = 1;
+    colony.taskCensus.forage = 1;
+    colony.targetRatio.forage = 0;
+    colony.targetRatio.dig    = 0;
+    colony.targetRatio.fight  = 10;
+
+    tick(world, []);
+
+    // Step 9b releases to Idle → step 10a (same tick) re-homes to Fighting.
+    expect(world.ants.task[wid]).toBe(AntTask.Fighting);
+    expect(colony.taskCensus.forage).toBe(0);
+    expect(colony.taskCensus.fight).toBe(1);
+    // Wave counter bumped once (0 → 1) by the demotion.
+    expect(world.ants.searchWave[wid]).toBe(1);
+  });
+
+  // Test 13d: 09 digger-reassignment memo — CarryingFood forager is NEVER
+  //           interrupted by the search leash, even when deep in the wilderness.
+  it('Test 13d (09 search-leash): CarryingFood forager is not demoted by leash', () => {
+    const colony = world.colonies[colonyId]!;
+    colony.workerCount = 1;
+    colony.eggCount = 0;
+    colony.larvaeCount = 0;
+    colony.entrances = [{
+      entranceId:   allocateEntityId(world),
+      surfaceTileX: 0,
+      surfaceTileY: 0,
+      isOpen:       true,
+    }];
+    colony.rallyPoint = null;
+    colony.digFlowFieldDirty = false;
+
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: 100 << FP_SHIFT,
+      posY: 0,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.CarryingFood,
+    });
+    world.ants.foodCarrying[wid] = 256;
+    colony.workers.push(wid);
+
+    colony.computedAllocation.nurse  = 0;
+    colony.computedAllocation.forage = 0;
+    colony.computedAllocation.dig    = 0;
+    colony.computedAllocation.fight  = 1;
+
+    tick(world, []);
+
+    // Still Foraging+CarryingFood — the deposit cycle completes on its own.
+    expect(world.ants.task[wid]).toBe(AntTask.Foraging);
+    expect(world.ants.subTask[wid]).toBe(ForagingSubState.CarryingFood);
+  });
+
   // Test 14: Mid-action ants are NOT force-interrupted (PRD §7c "No forced interruption")
   it('Test 14: mid-cycle CarryingFood ant is NOT reassigned even when allocation wants diggers', () => {
     const colony = world.colonies[colonyId]!;
@@ -437,8 +573,17 @@ describe('Step ordering observable proofs', () => {
       const colony = w.colonies[1]!;
       colony.workerCount = 10;
       // Add 9 eggs (age=0, will not hatch in 1 tick; EGG_HATCH_TICKS=1200).
-      // allocateWorkers(10, 9, {forage:0,dig:4,fight:3}) => nurse=(9/3)|0=3, available=7,
-      // dig=(7*4/7)|0=4, fight=(7*3/7)|0=3, forage=0, rem=0 → {nurse:3,forage:0,dig:4,fight:3}
+      // allocateWorkers(10, 9, {forage:4,dig:0,fight:3}) => nurse=(9/3)|0=3, available=7,
+      // forage=(7*4/7)|0=4, fight=(7*3/7)|0=3, dig=0 → {nurse:3,forage:4,dig:0,fight:3}.
+      //
+      // Note: before the 09 digger-reassignment fix this test used dig:4 in the
+      // target ratio. That worked only because the old sticky-digger behavior
+      // kept released workers classified as Digging even though this world has
+      // no undergroundGrid / no flow field. With the fix, those workers are
+      // honestly released back to Idle (see ant-system.ts tickDigExecution).
+      // The rule the test exercises — step 10a reassigns ALL Idle workers up
+      // to the computedAllocation, no Idle residue — is unchanged; we just use
+      // a ratio that doesn't depend on dig-work the test never set up.
       for (let e = 0; e < 9; e++) {
         const eid = allocateEntityId(w);
         initAnt(w.ants, eid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
@@ -454,10 +599,9 @@ describe('Step ordering observable proofs', () => {
         colony.workers.push(wid);
       }
 
-      // targetRatio that produces {nurse:3, forage:0, dig:4, fight:3} via allocateWorkers(10, 9, ratio).
-      // Step 8 re-runs allocateWorkers using this ratio; result must match expected census.
-      colony.targetRatio.forage = 0;
-      colony.targetRatio.dig    = 4;
+      // targetRatio that produces {nurse:3, forage:4, dig:0, fight:3} via allocateWorkers(10, 9, ratio).
+      colony.targetRatio.forage = 4;
+      colony.targetRatio.dig    = 0;
       colony.targetRatio.fight  = 3;
 
       tick(w, []);
@@ -471,8 +615,8 @@ describe('Step ordering observable proofs', () => {
       // Sum bound — all 10 ants assigned; no Idle residue
       expect(tc.forage + tc.dig + tc.fight + tc.nurse).toBe(10);
       // Census matches computedAllocation under full-reassignment (forage→dig→fight→nurse order)
-      expect(tc.forage).toBe(0);
-      expect(tc.dig).toBe(4);
+      expect(tc.forage).toBe(4);
+      expect(tc.dig).toBe(0);
       expect(tc.fight).toBe(3);
       expect(tc.nurse).toBe(3);
       // No Idle residue
@@ -854,17 +998,47 @@ describe('Phase 7: MarkDigTile command processing', () => {
     expect(ugGet(underground, 7, 7)).toBe(UndergroundTileState.BeingDug);
   });
 
-  // Test P7-6: MarkFoodPile toggles isMarkedPriority on matching food pile
-  it('Test P7-6: MarkFoodPile toggles isMarkedPriority on matching pile', () => {
+  // Test P7-6: MarkFoodPile sets colony.priorityFoodPileId and re-clicking the same pile clears it
+  it('Test P7-6: MarkFoodPile sets colony priority on first click, clears on second (toggle off)', () => {
     const { world, colonyId } = makeWorldWithUnderground();
-    const pile: FoodPile = { foodPileId: 0, tileX: 20, tileY: 30, isMarkedPriority: false };
+    const pile: FoodPile = { foodPileId: 0, tileX: 20, tileY: 30 };
     world.foodPiles.push(pile);
+    const colony = world.colonies[colonyId]!;
+    expect(colony.priorityFoodPileId).toBeNull();
     const cmd: SimCommand = { type: 'MarkFoodPile', colonyId, tileX: 20, tileY: 30, issuedAtTick: 0 };
     tick(world, [cmd]);
-    expect(world.foodPiles[0]!.isMarkedPriority).toBe(true);
-    // Toggle again
+    expect(colony.priorityFoodPileId).toBe(0);
+    // Toggle-off on re-click of the same pile.
     tick(world, [cmd]);
-    expect(world.foodPiles[0]!.isMarkedPriority).toBe(false);
+    expect(colony.priorityFoodPileId).toBeNull();
+  });
+
+  // Phase 9: selecting a different pile is an EXCLUSIVE redirect, not an additive mark.
+  it('MarkFoodPile redirect: clicking a second pile replaces the first (exclusive per colony)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    world.foodPiles.push({ foodPileId: 0, tileX: 20, tileY: 30 });
+    world.foodPiles.push({ foodPileId: 1, tileX: 40, tileY: 50 });
+    const colony = world.colonies[colonyId]!;
+    tick(world, [{ type: 'MarkFoodPile', colonyId, tileX: 20, tileY: 30, issuedAtTick: 0 }]);
+    expect(colony.priorityFoodPileId).toBe(0);
+    tick(world, [{ type: 'MarkFoodPile', colonyId, tileX: 40, tileY: 50, issuedAtTick: 0 }]);
+    expect(colony.priorityFoodPileId).toBe(1);
+  });
+
+  // Phase 9 cross-colony isolation: colony A marking a pile does NOT mark it for colony B.
+  it('MarkFoodPile is per-colony: marking in colony A leaves colony B unchanged', () => {
+    const { world, colonyId: colonyA } = makeWorldWithUnderground();
+    // Add a second colony in the same world.
+    const colonyB = colonyA + 1;
+    world.colonies[colonyB] = {
+      ...world.colonies[colonyA]!,
+      colonyId: colonyB,
+      priorityFoodPileId: null,
+    };
+    world.foodPiles.push({ foodPileId: 7, tileX: 10, tileY: 10 });
+    tick(world, [{ type: 'MarkFoodPile', colonyId: colonyA, tileX: 10, tileY: 10, issuedAtTick: 0 }]);
+    expect(world.colonies[colonyA]!.priorityFoodPileId).toBe(7);
+    expect(world.colonies[colonyB]!.priorityFoodPileId).toBeNull();
   });
 
   // Test P7-7: PlaceChamber creates PendingChamber with correct dimensions; footprint tiles marked
@@ -1221,14 +1395,18 @@ describe('Phase 7: Integration tests', () => {
     colony.targetRatio.dig    = 10;
     colony.targetRatio.fight  = 0;
 
-    // Mark a tile close to the colony start (player starts at x=24, y=64 on surface)
-    // Workers start at Underground zone after tickAntMovement moves them in, but for
-    // this test we just verify no crash and tick increments correctly
+    // Mark a tile adjacent to the pre-excavated player shaft (entrance column=24,
+    // shaft Open at underground rows 0..ENTRANCE_SHAFT_DEPTH-1). Picking a
+    // reachable tile is load-bearing after the 09 digger-reassignment fix:
+    // tickDigExecution now releases any dig worker whose underlying flow-field
+    // cell is -2 (unreachable) back to Idle, so marks isolated from the Open
+    // region would leave every worker freshly Idle and break the
+    // `diggingCount > 0` assertion below. (25, 1) is adjacent to Open (24, 1).
     const cmd: SimCommand = {
       type: 'MarkDigTile',
       colonyId,
-      tileX: 30,
-      tileY: 5,
+      tileX: 25,
+      tileY: 1,
       issuedAtTick: 0,
     };
 
@@ -1506,7 +1684,7 @@ describe('Regression: reviewer P1 fixes', () => {
 
   it('DesignateEntrance rejected: food pile at surface tile', () => {
     const { world, colonyId } = makeWorldWithUnderground();
-    world.foodPiles.push({ foodPileId: 0, tileX: 50, tileY: 0, isMarkedPriority: false });
+    world.foodPiles.push({ foodPileId: 0, tileX: 50, tileY: 0 });
     const cmd: SimCommand = {
       type: 'DesignateEntrance', colonyId,
       surfaceTileX: 50, surfaceTileY: 0, issuedAtTick: 0,

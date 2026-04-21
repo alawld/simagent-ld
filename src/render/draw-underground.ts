@@ -14,7 +14,7 @@ export type { GfxLike } from './draw-surface.js';
 import type { GfxLike } from './draw-surface.js';
 import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import { isAlive } from '../sim/ant/ant-store.js';
-import { FP_SHIFT } from '../sim/fixed.js';
+import { FP_SHIFT, FP_ONE } from '../sim/fixed.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import { ChamberType } from '../sim/enums.js';
 import { CHAMBER_DIMENSIONS } from '../sim/colony/chamber.js';
@@ -30,7 +30,6 @@ import {
   COLOR_CHAMBER_NURSERY,
   COLOR_CHAMBER_FOOD_STORAGE,
   COLOR_PLAYER_COLONY,
-  COLOR_ENEMY_COLONY,
   COLOR_QUEEN_OUTLINE,
   COLOR_ANT_EGG,
   COLOR_ANT_LARVAE,
@@ -180,17 +179,21 @@ export function drawUndergroundEntities(
     }
   }
 
-  // --- Underground ants (zone === 1) ---
+  // --- Underground ants (zone === 1, player colony only per PRD §7b) ---
   const maxId = curr.ants.alive.length;
   for (let id = 0; id < maxId; id++) {
     if (!isAlive(curr.ants, id)) continue;
     if (curr.ants.zone[id] !== 1) continue; // underground only
+    if (curr.ants.colonyId[id] !== PLAYER_COLONY_ID) continue; // no enemy leak
 
-    // Interpolate: posX = surface X, posY = depth (Pitfall 6)
-    const prevPxX = (prev.ants.posX[id]! >> FP_SHIFT) * TILE_SIZE_PX;
-    const currPxX = (curr.ants.posX[id]! >> FP_SHIFT) * TILE_SIZE_PX;
-    const prevPxY = (prev.ants.posY[id]! >> FP_SHIFT) * TILE_SIZE_PX;
-    const currPxY = (curr.ants.posY[id]! >> FP_SHIFT) * TILE_SIZE_PX;
+    // Interpolate: posX = surface X, posY = depth (Pitfall 6). Multiply BEFORE
+    // dividing so sub-tile precision survives — truncating with `>> FP_SHIFT`
+    // first would snap the ant to its tile's upper-left corner, and it would
+    // appear pinned to the entrance/chamber origin instead of moving through it.
+    const prevPxX = (prev.ants.posX[id]! * TILE_SIZE_PX) / FP_ONE;
+    const currPxX = (curr.ants.posX[id]! * TILE_SIZE_PX) / FP_ONE;
+    const prevPxY = (prev.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
+    const currPxY = (curr.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
 
     const screenX = prevPxX + (currPxX - prevPxX) * alpha - left * TILE_SIZE_PX;
     const screenY = prevPxY + (currPxY - prevPxY) * alpha - top  * TILE_SIZE_PX;
@@ -198,21 +201,17 @@ export function drawUndergroundEntities(
     // Trivial viewport cull
     if (screenX < -TILE_SIZE_PX || screenX > canvasW || screenY < -TILE_SIZE_PX || screenY > canvasH) continue;
 
-    const colonyId = curr.ants.colonyId[id]!;
-    const antColony = curr.colonies[colonyId];
-    const isQueen = antColony !== undefined && id === antColony.queenEntityId;
-
-    const color = colonyId === PLAYER_COLONY_ID ? COLOR_PLAYER_COLONY : COLOR_ENEMY_COLONY;
+    const isQueen = id === colony.queenEntityId;
 
     if (isQueen) {
       // Phase 8.5 readability: larger body + thicker gold ring so the queen
       // is immediately distinguishable from a worker cluster.
-      gfx.fillStyle(color, 1);
+      gfx.fillStyle(COLOR_PLAYER_COLONY, 1);
       gfx.fillRect(screenX - 6, screenY - 6, 12, 12);
       gfx.lineStyle(2, COLOR_QUEEN_OUTLINE, 1);
       gfx.strokeCircle(screenX, screenY, 9);
     } else {
-      gfx.fillStyle(color, 1);
+      gfx.fillStyle(COLOR_PLAYER_COLONY, 1);
       gfx.fillRect(screenX - 3, screenY - 3, 6, 6);
     }
   }

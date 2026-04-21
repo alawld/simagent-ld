@@ -29,15 +29,15 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       expect(s.surface.data.length).toBeGreaterThan(0);
       expect(s.undergroundGrids[String(PLAYER_COLONY_ID)]).toBeDefined();
     });
-    it('serializes all 17 Int32Array ant fields as number[] (NOT "{}")', () => {
+    it('serializes all 18 Int32Array ant fields as number[] (NOT "{}")', () => {
       const w = createScenario(42);
       const s = serializeWorldState(w);
       const fields = ['posX','posY','colonyId','task','subTask','speed','foodCarrying','starvationTimer',
                       'age','alive','lifespan','zone','digTileX','digTileY','digTicksRemaining',
-                      'targetPosX','targetPosY'] as const;
+                      'targetPosX','targetPosY','searchWave'] as const;
       for (const f of fields) {
         expect(Array.isArray(s.ants[f])).toBe(true);
-        expect(s.ants[f].length).toBeGreaterThan(0);
+        expect(s.ants[f]!.length).toBeGreaterThan(0);
       }
     });
     it('serializes every Uint8Array grid .data as number[]', () => {
@@ -75,6 +75,18 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       const s = serializeWorldState(w);
       expect(s.colonies[String(PLAYER_COLONY_ID)]!.rallyPoint).toEqual({ tileX: 10, tileY: 20 });
     });
+    it('preserves ColonyRecord.priorityFoodPileId (Phase 9 / PRD §3d — per-colony priority food target)', () => {
+      const w = createScenario(42);
+      w.colonies[PLAYER_COLONY_ID]!.priorityFoodPileId = 123;
+      const s = serializeWorldState(w);
+      expect(s.colonies[String(PLAYER_COLONY_ID)]!.priorityFoodPileId).toBe(123);
+    });
+    it('preserves ColonyRecord.priorityFoodPileId=null (no active priority target)', () => {
+      const w = createScenario(42);
+      w.colonies[PLAYER_COLONY_ID]!.priorityFoodPileId = null;
+      const s = serializeWorldState(w);
+      expect(s.colonies[String(PLAYER_COLONY_ID)]!.priorityFoodPileId).toBeNull();
+    });
   });
 
   describe('deserializeWorldState — round-trip', () => {
@@ -101,6 +113,47 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       const w2 = deserializeWorldState(serializeWorldState(w));
       expect(w2.commandQueue.length).toBe(1);
       expect(w2.commandQueue[0]).toMatchObject({ type: 'MarkDigTile', tileX: 1, tileY: 2 });
+    });
+    it('round-trips ColonyRecord.priorityFoodPileId through serialize → deserialize (non-null)', () => {
+      // Phase 9 regression guard: the priority food target lives on ColonyRecord
+      // (moved off the shared FoodPile record). If this field is omitted from
+      // the save envelope, Continue/autosave silently drops the player's
+      // selected food target.
+      const w = createScenario(42);
+      const pileId = w.foodPiles[0]!.foodPileId;
+      w.colonies[PLAYER_COLONY_ID]!.priorityFoodPileId = pileId;
+      const w2 = deserializeWorldState(serializeWorldState(w));
+      expect(w2.colonies[PLAYER_COLONY_ID]!.priorityFoodPileId).toBe(pileId);
+    });
+    it('round-trips ColonyRecord.priorityFoodPileId=null through serialize → deserialize', () => {
+      const w = createScenario(42);
+      w.colonies[PLAYER_COLONY_ID]!.priorityFoodPileId = null;
+      const w2 = deserializeWorldState(serializeWorldState(w));
+      expect(w2.colonies[PLAYER_COLONY_ID]!.priorityFoodPileId).toBeNull();
+    });
+    it('round-trips non-zero ants.searchWave through serialize → deserialize (Phase 9 / 09 digger-reassignment memo)', () => {
+      // Regression guard: if searchWave is dropped, Continue/autosave silently
+      // resets all foragers to base wave 0, changing post-load leash behavior
+      // vs. the pre-save session.
+      const w = createScenario(42);
+      w.ants.searchWave[0] = 3; // MAX wave
+      w.ants.searchWave[1] = 1;
+      w.ants.searchWave[2] = 2;
+      const w2 = deserializeWorldState(serializeWorldState(w));
+      expect(w2.ants.searchWave[0]).toBe(3);
+      expect(w2.ants.searchWave[1]).toBe(1);
+      expect(w2.ants.searchWave[2]).toBe(2);
+    });
+    it('pre-Phase-9 saves (searchWave absent) deserialize to zero-init wave', () => {
+      // Backward compatibility: a save written before searchWave was added
+      // should not throw on load and should zero-init the field.
+      const w = createScenario(42);
+      const s = serializeWorldState(w);
+      // Simulate an older save that lacked the field.
+      delete (s.ants as { searchWave?: number[] }).searchWave;
+      const w2 = deserializeWorldState(s);
+      expect(w2.ants.searchWave[0]).toBe(0);
+      expect(w2.ants.searchWave[10]).toBe(0);
     });
   });
 

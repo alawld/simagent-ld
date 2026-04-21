@@ -231,3 +231,20 @@ export const CHAMBER_FOOD_WIDTH = 4;
 
 /** Phase 7 PRD §2d — FoodStorage chamber tile height. */
 export const CHAMBER_FOOD_HEIGHT = 3;
+
+// ---------------------------------------------------------------------------
+// Phase 9 SearchingFood leash (09 digger-reassignment memo)
+// ---------------------------------------------------------------------------
+
+/**
+ * Soft-leash radii for SearchingFood foragers, indexed by AntComponents.searchWave.
+ * When a surface SearchingFood ant's Manhattan distance from its nearest own-colony
+ * entrance exceeds its wave's radius, it is demoted to Idle (step 10a re-entry)
+ * and its wave index increments (capped at SEARCH_LEASH_MAX_WAVE). On a successful
+ * food pickup the wave resets to 0. Values per the memo's acceptable design:
+ * base 25 → 30 → 35 → 40. Kept per-ant, not colony-memory.
+ */
+export const SEARCH_LEASH_RADII: readonly number[] = [25, 30, 35, 40];
+
+/** Highest valid index into SEARCH_LEASH_RADII. */
+export const SEARCH_LEASH_MAX_WAVE = SEARCH_LEASH_RADII.length - 1;

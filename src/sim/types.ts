@@ -81,7 +81,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   dst.nextEntityId = src.nextEntityId;
   dst.commandQueue = src.commandQueue.slice(); // small in practice (user-input rate) — PRD §3 accepts this as the only Phase 1 allocation
 
-  // --- AntComponents: 17 TypedArray.set calls (zero allocation) ---
+  // --- AntComponents: 18 TypedArray.set calls (zero allocation) ---
   dst.ants.posX.set(src.ants.posX);
   dst.ants.posY.set(src.ants.posY);
   dst.ants.colonyId.set(src.ants.colonyId);
@@ -100,6 +100,8 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   dst.ants.digTicksRemaining.set(src.ants.digTicksRemaining);
   dst.ants.targetPosX.set(src.ants.targetPosX);
   dst.ants.targetPosY.set(src.ants.targetPosY);
+  // Phase 9 / 09 digger-reassignment memo — per-ant SearchingFood leash wave.
+  dst.ants.searchWave.set(src.ants.searchWave);
 
   // --- colonies: delete stale dst keys; upsert each src colony ---
   // Remove dst colonies that no longer exist in src
@@ -122,6 +124,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
       fresh.rallyPoint        = null;
       fresh.digFlowFieldDirty = false;
       fresh.killCount         = 0;
+      fresh.priorityFoodPileId = null;
     }
     const d = dst.colonies[colonyId]!;
 
@@ -137,6 +140,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
     d.defeated             = s.defeated;
     d.reconcileCountdown   = s.reconcileCountdown;
     d.killCount            = s.killCount;
+    d.priorityFoodPileId   = s.priorityFoodPileId;
 
     // Bucket arrays — reuse via length truncation + index copy (no new array)
     d.eggs.length = s.eggs.length;
