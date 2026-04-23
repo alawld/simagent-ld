@@ -122,7 +122,7 @@ function buildCrossGridWorld(seed = 1, queenTileX = 5, queenTileY = 5): CrossGri
     posX:     (queenTileX << FP_SHIFT) + (FP_ONE >> 1),
     posY:     (queenTileY << FP_SHIFT) + (FP_ONE >> 1),
     task:     AntTask.Fighting,
-    subTask:  FightingSubState.Attacking,
+    subTask:  FightingSubState.Engaging,
     speed:    WORKER_BASE_SPEED,
     lifespan: WORKER_LIFESPAN_TICKS,
     zone:     Zone.Underground,
