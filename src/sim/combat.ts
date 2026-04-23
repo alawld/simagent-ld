@@ -34,7 +34,16 @@ export function detectAndResolveCombat(world: WorldState): void {
     if (ants.colonyId[i] === 0) continue;
     const tileX = ants.posX[i]! >> FP_SHIFT;
     const tileY = ants.posY[i]! >> FP_SHIFT;
-    const key = makeTileKey(ants.zone[i] as unknown as Zone, tileX, tileY);
+    // Phase 09.1 Chunk 4: pass currentGridColonyId so underground ants in
+    // different grids at the same (tileX, tileY) bucket separately. makeTileKey
+    // internally zeroes the gridByte for Surface, so passing this
+    // unconditionally is safe and preserves surface bucketing byte-for-byte.
+    const key = makeTileKey(
+      ants.zone[i] as unknown as Zone,
+      tileX,
+      tileY,
+      ants.currentGridColonyId[i] as ColonyId,
+    );
     const slot = bucket.get(key);
     if (slot === undefined) bucket.set(key, [i]);
     else slot.push(i);
