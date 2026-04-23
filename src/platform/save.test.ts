@@ -8,7 +8,7 @@ import {
 } from './save.js';
 import { createScenario } from '../sim/scenario.js';
 import { tick } from '../sim/tick.js';
-import { PLAYER_COLONY_ID } from '../sim/constants.js';
+import { PLAYER_COLONY_ID, ENEMY_COLONY_ID } from '../sim/constants.js';
 import type { SimCommand } from '../sim/commands.js';
 import type { ColonyId } from '../sim/colony/colony-store.js';
 
@@ -154,6 +154,64 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       const w2 = deserializeWorldState(s);
       expect(w2.ants.searchWave[0]).toBe(0);
       expect(w2.ants.searchWave[10]).toBe(0);
+    });
+    it('round-trips ants.currentGridColonyId through serialize → deserialize (Phase 09.1 Chunk 0 grid-of-occupancy)', () => {
+      // Regression guard for the phase 09.1 verification gap: if
+      // currentGridColonyId is dropped from the save envelope, every loaded
+      // ant's grid byte zeros out. Enemy ants (colonyId=ENEMY_COLONY_ID=2)
+      // would then silently target the player's underground grid on every
+      // lookup, and a Fighter invader mid-attack (currentGridColonyId !=
+      // colonyId) would snap back to its home grid on load. Cover all three
+      // shapes: normal player ant, normal enemy ant, and invader.
+      const w = createScenario(42);
+      // createScenario already spawns ants in both colonies via initAnt, which
+      // sets currentGridColonyId === colonyId. Confirm the precondition by
+      // picking two alive ants from the scenario.
+      const playerQueen = w.colonies[PLAYER_COLONY_ID]!.queenEntityId;
+      const enemyQueen  = w.colonies[ENEMY_COLONY_ID]!.queenEntityId;
+      expect(w.ants.alive[playerQueen]).toBe(1);
+      expect(w.ants.alive[enemyQueen]).toBe(1);
+      expect(w.ants.colonyId[playerQueen]).toBe(PLAYER_COLONY_ID);
+      expect(w.ants.colonyId[enemyQueen]).toBe(ENEMY_COLONY_ID);
+      expect(w.ants.currentGridColonyId[playerQueen]).toBe(PLAYER_COLONY_ID);
+      expect(w.ants.currentGridColonyId[enemyQueen]).toBe(ENEMY_COLONY_ID);
+      // Synthesize a Fighter invader: a player-owned ant whose grid byte
+      // points at the enemy grid (simulating the mid-invasion state Chunks
+      // 3+4 of 09.1 will produce at runtime).
+      const playerInvader = w.colonies[PLAYER_COLONY_ID]!.workers[0]!;
+      expect(w.ants.alive[playerInvader]).toBe(1);
+      expect(w.ants.colonyId[playerInvader]).toBe(PLAYER_COLONY_ID);
+      w.ants.currentGridColonyId[playerInvader] = ENEMY_COLONY_ID;
+
+      const s1 = JSON.stringify(serializeWorldState(w));
+      const w2 = deserializeWorldState(JSON.parse(s1));
+
+      // Alive ants: grid byte survives the round-trip untouched.
+      expect(w2.ants.currentGridColonyId[playerQueen]).toBe(PLAYER_COLONY_ID);
+      expect(w2.ants.currentGridColonyId[enemyQueen]).toBe(ENEMY_COLONY_ID);
+      expect(w2.ants.currentGridColonyId[playerInvader]).toBe(ENEMY_COLONY_ID);
+    });
+    it('pre-Phase-09.1 saves (currentGridColonyId absent) deserialize with currentGridColonyId === colonyId (initAnt invariant)', () => {
+      // Backward compatibility: a save written before Phase 09.1 Chunk 0
+      // landed lacks the currentGridColonyId field. Every ant in such a save
+      // must load with currentGridColonyId === colonyId — exactly the
+      // invariant initAnt establishes for fresh ants (no Fighter invaders
+      // existed before Chunks 3+4). A naive zero-fill would silently route
+      // every enemy ant's grid lookup at the player's underground grid.
+      const w = createScenario(42);
+      const s = serializeWorldState(w);
+      // Simulate an older save that lacked the field.
+      delete (s.ants as { currentGridColonyId?: number[] }).currentGridColonyId;
+      const w2 = deserializeWorldState(s);
+      const playerQueen = w.colonies[PLAYER_COLONY_ID]!.queenEntityId;
+      const enemyQueen  = w.colonies[ENEMY_COLONY_ID]!.queenEntityId;
+      expect(w2.ants.currentGridColonyId[playerQueen]).toBe(PLAYER_COLONY_ID);
+      expect(w2.ants.currentGridColonyId[enemyQueen]).toBe(ENEMY_COLONY_ID);
+      // Spot-check a worker in each colony too.
+      const playerWorker = w.colonies[PLAYER_COLONY_ID]!.workers[0]!;
+      const enemyWorker  = w.colonies[ENEMY_COLONY_ID]!.workers[0]!;
+      expect(w2.ants.currentGridColonyId[playerWorker]).toBe(PLAYER_COLONY_ID);
+      expect(w2.ants.currentGridColonyId[enemyWorker]).toBe(ENEMY_COLONY_ID);
     });
   });
 
