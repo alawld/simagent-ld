@@ -640,6 +640,56 @@ describe('drawSurfaceEntities — rally-point marker', () => {
     drawSurfaceEntities(gfx, sprites, world, world, 0, cam);
     expect(rallyRects(gfx).length).toBe(0);
   });
+
+  // Phase 09.1-05 Task 1: structural regression guard. The fight-target marker
+  // is the only in-game signal that connects the player's Fight rally click to
+  // a visible tile. A silent deletion during a future refactor (e.g. the rally
+  // block being accidentally commented out while editing the surrounding
+  // pending-entrance preview) would not be caught by tests that only assert
+  // "at least one rect was drawn" because other debug overlays could
+  // incidentally produce white fillRects. This test locks in the three-rect
+  // crosshair composition (horizontal bar + vertical bar + center accent) so
+  // any reduction below three COLOR_RALLY_POINT rects fails loudly.
+  it('renders the full crosshair composition: exactly 3 white rally rects (H-bar + V-bar + center accent)', () => {
+    addPlayerColony({ tileX: 5, tileY: 5 });
+    const cam = makeCamera(5, 5, 20, 20);
+    drawSurfaceEntities(gfx, sprites, world, world, 0, cam);
+    const rects = rallyRects(gfx);
+    expect(rects.length).toBe(3);
+
+    // Derive expected pixel coords for the marker's tile.
+    const left = Math.floor(cam.x - cam.viewportWidth  / 2);
+    const top  = Math.floor(cam.y - cam.viewportHeight / 2);
+    const sx = (5 - left) * TILE_SIZE_PX;
+    const sy = (5 - top)  * TILE_SIZE_PX;
+
+    // Horizontal bar: full-tile-width minus edges, 2-px thick, centered vertically.
+    const hBar = rects.find(r =>
+      r.args[0] === sx + 1 &&
+      r.args[1] === sy + 7 &&
+      r.args[2] === TILE_SIZE_PX - 2 &&
+      r.args[3] === 2,
+    );
+    expect(hBar).toBeDefined();
+
+    // Vertical bar: 2-px wide, full-tile-height minus edges, centered horizontally.
+    const vBar = rects.find(r =>
+      r.args[0] === sx + 7 &&
+      r.args[1] === sy + 1 &&
+      r.args[2] === 2 &&
+      r.args[3] === TILE_SIZE_PX - 2,
+    );
+    expect(vBar).toBeDefined();
+
+    // Center accent: 4×4 square at tile center — required for pop against busy terrain.
+    const accent = rects.find(r =>
+      r.args[0] === sx + 6 &&
+      r.args[1] === sy + 6 &&
+      r.args[2] === 4 &&
+      r.args[3] === 4,
+    );
+    expect(accent).toBeDefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
