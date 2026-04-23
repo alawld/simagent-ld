@@ -160,6 +160,79 @@ describe('invasion-routing — Fighting ant descent-intent gate (REQ-C3)', () =>
     expect(world.ants.currentGridColonyId[playerAntId]).toBe(ENEMY_COLONY_ID);
   });
 
+  it('REQ-C3a extension: Fighting ant inside foreign grid steps TOWARD nearest hostile (Manhattan)', () => {
+    // Strengthened positive test (Task 3): after descent, a Fighter inside
+    // the enemy underground grid should consume pickNearestHostileUnderground
+    // for target selection and its Manhattan distance to the target should
+    // DECREASE across a few more ticks. We don't assert reaching — combat
+    // resolution is Chunk 4's concern.
+    const { world, playerAntId } = buildInvasionWorld();
+    world.ants.task[playerAntId] = AntTask.Fighting;
+
+    // Place an enemy "hostile" ant underground in the enemy grid, a few
+    // tiles away from the entrance column so the player invader must step
+    // toward it after descent. Uses the same minimal-spawn pattern as
+    // buildInvasionWorld but for an ENEMY_COLONY_ID ant.
+    const hostileTileX = ENEMY_START_X + 3; // 3 tiles east of shaft column
+    const hostileTileY = 5; // 5 tiles below surface
+    const hostileId = allocateEntityId(world);
+    initAnt(world.ants, hostileId, {
+      colonyId: ENEMY_COLONY_ID,
+      posX:     (hostileTileX << FP_SHIFT) + (FP_ONE >> 1),
+      posY:     (hostileTileY << FP_SHIFT) + (FP_ONE >> 1),
+      task:     AntTask.Idle,
+      subTask:  0,
+      speed:    0, // pin hostile in place so distance-decrease is unambiguous
+      zone:     Zone.Underground,
+    });
+    world.ants.currentGridColonyId[hostileId] = ENEMY_COLONY_ID;
+    world.colonies[ENEMY_COLONY_ID]!.workers.push(hostileId);
+    world.colonies[ENEMY_COLONY_ID]!.workerCount += 1;
+    // Carve an OPEN rectangle (shaft..hostileX, 0..hostileTileY) so the
+    // invader's greedy-Manhattan stepper can reach the hostile regardless of
+    // axis-selection ties. A thin L-corridor would leave the invader stuck at
+    // the elbow when |rawDx|===|rawDy| flips preference to the blocked axis
+    // (canEnterUndergroundTile reverts the step on Solid tiles, which
+    // effectively pins the ant). A rectangular carve guarantees at least one
+    // of {east, south} is always Open for every intermediate tile.
+    const enemyGrid = world.undergroundGrids[ENEMY_COLONY_ID]!;
+    for (let y = 0; y <= hostileTileY; y++) {
+      for (let x = ENEMY_START_X; x <= hostileTileX; x++) {
+        ugSet(enemyGrid, x, y, UndergroundTileState.Open);
+      }
+    }
+
+    // Descend the invader first (no pre-check on hostile distance yet —
+    // descent-phase doesn't apply hostile targeting).
+    tickN(world, DESCENT_TICKS);
+
+    // Precondition for the targeting phase: invader is underground in the
+    // enemy grid, hostile is alive and reachable. If these fail, the
+    // test harness broke — not the targeting gate.
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Underground);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(ENEMY_COLONY_ID);
+    expect(world.ants.alive[hostileId]).toBe(1);
+    expect(world.ants.zone[hostileId]).toBe(Zone.Underground);
+
+    // Distance at the start of the targeting phase.
+    const d0 = Math.abs(tileXOf(world, playerAntId) - hostileTileX)
+             + Math.abs(tileYOf(world, playerAntId) - hostileTileY);
+
+    // Tick forward enough for a visible approach. At WORKER_BASE_SPEED the
+    // invader moves ~0.5 tiles/tick along the chosen axis, so 10 ticks
+    // gives roughly 5 tiles of motion — enough to close the initial
+    // Manhattan gap which is at most ~10 tiles (shaft→hostile).
+    tickN(world, 10);
+
+    const dN = Math.abs(tileXOf(world, playerAntId) - hostileTileX)
+             + Math.abs(tileYOf(world, playerAntId) - hostileTileY);
+
+    // MANDATORY outcome assertions — invader moved toward the hostile.
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Underground);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(ENEMY_COLONY_ID);
+    expect(dN).toBeLessThan(d0); // distance strictly decreased
+  });
+
   it('REQ-C3b: Fighting ant does NOT descend through CLOSED enemy entrance', () => {
     const { world, playerAntId, enemyEntTileX, enemyEntTileY } = buildInvasionWorld();
     world.ants.task[playerAntId] = AntTask.Fighting;

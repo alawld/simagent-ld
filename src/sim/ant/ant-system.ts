@@ -2206,9 +2206,17 @@ export function tickAntMovement(
         // Zone.Underground — underground carriers compute an entrance target
         // whether or not a FoodStorage chamber exists, so the chamber-flow
         // unreachable failsafe has a fallback ready.
+        //
+        // Phase 09.1 Chunk 3 — Fighting ants in a FOREIGN grid are invaders,
+        // not exfiltrating. They target hostiles via pickNearestHostileUnderground
+        // in the Fighting branch below, NOT the own-colony entrance. Only
+        // Fighters in their OWN grid (the normal surface→underground Fighter
+        // path, or a returning invader who exited and re-entered home) route
+        // toward the own-colony entrance here.
+        const inOwnGrid = ants.currentGridColonyId[id] === ants.colonyId[id];
         needsTransition =
           (task === AntTask.Foraging && foodCarrying === 0) ||
-          task === AntTask.Fighting ||
+          (task === AntTask.Fighting && inOwnGrid) ||
           (task === AntTask.Foraging && foodCarrying > 0);
       }
 
@@ -2456,13 +2464,48 @@ export function tickAntMovement(
       // fighters computed entranceTargetX via needsTransition above and were
       // handled by the entrance branch — they only reach this branch after
       // transitioning to the surface, when targetPosX/Y now holds the rally.
+      //
+      // Phase 09.1 Chunk 3 — a Fighter in a FOREIGN underground grid (an
+      // invader) skips the entrance-routing path above (needsTransition is
+      // false for them) and arrives here. They have no rally-targetPosX/Y
+      // that is meaningful to navigate the enemy grid (updateFightAntTargets
+      // writes their OWN colony's rally/entrance, which is surface-side).
+      // Substitute a Manhattan nearest-hostile step via
+      // pickNearestHostileUnderground while a proper fight-flow-field is
+      // deferred to Chunk 5. Null-target fallback: idle in place (Option A
+      // per plan 09.1-03 task 3 — simplest, deterministic, no magic numbers).
       const posX = ants.posX[id]!;
       const posY = ants.posY[id]!;
-      const targetX = ants.targetPosX[id]!;
-      const targetY = ants.targetPosY[id]!;
-      if (targetX !== -1 && targetY !== -1) {
-        const rawDx = targetX - posX;
-        const rawDy = targetY - posY;
+
+      const gridColonyId = ants.currentGridColonyId[id]!;
+      const ownColonyId = ants.colonyId[id]!;
+      const isForeignGridUnderground =
+        zone === Zone.Underground && gridColonyId !== ownColonyId;
+
+      let rawDx = 0;
+      let rawDy = 0;
+      let haveTarget = false;
+
+      if (isForeignGridUnderground) {
+        const hostile = pickNearestHostileUnderground(ants, id, gridColonyId);
+        if (hostile !== null) {
+          rawDx = hostile.targetX - posX;
+          rawDy = hostile.targetY - posY;
+          haveTarget = true;
+        }
+        // hostile === null → idle fallback: dx=dy=0 (haveTarget stays false,
+        // axis-step block below leaves dx/dy at their defaults of 0).
+      } else {
+        const targetX = ants.targetPosX[id]!;
+        const targetY = ants.targetPosY[id]!;
+        if (targetX !== -1 && targetY !== -1) {
+          rawDx = targetX - posX;
+          rawDy = targetY - posY;
+          haveTarget = true;
+        }
+      }
+
+      if (haveTarget) {
         if (Math.abs(rawDx) >= Math.abs(rawDy)) {
           dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
           dy = 0;
@@ -2473,7 +2516,8 @@ export function tickAntMovement(
       } else {
         // No target and no entrance fallback — hold. updateFightAntTargets
         // writes targetPosX/Y whenever rallyPoint or entrances exist, so this
-        // is only reached when a fighter has neither rally nor entrance.
+        // is only reached when a fighter has neither rally nor entrance
+        // (or a foreign-grid invader with no underground hostiles yet).
         dx = 0;
         dy = 0;
       }
