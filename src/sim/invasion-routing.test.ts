@@ -37,7 +37,7 @@ import { tick } from './tick.js';
 import { allocateEntityId } from './types.js';
 import { initAnt } from './ant/ant-store.js';
 import { AntTask } from './enums.js';
-import { Zone } from './terrain.js';
+import { Zone, UndergroundTileState, ugSet } from './terrain.js';
 import { FP_SHIFT, FP_ONE } from './fixed.js';
 import {
   PLAYER_COLONY_ID,
@@ -165,6 +165,14 @@ describe('invasion-routing — Fighting ant descent-intent gate (REQ-C3)', () =>
     world.ants.task[playerAntId] = AntTask.Fighting;
     const entrance = enemyEntrance(world);
     entrance.isOpen = false; // KEY: closed entrance
+    // createScenario pre-excavates the shaft (y=0 and y=1 at entrance column)
+    // so entrance.isOpen=true on tick 0. checkEntranceCompletion (step 12)
+    // re-opens the entrance every tick while the shaft stays Open. Revert
+    // the shaft to Solid so the closed-entrance scenario is actually stable
+    // across all DESCENT_TICKS.
+    const enemyGrid = world.undergroundGrids[ENEMY_COLONY_ID]!;
+    ugSet(enemyGrid, entrance.surfaceTileX, 0, UndergroundTileState.Solid);
+    ugSet(enemyGrid, entrance.surfaceTileX, 1, UndergroundTileState.Solid);
 
     // MANDATORY t=0 precondition assertions -----------------------------------
     // Prevents a false green from wrong setup (ant not at tile, or entrance

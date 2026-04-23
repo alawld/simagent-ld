@@ -30,6 +30,7 @@
 // world.nextEntityId is the upper bound for entity iteration; alive=0 slots are skipped.
 
 import type { WorldState } from '../types.js';
+import type { AntComponents } from './ant-store.js';
 import type { ColonyRecord } from '../colony/colony-store.js';
 import { colonyFoodCapacity, hasCompletedChamber } from '../colony/colony-system.js';
 import { AntTask, ForagingSubState, DiggingSubState, NursingSubState, ChamberType, PheromoneType } from '../enums.js';
@@ -1680,6 +1681,77 @@ export function canEnterUndergroundTile(
 }
 
 // ---------------------------------------------------------------------------
+// pickNearestHostileUnderground — Phase 09.1 Chunk 3 invasion routing helper
+//
+// Returns the fixed-point target position of the nearest hostile ant that is
+// underground in the given grid (Manhattan distance). A "hostile" is any
+// alive ant whose owning colony differs from the caller's and who currently
+// occupies `gridColonyId` (i.e. is inside the same underground grid).
+//
+// Used by Fighting invaders inside a foreign grid: their own-colony flow
+// fields don't guide them toward the enemy queen, so they substitute a
+// Manhattan nearest-hostile step while the proper fight-flow-field work is
+// deferred to Chunk 5. Returns null if no hostile is present — caller must
+// choose a fallback (idle, wander, retreat, etc.).
+//
+// Pure: reads ants SoA only. No PRNG calls. No wall-clock. Deterministic —
+// iteration order is ascending entity id, ties broken by first-seen (strict
+// `<` comparison preserves the lowest-id candidate on equal distances).
+// ---------------------------------------------------------------------------
+
+/**
+ * Manhattan nearest-hostile underground target selector.
+ *
+ * @param ants           SoA ant component storage.
+ * @param selfId         EntityId of the caller (must be alive and underground).
+ * @param gridColonyId   Underground-grid id the caller occupies
+ *                       (ants.currentGridColonyId[selfId]). Hostiles in OTHER
+ *                       grids are ignored — both the caller and the target
+ *                       must share the same grid-of-occupancy.
+ * @returns              Fixed-point {targetX, targetY} of the nearest hostile,
+ *                       or null if no underground hostile shares the grid.
+ */
+export function pickNearestHostileUnderground(
+  ants: AntComponents,
+  selfId: number,
+  gridColonyId: number,
+): { targetX: number; targetY: number } | null {
+  const selfColony = ants.colonyId[selfId]!;
+  const selfPosX = ants.posX[selfId]!;
+  const selfPosY = ants.posY[selfId]!;
+  const selfTileX = selfPosX >> FP_SHIFT;
+  const selfTileY = selfPosY >> FP_SHIFT;
+
+  let bestPosX = 0;
+  let bestPosY = 0;
+  let bestDist = -1;
+
+  // alive.length is a safe upper bound for iteration. Post-death slots read
+  // alive=0 and are skipped. No allocation inside the loop.
+  for (let id = 0; id < ants.alive.length; id++) {
+    if (ants.alive[id] !== 1) continue;
+    if (id === selfId) continue;
+    if (ants.zone[id] !== Zone.Underground) continue;
+    if (ants.currentGridColonyId[id] !== gridColonyId) continue;
+    if (ants.colonyId[id] === selfColony) continue;
+
+    const theirTileX = ants.posX[id]! >> FP_SHIFT;
+    const theirTileY = ants.posY[id]! >> FP_SHIFT;
+    const dx = theirTileX - selfTileX;
+    const dy = theirTileY - selfTileY;
+    const dist = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+    if (bestDist < 0 || dist < bestDist) {
+      bestDist = dist;
+      bestPosX = ants.posX[id]!;
+      bestPosY = ants.posY[id]!;
+    }
+  }
+
+  if (bestDist < 0) return null;
+  return { targetX: bestPosX, targetY: bestPosY };
+}
+
+// ---------------------------------------------------------------------------
 // P1 queen relocation — Phase 3 chamber behavior.
 //
 // Once a completed Queen chamber exists, the queen routes from her current
@@ -2520,36 +2592,79 @@ export function tickAntMovement(
         }
       }
 
+      // Phase 09.1 Chunk 3 — descent-intent gate (REQ-C3). `needsUnderground`
+      // is the TASK-level filter: tasks that have a reason to descend.
+      // Fighters are included here so an own-colony Fighter standing on its
+      // own open entrance descends (pre-09.1 Fighters had no descent path;
+      // Plan 09.1-03 adds one). Invasion routing (foreign entrance) then
+      // layers on top via the per-entrance descent-intent predicate below.
       const needsUnderground =
         task === AntTask.Digging ||
         task === AntTask.Nursing ||
+        task === AntTask.Fighting ||
         (task === AntTask.Foraging && ants.subTask[id] === ForagingSubState.CarryingFood);
 
       if (needsUnderground) {
         const tileX = posX >> FP_SHIFT;
         const tileY = posY >> FP_SHIFT;
-        const colonyId = ants.colonyId[id]!;
-        const colony = world.colonies[colonyId];
-        if (colony && colony.entrances) {
-          // Phase 9 playability: a Surface Digger passing through its colony's
-          // designated-but-unopened entrance descends to begin shaft excavation.
-          // Non-Diggers still require an open entrance per PRD §5d.
+        const antColonyId = ants.colonyId[id]!;
+
+        // Phase 09.1 Chunk 3 — iterate ALL colonies' entrances, not just the
+        // ant's own colony. Combined with the descent-intent predicate below,
+        // this is what lets player Fighting ants cross colony boundaries
+        // through open enemy entrances (REQ-C3a) while preserving the
+        // existing own-colony descent behavior and rejecting foreign descent
+        // for non-Fighting ants (REQ-C3c).
+        //
+        // Determinism: world.colonies is a Record<ColonyId, ColonyRecord>
+        // iterated via `for...in`; CLNY-08-compliant keyed iteration. Insertion
+        // order is stable (createScenario calls initColony(PLAYER) then
+        // initColony(ENEMY)) and no PRNG calls occur inside the loop.
+        let descended = false;
+        for (const cidKey in world.colonies) {
+          if (descended) break;
+          const colony = world.colonies[cidKey as unknown as keyof typeof world.colonies];
+          if (!colony || !colony.entrances) continue;
+
           for (let e = 0; e < colony.entrances.length; e++) {
             const entrance = colony.entrances[e]!;
-            const canDescend = entrance.isOpen || task === AntTask.Digging;
-            if (canDescend && entrance.surfaceTileX === tileX && entrance.surfaceTileY === tileY) {
-              ants.zone[id] = Zone.Underground;
-              // Phase 09.1 Chunk 0 — the entrance-owning colony dictates which
-              // undergroundGrids[...] this ant now occupies. Today always
-              // colony.colonyId === ants.colonyId[id] (own-colony entrance),
-              // so this is a byte-identical no-op. Chunks 3+4 expand the
-              // descent to cross-colony (Fighter invaders), and at that point
-              // currentGridColonyId will diverge from colonyId. This seam
-              // makes the divergence safe-by-construction.
-              ants.currentGridColonyId[id] = colony.colonyId;
-              ants.posY[id] = 0; // enter at top of underground grid
-              break;
+
+            // Tile match gate: both x and y must match the ant's current tile.
+            if (entrance.surfaceTileX !== tileX || entrance.surfaceTileY !== tileY) continue;
+
+            // Descent-intent predicate (RESEARCH.md §Pattern 3):
+            //   - Own-colony entrance: all tasks in `needsUnderground` descend.
+            //     Closed-but-designated own entrance still accepts a Surface
+            //     Digger (Phase 9 playability carve-out).
+            //   - Foreign entrance: descent ONLY for Fighting, and ONLY if the
+            //     entrance is open. Closed enemy entrance rejects Fighters.
+            //     Foreign Foraging / Digging / Nursing never descend.
+            const isOwnEntrance = colony.colonyId === antColonyId;
+            const isFightingForeigner =
+              task === AntTask.Fighting && !isOwnEntrance && entrance.isOpen;
+
+            if (isOwnEntrance) {
+              // Own-colony descent: digger carve-out (closed entrance OK) or
+              // any other descent-intent task on an open entrance.
+              const canDescend = entrance.isOpen || task === AntTask.Digging;
+              if (!canDescend) continue;
+            } else if (!isFightingForeigner) {
+              // Foreign entrance but not a Fighting invader — descent-intent
+              // gate rejects (REQ-C3c). Non-Fighting foreign ants stay on
+              // the surface.
+              continue;
             }
+
+            // Descent fires. `colony.colonyId` is the entrance-owning colony
+            // and becomes the ant's new grid-of-occupancy (Phase 09.1 Chunk 0
+            // invariant). For own-colony descent this byte-identical; for
+            // Fighting foreigners it diverges from `ants.colonyId[id]`, which
+            // is the precise design intent.
+            ants.zone[id] = Zone.Underground;
+            ants.currentGridColonyId[id] = colony.colonyId;
+            ants.posY[id] = 0; // enter at top of underground grid
+            descended = true;
+            break;
           }
         }
       }
