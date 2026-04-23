@@ -70,6 +70,14 @@ interface SerializedAnts {
   // so an ant one tick post-load cannot be anti-backtracked on its first move.
   searchPrevTileX?: number[];
   searchPrevTileY?: number[];
+  // Phase 09.1 Chunk 0 — grid-of-occupancy byte (Uint8Array on AntComponents,
+  // serialized as number[]). Optional for backward compatibility with saves
+  // written before Phase 09.1 landed: deserializer falls back to copying
+  // `colonyId` into `currentGridColonyId`, reproducing the pre-Chunk-0
+  // invariant (every ant's grid byte equals its colony byte) that initAnt
+  // establishes for fresh ants. A naive zero-fill would silently point every
+  // enemy ant's grid lookup at the player's underground grid.
+  currentGridColonyId?: number[];
 }
 
 interface SerializedColony {
@@ -147,6 +155,10 @@ function serializeAnts(a: AntComponents): SerializedAnts {
     searchHeadingTicks:Array.from(a.searchHeadingTicks),
     searchPrevTileX:   Array.from(a.searchPrevTileX),
     searchPrevTileY:   Array.from(a.searchPrevTileY),
+    // Phase 09.1 Chunk 0 — grid-of-occupancy byte. Array.from works for both
+    // Int32Array and Uint8Array, so the shape is identical to the other
+    // per-ant fields (number[]).
+    currentGridColonyId: Array.from(a.currentGridColonyId),
   };
 }
 
@@ -230,6 +242,13 @@ function copyIntoInt32(dst: Int32Array, src: readonly number[]): void {
   for (let i = 0; i < n; i++) dst[i] = src[i]!;
 }
 
+// Phase 09.1 Chunk 0 — currentGridColonyId is Uint8Array, not Int32Array.
+// Same semantics as copyIntoInt32 (length-clamped, positional copy).
+function copyIntoUint8(dst: Uint8Array, src: readonly number[]): void {
+  const n = src.length < dst.length ? src.length : dst.length;
+  for (let i = 0; i < n; i++) dst[i] = src[i]!;
+}
+
 function deserializeAnts(saved: SerializedAnts, capacity: number): AntComponents {
   const a = createAntComponents(capacity);
   // createAntComponents pre-fills digTileX/digTileY/targetPosX/targetPosY with -1.
@@ -275,6 +294,19 @@ function deserializeAnts(saved: SerializedAnts, capacity: number): AntComponents
   }
   if (saved.searchPrevTileY !== undefined) {
     copyIntoInt32(a.searchPrevTileY, saved.searchPrevTileY);
+  }
+  // Phase 09.1 Chunk 0 — grid-of-occupancy byte. Pre-Chunk-0 saves omit this
+  // field; fall back to copying colonyId into currentGridColonyId, which
+  // reproduces the invariant initAnt establishes for fresh ants
+  // (currentGridColonyId[id] === colonyId[id]). A naive zero-fill would
+  // silently route every enemy ant's grid lookup at the player's underground
+  // grid. Chunks 3+4 of 09.1 are the only code path that breaks this
+  // invariant at runtime (Fighter invaders mid-attack); until a save from
+  // after Chunks 3+4 exists, "absent field" and "identity copy" are equivalent.
+  if (saved.currentGridColonyId !== undefined) {
+    copyIntoUint8(a.currentGridColonyId, saved.currentGridColonyId);
+  } else {
+    copyIntoUint8(a.currentGridColonyId, saved.colonyId);
   }
   return a;
 }
