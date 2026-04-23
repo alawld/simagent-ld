@@ -113,7 +113,35 @@ describe('AI-only scenario 3000 ticks', () => {
         const snap = snapshotColony(world, aiColony!);
         diagnostics.push(snap);
 
-        console.log(`[AI-only t=${snap.tick}]`, JSON.stringify(snap));
+        // Extra pre-audit diagnostics: count Marked/Open/BeingDug tiles in AI grid,
+        // worker task distribution, pendingChambers for AI.
+        const grid = world.undergroundGrids[ENEMY_COLONY_ID]!;
+        let solid = 0, marked = 0, beingDug = 0, open = 0;
+        for (let i = 0; i < grid.data.length; i++) {
+          const v = grid.data[i]!;
+          if (v === UndergroundTileState.Solid) solid++;
+          else if (v === UndergroundTileState.Marked) marked++;
+          else if (v === UndergroundTileState.BeingDug) beingDug++;
+          else if (v === UndergroundTileState.Open) open++;
+        }
+        const allocSnap = aiColony!.computedAllocation;
+        const pending = Object.values(world.pendingChambers).filter((p) => p.colonyId === ENEMY_COLONY_ID).length;
+        const qId = aiColony!.queenEntityId;
+        const qZone = world.ants.zone[qId];
+        const qx = (world.ants.posX[qId] ?? 0) >> FP_SHIFT;
+        const qy = (world.ants.posY[qId] ?? 0) >> FP_SHIFT;
+        const qAlive = world.ants.alive[qId];
+        const qTask = world.ants.task[qId];
+        const queenChamberInfo = aiColony!.chambers.find((c) => c.chamberType === ChamberType.Queen);
+        const qcPos = queenChamberInfo
+          ? `qc=(${queenChamberInfo.posX >> FP_SHIFT},${queenChamberInfo.posY >> FP_SHIFT})`
+          : 'qc=none';
+        console.log(`[AI-only t=${snap.tick}]`, JSON.stringify(snap),
+          `grid={solid:${solid},marked:${marked},beingDug:${beingDug},open:${open}}`,
+          `alloc=${JSON.stringify(allocSnap)}`,
+          `pendingChambers=${pending}`,
+          `queen={zone:${qZone},pos:(${qx},${qy}),alive:${qAlive},task:${qTask}}`,
+          qcPos);
       }
     }
 
