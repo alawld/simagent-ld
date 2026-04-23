@@ -83,12 +83,16 @@ import {
   isInsideContextMenu,
   itemLabelPos,
   drawContextMenuGeometry,
+  visibleContextMenuItems,
+  type ContextMenuItem,
 } from './context-menu-layout.js';
 import {
   computeHudStats,
   formatAntsLabel,
   formatFoodLabel,
+  formatQueenLabel,
   queenBarRect,
+  queenLabelRect,
   queenHealthBarColor,
   queenHealthBarFillWidth,
   HUD_STATS_COLORS,
@@ -111,18 +115,20 @@ import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { SetBehaviorRatioCommand, PlaceChamberCommand } from '../sim/commands.js';
 
 // HUD-02 stats row lives entirely inside the 200x24 HUD.STATS rect so
-// isPointerOverHUD() correctly masks world-input click-through. Per PRD §6c:
+// isPointerOverHUD() correctly masks world-input click-through. Per PRD §6c
+// + 09 HUD clarity pass:
 //   - Semi-transparent dark background (0x000000, α=0.6) fills the full rect.
-//   - "Ants: N" (white) left-anchored.
-//   - "Food: N" (green-tinted indicator) right-anchored against the queen bar,
-//     so the food number grows leftward as the colony stockpiles food and
-//     never collides with the queen region (09 HUD food-overlap fix). The
-//     PRD §6c "Queen:" label is removed in this pass — the color-coded queen
-//     health bar is unambiguous on its own and the label was the main source
-//     of the overlap at food ≥ ~100.
-//   - Visual queen-health bar, right-anchored inside the rect.
-const STATS_ROW_Y  = HUD.STATS.y + HUD_STATS_LAYOUT.textRowYOffset;
-const STATS_TEXT_X = HUD.STATS.x + 4;
+//   - Two-row micro-layout inside the 24px rect:
+//       Row 1: "Ants: N" (white, left) + "Food: C/M" (green, right-anchored)
+//       Row 2: "Queen" label (white, left) + queen health bar (right-anchored)
+//   - "Food: C/M" shows current stored over colonyFoodCapacity, both in human
+//     units (>> FP_SHIFT). Gives immediate feedback when a FoodStorage chamber
+//     completes and capacity grows.
+//   - Queen label restored to "Queen" from the prior single-char 'Q' — the
+//     bar color alone was not enough for players to tell what it measured.
+const STATS_ROW1_Y = HUD.STATS.y + HUD_STATS_LAYOUT.row1YOffset;
+const STATS_ROW2_Y = HUD.STATS.y + HUD_STATS_LAYOUT.row2YOffset;
+const STATS_TEXT_X = HUD.STATS.x + HUD_STATS_LAYOUT.leftTextInset;
 
 export class UIScene extends Phaser.Scene {
   private viewState!: ViewState;
@@ -134,9 +140,14 @@ export class UIScene extends Phaser.Scene {
   private gfx!: Phaser.GameObjects.Graphics;
   private antsText!: Phaser.GameObjects.Text;
   private foodText!: Phaser.GameObjects.Text;
+  private queenLabelText!: Phaser.GameObjects.Text;
   private triangleLabels!: Phaser.GameObjects.Text[];
   private viewToggleText!: Phaser.GameObjects.Text;
   private contextMenuLabels!: Phaser.GameObjects.Text[];
+  // Snapshot of the items last rendered so pointerdown hit-testing (which fires
+  // BEFORE the next update frame) uses the same filtered list the player saw.
+  // Updated at the end of each update() when the menu is visible.
+  private contextMenuVisibleItems: readonly ContextMenuItem[] = CONTEXT_MENU_ITEMS;
   private antActivityText!: Phaser.GameObjects.Text;
   private dragState!: TriangleDragState;
 
@@ -155,13 +166,14 @@ export class UIScene extends Phaser.Scene {
     this.gfx = this.add.graphics();
     this.dragState = createTriangleDragState();
 
-    // HUD-02 stats row — two Texts confined to the 200x24 HUD.STATS rect.
-    // antsText is white; foodText is green-tinted per PRD §6c; the queen
-    // health bar is drawn in update() via gfx so its color can change per
-    // frame without Text churn.
+    // HUD-02 stats row — three Texts confined to the 200x24 HUD.STATS rect,
+    // two-row layout. Row 1: antsText (white, left) + foodText (green, right-
+    // anchored). Row 2: queenLabelText (white, left) + queen health bar
+    // (drawn in update() via gfx so its color can change per frame without
+    // Text churn).
     this.antsText = this.add.text(
       STATS_TEXT_X,
-      STATS_ROW_Y,
+      STATS_ROW1_Y,
       'Ants: 0',
       { color: HUD_STATS_COLORS.antsTextCss, fontSize: '10px', fontFamily: 'monospace' },
     );
@@ -169,11 +181,22 @@ export class UIScene extends Phaser.Scene {
 
     this.foodText = this.add.text(
       STATS_TEXT_X,
-      STATS_ROW_Y,
-      'Food: 0',
+      STATS_ROW1_Y,
+      'Food: 0/0',
       { color: HUD_STATS_COLORS.foodTextCss, fontSize: '10px', fontFamily: 'monospace' },
     );
     this.foodText.setScrollFactor(0);
+
+    // Queen label — "Queen" text sits on row 2 (09 HUD clarity pass).
+    // Position is set in update() from queenLabelRect so layout constants
+    // remain single-sourced in hud-stats.ts.
+    this.queenLabelText = this.add.text(
+      STATS_TEXT_X,
+      STATS_ROW2_Y,
+      formatQueenLabel(),
+      { color: HUD_STATS_COLORS.queenLabelCss, fontSize: '10px', fontFamily: 'monospace' },
+    );
+    this.queenLabelText.setScrollFactor(0);
 
     // Triangle vertex labels — static text, created once.
     // Phase 8.5 HUD cleanup: offsets tightened so every label renders INSIDE
@@ -263,13 +286,16 @@ export class UIScene extends Phaser.Scene {
       // the underlying HUD control still receives the click — prevents the
       // menu from lingering after unrelated HUD interactions.
       if (contextMenuState.visible) {
+        const items = this.contextMenuVisibleItems;
         if (isInsideContextMenu(
           pointer.x, pointer.y,
           contextMenuState.screenX, contextMenuState.screenY,
+          items,
         )) {
           const choice = contextMenuItemAt(
             pointer.x, pointer.y,
             contextMenuState.screenX, contextMenuState.screenY,
+            items,
           );
           const world = this.getWorld();
           if (choice !== null && world) {
@@ -419,14 +445,17 @@ export class UIScene extends Phaser.Scene {
       this.antsText.setText(formatAntsLabel(s));
       this.foodText.setText(formatFoodLabel(s));
 
-      // Layout (09 HUD food-overlap fix): antsText left-anchored; foodText
-      // right-anchored against the queen bar so large food totals grow
-      // leftward instead of overwriting the queen region. The "Queen:" label
-      // is gone — the bar's color (healthy/moderate/critical) conveys state
-      // without a prefix.
-      const bar = queenBarRect(HUD.STATS);
-      const foodX = bar.x - this.foodText.width - 6;
-      this.foodText.setPosition(foodX, STATS_ROW_Y);
+      // Two-row layout (09 HUD clarity pass). Row 1: Ants left-anchored,
+      // Food right-anchored against the stats rect's right edge (minus a
+      // small inset). Row 2: "Queen" left-anchored, queen health bar right-
+      // anchored. Rows are disjoint so "Food: C/M" can grow without fighting
+      // the queen label for horizontal budget.
+      const bar   = queenBarRect(HUD.STATS);
+      const label = queenLabelRect(HUD.STATS);
+      this.queenLabelText.setPosition(label.x, label.y);
+      const FOOD_RIGHT_INSET = 6;
+      const foodX = HUD.STATS.x + HUD.STATS.w - FOOD_RIGHT_INSET - this.foodText.width;
+      this.foodText.setPosition(foodX, STATS_ROW1_Y);
 
       // Queen health bar — track + proportional fill.
       this.gfx.fillStyle(HUD_STATS_COLORS.barTrack, 1);
@@ -498,15 +527,29 @@ export class UIScene extends Phaser.Scene {
       this.antActivityText.setVisible(false);
     }
 
-    // Context menu (drawn last so it appears on top of other HUD elements)
-    if (contextMenuState.visible) {
+    // Context menu (drawn last so it appears on top of other HUD elements).
+    // Filter the choice list against colony state each frame so the player
+    // never sees a disabled Queen option once the colony already owns or has
+    // queued a Queen chamber.
+    if (contextMenuState.visible && colony) {
+      const items = visibleContextMenuItems(colony, world);
+      this.contextMenuVisibleItems = items;
       drawContextMenuGeometry(
         this.gfx as unknown as import('./draw-surface.js').GfxLike,
         contextMenuState.screenX,
         contextMenuState.screenY,
+        items,
       );
-      for (let i = 0; i < this.contextMenuLabels.length; i++) {
-        const label = this.contextMenuLabels[i]!;
+      // Show exactly one label per visible item, in order, reusing pooled
+      // label texts by chamberType so the correct string lands at each row.
+      const labelByType = new Map<number, Phaser.GameObjects.Text>();
+      for (let i = 0; i < CONTEXT_MENU_ITEMS.length; i++) {
+        labelByType.set(CONTEXT_MENU_ITEMS[i]!.chamberType, this.contextMenuLabels[i]!);
+      }
+      for (const label of this.contextMenuLabels) label.setVisible(false);
+      for (let i = 0; i < items.length; i++) {
+        const label = labelByType.get(items[i]!.chamberType);
+        if (!label) continue;
         const pos = itemLabelPos(i, contextMenuState.screenX, contextMenuState.screenY);
         label.setPosition(pos.x, pos.y);
         label.setVisible(true);

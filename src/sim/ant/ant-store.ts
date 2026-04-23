@@ -75,6 +75,36 @@ export interface AntComponents {
    * (not colony-memory) per the 09 digger-reassignment memo.
    */
   readonly searchWave:        Int32Array;
+  /**
+   * 09 excursion-foraging memo — persistent outbound heading X component for a
+   * SearchingFood forager. One of {-1, 0, 1}. Zero paired with searchHeadingY=0
+   * means "no active heading" (initial value, or just reset after pickup /
+   * deposit / entrance return). chooseExcursionDirection derives or keeps
+   * this heading to produce a correlated outward walk instead of per-tick
+   * random cardinals. Per-ant state — no colony-memory.
+   */
+  readonly searchHeadingX:    Int32Array;
+  /** Companion Y component to searchHeadingX. */
+  readonly searchHeadingY:    Int32Array;
+  /**
+   * 09 excursion-foraging memo — ticks remaining on the current heading before
+   * the next turn check. Counts down each chooseExcursionDirection call; on
+   * reaching zero a small random turn may be rolled and the counter is reset.
+   * Zero while heading is (0,0) means "pick a fresh heading now".
+   */
+  readonly searchHeadingTicks: Int32Array;
+  /**
+   * 09 excursion-foraging follow-up — tile X the ant occupied last tick
+   * (before the current tile). Sentinel: -1 = no previous tile (fresh
+   * promotion, post-pickup, post-deposit, entrance-return). Used by
+   * sampleForagingDirection and hasNearbyPheromoneSignal to suppress
+   * immediate reversal: a SearchingFood ant will not follow pheromone back
+   * to the tile it just left unless no other signal is available. Per-ant
+   * state — no colony-memory.
+   */
+  readonly searchPrevTileX: Int32Array;
+  /** Companion Y component to searchPrevTileX. Sentinel: -1 = no previous tile. */
+  readonly searchPrevTileY: Int32Array;
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +129,10 @@ export function createAntComponents(maxEntities: number = MAX_ENTITIES): AntComp
   targetPosX.fill(-1);
   const targetPosY = new Int32Array(maxEntities);
   targetPosY.fill(-1);
+  const searchPrevTileX = new Int32Array(maxEntities);
+  searchPrevTileX.fill(-1);
+  const searchPrevTileY = new Int32Array(maxEntities);
+  searchPrevTileY.fill(-1);
 
   return {
     posX:            new Int32Array(maxEntities),
@@ -121,6 +155,13 @@ export function createAntComponents(maxEntities: number = MAX_ENTITIES): AntComp
     targetPosY,
     // Phase 9 SearchingFood leash:
     searchWave:        new Int32Array(maxEntities), // zero = base wave (correct default)
+    // Phase 9 excursion-foraging memo — correlated outward walk heading:
+    searchHeadingX:    new Int32Array(maxEntities), // zero = no heading yet
+    searchHeadingY:    new Int32Array(maxEntities), // zero = no heading yet
+    searchHeadingTicks:new Int32Array(maxEntities), // zero = re-roll heading now
+    // Phase 9 excursion-foraging follow-up — per-ant anti-backtrack prev tile:
+    searchPrevTileX,
+    searchPrevTileY,
   };
 }
 
@@ -181,6 +222,11 @@ export function initAnt(ants: AntComponents, id: EntityId, spec: InitAntSpec): v
   ants.targetPosX[id]        = -1;
   ants.targetPosY[id]        = -1;
   ants.searchWave[id]        = 0;
+  ants.searchHeadingX[id]    = 0;
+  ants.searchHeadingY[id]    = 0;
+  ants.searchHeadingTicks[id]= 0;
+  ants.searchPrevTileX[id]   = -1;
+  ants.searchPrevTileY[id]   = -1;
 }
 
 /**

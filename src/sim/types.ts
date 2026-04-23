@@ -102,6 +102,17 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   dst.ants.targetPosY.set(src.ants.targetPosY);
   // Phase 9 / 09 digger-reassignment memo — per-ant SearchingFood leash wave.
   dst.ants.searchWave.set(src.ants.searchWave);
+  // Phase 9 / 09 excursion-foraging memo — correlated outward walk heading.
+  dst.ants.searchHeadingX.set(src.ants.searchHeadingX);
+  dst.ants.searchHeadingY.set(src.ants.searchHeadingY);
+  dst.ants.searchHeadingTicks.set(src.ants.searchHeadingTicks);
+  // Phase 9 / 09 excursion-foraging follow-up — per-ant anti-backtrack prev
+  // tile. Live state read by sampleForagingDirection + hasNearbyPheromoneSignal,
+  // so the render snapshot MUST round-trip it (previously dropped → the
+  // interpolated prev frame looked "fresh" every tick and broke anti-backtrack
+  // diagnostics / replay determinism boundary).
+  dst.ants.searchPrevTileX.set(src.ants.searchPrevTileX);
+  dst.ants.searchPrevTileY.set(src.ants.searchPrevTileY);
 
   // --- colonies: delete stale dst keys; upsert each src colony ---
   // Remove dst colonies that no longer exist in src

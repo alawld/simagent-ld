@@ -188,11 +188,14 @@ describe('isPointerOverHUD', () => {
     });
   });
 
-  describe('ant-activity popup — dynamic mask', () => {
-    // The panel rect only contributes to the HUD mask while antActivityPanelState
-    // reports visible (including the deferred-hide pending state). This prevents
-    // the dismissal click from falling through to world-input handlers in the
-    // same Phaser dispatch — see ant-activity-panel-state.ts.
+  describe('ant-activity popup — full-canvas mask while panel is open', () => {
+    // While the ant-activity popup is visible (or already pending dismissal),
+    // isPointerOverHUD must treat the ENTIRE canvas as HUD. Reason: UIScene's
+    // pointerdown handler and world-input pointerdown handlers fire on the
+    // same Phaser event, cross-scene dispatch order is not guaranteed, and
+    // the first outside click must never also become a world action. Masking
+    // both `visible` and `pendingHide` closes both listener orderings.
+    // See ant-activity-panel-state.ts.
     //
     // Imports are scoped to this block to keep the existing test cases using
     // only the original import set.
@@ -225,16 +228,42 @@ describe('isPointerOverHUD', () => {
       }
     });
 
-    it('masks every screen position while pendingHide is set (deferred-hide race guard)', async () => {
-      // Regression test for the dismissal race. When UIScene's pointerdown
-      // handler sees a click outside the panel, it calls
-      // requestHideAntActivityPanel() and returns. A subsequent world-input
-      // handler running later in the SAME Phaser dispatch consults
-      // isPointerOverHUD with the raw screen coords; those coords may be
-      // anywhere on the map. isPointerOverHUD must return true for the
-      // entire canvas during pendingHide so the world handler drops the
-      // click (otherwise it would also mark food / place rally / designate
-      // entrance / mark underground dig).
+    it('masks every screen position while panel is visible (world-input-first race guard)', async () => {
+      // Regression test for the world-input-first dispatch ordering. If a
+      // world-input pointerdown handler runs BEFORE UIScene gets a chance to
+      // call requestHideAntActivityPanel(), `pendingHide` is still false.
+      // The click must still be consumed — otherwise it leaks through as a
+      // food mark / rally placement / entrance designation / dig mark, and
+      // UIScene would then also dismiss the popup, so one physical click
+      // produces both a world action AND a dismissal. Masking on `visible`
+      // alone forces the world handler to drop the click regardless of
+      // listener order.
+      const {
+        showAntActivityPanel,
+        hideAntActivityPanel,
+        antActivityPanelState,
+      } = await import('../render/ant-activity-panel-state.js');
+      showAntActivityPanel();
+      try {
+        expect(antActivityPanelState.visible).toBe(true);
+        expect(antActivityPanelState.pendingHide).toBe(false);
+        // Deep middle of the world map — must be masked.
+        expect(isPointerOverHUD(400, 300)).toBe(true);
+        // A point near a map edge — also masked.
+        expect(isPointerOverHUD(50, 300)).toBe(true);
+        // A point over an empty region of the top HUD strip — masked.
+        expect(isPointerOverHUD(600, 4)).toBe(true);
+      } finally {
+        hideAntActivityPanel();
+      }
+    });
+
+    it('masks every screen position while pendingHide is set (UIScene-first race guard)', async () => {
+      // Regression test for the UIScene-first dispatch ordering. UIScene sees
+      // the outside click, calls requestHideAntActivityPanel() (pendingHide=
+      // true), and returns. A subsequent world-input handler running later
+      // in the SAME Phaser dispatch consults isPointerOverHUD with the raw
+      // screen coords; those coords may be anywhere on the map.
       const {
         showAntActivityPanel,
         requestHideAntActivityPanel,
@@ -252,14 +281,44 @@ describe('isPointerOverHUD', () => {
           ANT_ACTIVITY_PANEL.x + 5,
           ANT_ACTIVITY_PANEL.y + 5,
         )).toBe(true);
-        // Deep middle of the world map — must ALSO be masked during
-        // pendingHide so the dismissal click is fully consumed.
+        // Deep middle of the world map — must ALSO be masked.
         expect(isPointerOverHUD(400, 300)).toBe(true);
         // A point near a map edge — also masked.
         expect(isPointerOverHUD(50, 300)).toBe(true);
       } finally {
         hideAntActivityPanel();
       }
+    });
+
+    it('still flags Stats / View / Minimap / Triangle zones while panel is visible (HUD hit-rects preserved)', async () => {
+      // Sanity: UIScene checks its own HUD hit-rects directly (it does not
+      // consult isPointerOverHUD for its own dispatch), but isPointerOverHUD
+      // is also used by drag-pan to decide whether a pointerdown is a pan
+      // trigger. These zones must keep reporting true while the panel is up.
+      const { showAntActivityPanel, hideAntActivityPanel } =
+        await import('../render/ant-activity-panel-state.js');
+      showAntActivityPanel();
+      try {
+        expect(isPointerOverHUD(HUD.STATS.x + 5, HUD.STATS.y + 5)).toBe(true);
+        expect(isPointerOverHUD(HUD.VIEW_TOGGLE.x + 5, HUD.VIEW_TOGGLE.y + 5)).toBe(true);
+        expect(isPointerOverHUD(HUD.MINIMAP.x + 5, HUD.MINIMAP.y + 5)).toBe(true);
+        expect(isPointerOverHUD(HUD.TRIANGLE.x + 5, HUD.TRIANGLE.y + 5)).toBe(true);
+      } finally {
+        hideAntActivityPanel();
+      }
+    });
+
+    it('restores normal masking after the panel is hidden', async () => {
+      const { showAntActivityPanel, hideAntActivityPanel, antActivityPanelState } =
+        await import('../render/ant-activity-panel-state.js');
+      showAntActivityPanel();
+      hideAntActivityPanel();
+      expect(antActivityPanelState.visible).toBe(false);
+      expect(antActivityPanelState.pendingHide).toBe(false);
+      // Mid-canvas — no longer masked.
+      expect(isPointerOverHUD(400, 300)).toBe(false);
+      // HUD zones — still masked as usual.
+      expect(isPointerOverHUD(HUD.STATS.x + 5, HUD.STATS.y + 5)).toBe(true);
     });
   });
 });

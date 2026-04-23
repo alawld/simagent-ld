@@ -12,6 +12,7 @@ import {
   DANGER_DECAY_FP,
   EGG_HATCH_TICKS,
   EXPLORE_RATE_PERCENT,
+  BASE_FOOD_STORAGE_CAPACITY,
   FOOD_CHAMBER_CAPACITY,
   FOOD_PICKUP_AMOUNT,
   FOOD_TRAIL_DEPOSIT,
@@ -95,6 +96,10 @@ describe('PRD §9c food economy constants', () => {
 
   it('FOOD_CHAMBER_CAPACITY === 5120 (20 × FP_ONE)', () => {
     expect(FOOD_CHAMBER_CAPACITY).toBe(5120);
+  });
+
+  it('BASE_FOOD_STORAGE_CAPACITY === 2048 (8 × FP_ONE, 09 backlog memo)', () => {
+    expect(BASE_FOOD_STORAGE_CAPACITY).toBe(2048);
   });
 
   it('WORKER_BASE_SPEED === 128 (0.5 × FP_ONE)', () => {

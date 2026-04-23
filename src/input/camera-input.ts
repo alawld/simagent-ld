@@ -30,7 +30,6 @@ import {
   HUD,
   TILE_SIZE_PX,
 } from '../render/sprites.js';
-import { ANT_ACTIVITY_PANEL } from '../render/ant-activity.js';
 import { antActivityPanelState } from '../render/ant-activity-panel-state.js';
 import {
   type ViewState,
@@ -118,20 +117,33 @@ export function resetDragState(dragState: DragState): void {
  * Inclusion rule: x in [rect.x, rect.x + rect.w) and y in [rect.y, rect.y + rect.h).
  */
 export function isPointerOverHUD(px: number, py: number): boolean {
-  // Ant-activity popup dismissal consumes the ENTIRE pointerdown dispatch
-  // regardless of where the click landed. When UIScene's pointerdown handler
-  // detects a click outside the panel (including anywhere on the world map),
-  // it calls requestHideAntActivityPanel() which sets pendingHide=true.
-  // A subsequent world-input handler running in the same Phaser dispatch
-  // must observe this click as "HUD-consumed" and drop it — otherwise the
-  // same click that dismissed the popup would also mark food, place a
-  // rally, designate an entrance, or mark underground digging.
+  // Ant-activity popup full-canvas mask — while the panel is visible OR
+  // already dismissing (pendingHide), treat every screen pixel as HUD.
   //
-  // Returning true unconditionally here is correct because pendingHide is
-  // only true for the single tick/frame between request and apply; the
-  // next frame's UIScene.update calls applyPendingAntActivityPanelHide
-  // and clears both `pendingHide` and `visible`.
-  if (antActivityPanelState.pendingHide) {
+  // Why the full canvas, not just the panel rect: UIScene's pointerdown
+  // handler and the world-input pointerdown handlers (surface-input /
+  // underground-input / drag-pan) are separate Phaser listeners on the
+  // same pointer event. Phaser does not guarantee cross-scene dispatch
+  // order. There are two orderings we must protect against:
+  //
+  //   1. UIScene-first. UIScene sees the outside click, calls
+  //      requestHideAntActivityPanel() → pendingHide=true, returns.
+  //      Then a world-input handler runs; `visible` is still true.
+  //
+  //   2. World-input-first. A world handler runs BEFORE UIScene has had a
+  //      chance to request the hide, so pendingHide is still false. If
+  //      we only masked during pendingHide, this click would leak through
+  //      as a food mark / rally placement / entrance designation / dig
+  //      mark, and the popup would ALSO get dismissed on the UIScene pass.
+  //
+  // Masking on `visible || pendingHide` closes both orderings: the world
+  // handler drops the click unconditionally while the panel is up, and
+  // UIScene's own HUD interactions (Stats toggle, view toggle, minimap,
+  // triangle) don't consult isPointerOverHUD — UIScene checks its own
+  // hit-rects directly — so those continue to work. The next
+  // UIScene.update frame commits the deferred hide and clears both flags,
+  // restoring normal masking.
+  if (antActivityPanelState.visible || antActivityPanelState.pendingHide) {
     return true;
   }
 
@@ -141,11 +153,6 @@ export function isPointerOverHUD(px: number, py: number): boolean {
     HUD.MINIMAP,
     HUD.VIEW_TOGGLE,
   ];
-  // Visible-but-not-dismissing: only the panel rect itself is masked, so
-  // clicks outside it still reach UIScene for dismissal handling.
-  if (antActivityPanelState.visible) {
-    zones.push(ANT_ACTIVITY_PANEL);
-  }
   for (const zone of zones) {
     if (
       px >= zone.x &&

@@ -6,9 +6,6 @@
 // Only imports: src/sim/constants.js (world dimensions) and src/render/sprites.js (TILE_SIZE_PX).
 // Pure TypeScript functions, fully testable under Node + Vitest.
 
-import {
-  UNDERGROUND_GRID_HEIGHT,
-} from '../sim/constants.js';
 import { TILE_SIZE_PX } from './sprites.js';
 
 // Suppress unused import warning — TILE_SIZE_PX is used in screenToTile below.
@@ -58,6 +55,22 @@ export const CAMERA_SCROLL_SPEED = 0.5;
  */
 export const EDGE_PAN_THRESHOLD_PX = 32;
 
+/**
+ * Initial underground-camera Y on fresh boot / session reset / first view
+ * toggle. Set to half the viewport so tile y=0 sits at the very top of the
+ * visible region — this places the surface entrance / starter shaft row
+ * near the top-center of the underground view, giving the player an
+ * immediate spatial connection between the surface hole they just dug and
+ * the tunnel they're about to excavate.
+ *
+ * Derived from VIEWPORT_HEIGHT_TILES rather than UNDERGROUND_GRID_HEIGHT —
+ * the old mid-depth start (UNDERGROUND_GRID_HEIGHT/2) left the shaft
+ * entirely off-screen and made the first underground visit disorienting.
+ * Using the viewport half puts this value exactly at clampCamera's minimum
+ * Y, so if viewport dimensions change the shaft stays anchored to the top.
+ */
+export const UNDERGROUND_INITIAL_CAMERA_Y = VIEWPORT_HEIGHT_TILES / 2;
+
 // ---------------------------------------------------------------------------
 // ViewState
 // ---------------------------------------------------------------------------
@@ -79,7 +92,8 @@ export interface ViewState {
   /**
    * Whether the underground view has been visited at least once.
    * Used for first-visit Y-centering (PRD §7c): undergroundCamera.y is set to
-   * UNDERGROUND_GRID_HEIGHT/2 on the FIRST toggle to underground only.
+   * UNDERGROUND_INITIAL_CAMERA_Y (shaft row near the top) on the FIRST
+   * toggle to underground only.
    */
   undergroundVisited: boolean;
 }
@@ -92,7 +106,9 @@ export interface ViewState {
  * createViewState — construct initial ViewState for a new game session.
  *
  * surfaceCamera is centered at (startTileX, startTileY).
- * undergroundCamera is centered at (startTileX, UNDERGROUND_GRID_HEIGHT/2 = 32).
+ * undergroundCamera is centered horizontally on the starter entrance column
+ * (startTileX) and vertically at UNDERGROUND_INITIAL_CAMERA_Y so the shaft /
+ * surface-entrance row sits near the top of the viewport.
  * undergroundVisited is false; activeView is 'surface'.
  *
  * Each camera is an independent object instance (no shared references).
@@ -111,7 +127,7 @@ export function createViewState(startTileX: number, startTileY: number): ViewSta
     },
     undergroundCamera: {
       x: startTileX,
-      y: UNDERGROUND_GRID_HEIGHT / 2,
+      y: UNDERGROUND_INITIAL_CAMERA_Y,
       viewportWidth: VIEWPORT_WIDTH_TILES,
       viewportHeight: VIEWPORT_HEIGHT_TILES,
     },
@@ -145,7 +161,7 @@ export function resetViewState(
   viewState.surfaceCamera.viewportWidth = VIEWPORT_WIDTH_TILES;
   viewState.surfaceCamera.viewportHeight = VIEWPORT_HEIGHT_TILES;
   viewState.undergroundCamera.x = startTileX;
-  viewState.undergroundCamera.y = UNDERGROUND_GRID_HEIGHT / 2;
+  viewState.undergroundCamera.y = UNDERGROUND_INITIAL_CAMERA_Y;
   viewState.undergroundCamera.viewportWidth = VIEWPORT_WIDTH_TILES;
   viewState.undergroundCamera.viewportHeight = VIEWPORT_HEIGHT_TILES;
   viewState.undergroundVisited = false;
@@ -160,7 +176,8 @@ export function resetViewState(
  *
  * Surface → Underground:
  *   - Copies surfaceCamera.x → undergroundCamera.x (X-link sync)
- *   - If first visit: sets undergroundCamera.y = UNDERGROUND_GRID_HEIGHT/2 and marks visited
+ *   - If first visit: sets undergroundCamera.y = UNDERGROUND_INITIAL_CAMERA_Y
+ *     (shaft/starter-hole row near the top) and marks visited
  *   - Sets activeView = 'underground'
  *
  * Underground → Surface:
@@ -176,7 +193,7 @@ export function toggleView(viewState: ViewState): void {
   if (viewState.activeView === 'surface') {
     viewState.undergroundCamera.x = viewState.surfaceCamera.x;
     if (!viewState.undergroundVisited) {
-      viewState.undergroundCamera.y = UNDERGROUND_GRID_HEIGHT / 2;
+      viewState.undergroundCamera.y = UNDERGROUND_INITIAL_CAMERA_Y;
       viewState.undergroundVisited = true;
     }
     viewState.activeView = 'underground';

@@ -278,7 +278,7 @@ describe('handleUndergroundLeftClick', () => {
     expect(state.lastMarkedTileY).toBe(10);
   });
 
-  it('does NOT push MarkDigTile when ant-activity panel pendingHide is set (popup click-away race)', async () => {
+  it('does NOT push MarkDigTile when ant-activity panel pendingHide is set (UIScene-first race)', async () => {
     // Scenario: player opens HUD ant-activity popup, then clicks on the
     // underground map to dismiss it. UIScene's pointerdown handler sets
     // pendingHide=true before returning. The subsequent underground-input
@@ -297,6 +297,54 @@ describe('handleUndergroundLeftClick', () => {
       handleUndergroundLeftClick(world, vs, x, y, state);
       expect(world.commandQueue).toHaveLength(0);
       expect(state.isDragging).toBe(false);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('does NOT push MarkDigTile when panel is visible and pendingHide=false (world-input-first race)', async () => {
+    // World-input-first dispatch ordering: UIScene has NOT yet called
+    // requestHideAntActivityPanel(), so pendingHide is still false when the
+    // underground-input pointerdown runs. The click must still be consumed
+    // — otherwise the dismissal click would also mark a dig tile. isPointer-
+    // OverHUD now masks on `visible` alone (not just pendingHide) to close
+    // both listener orderings.
+    const { showAntActivityPanel, hideAntActivityPanel, antActivityPanelState } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({ tick: 7 });
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+
+    showAntActivityPanel();
+    try {
+      expect(antActivityPanelState.visible).toBe(true);
+      expect(antActivityPanelState.pendingHide).toBe(false);
+      handleUndergroundLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+      expect(state.isDragging).toBe(false);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('right-click also no-ops when panel is visible and pendingHide=false (world-input-first race)', async () => {
+    // Right-click on Marked or Open-tunnel-end would normally emit
+    // CancelDigMark / open a context menu. Must be suppressed while the
+    // panel is up, regardless of listener order.
+    const { showAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({ tick: 4 });
+    // Seed a Marked tile at (5, 10) so a normal right-click would emit
+    // CancelDigMarkCommand.
+    ugSet(world.undergroundGrids[PLAYER_COLONY_ID]!, 5, 10, UndergroundTileState.Marked);
+    const vs = makeViewState('underground', 64, 32);
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+
+    showAntActivityPanel();
+    try {
+      handleUndergroundRightClick(world, vs, x, y);
+      expect(world.commandQueue).toHaveLength(0);
     } finally {
       hideAntActivityPanel();
     }
@@ -411,6 +459,116 @@ describe('handleUndergroundDrag', () => {
     handleUndergroundDrag(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
     expect(state.isDragging).toBe(false);
+  });
+
+  // 09 backlog memo — drag interpolation must emit a 4-connected (Manhattan-
+  // adjacent) tile sequence. A pure diagonal between successive tiles would
+  // leave them touching only by a corner, which breaks the 4-connected
+  // underground movement/dig graph and creates unreachable tunnel segments.
+  // Each diagonal step is split into an orthogonal bridge + the destination.
+  it('single-step diagonal drag from (10,10) to (11,11) emits an orthogonal bridge tile plus the final tile', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState(true, 10, 10);
+    const { x, y } = tileToScreen(11, 11, 64, 32);
+    handleUndergroundDrag(world, vs, x, y, state);
+    const marks = world.commandQueue.map((c) => {
+      const cc = c as { type: string; tileX: number; tileY: number };
+      return `${cc.tileX},${cc.tileY}`;
+    });
+    // At least one bridge tile (11,10) or (10,11) must be emitted; the
+    // destination (11,11) is always emitted. Starting tile is not re-emitted.
+    const bridgeEmitted = marks.includes('11,10') || marks.includes('10,11');
+    expect(bridgeEmitted).toBe(true);
+    expect(marks).toContain('11,11');
+    expect(marks).not.toContain('10,10');
+    // Every successive emitted tile — measured from the prior marked tile
+    // (10,10) — must be Manhattan-adjacent (4-connected).
+    const prev: Array<[number, number]> = [[10, 10]];
+    for (const m of marks) {
+      const [xs, ys] = m.split(',').map(Number) as [number, number];
+      const [px, py] = prev[prev.length - 1]!;
+      expect(Math.abs(xs - px) + Math.abs(ys - py)).toBe(1);
+      prev.push([xs, ys]);
+    }
+    expect(state.lastMarkedTileX).toBe(11);
+    expect(state.lastMarkedTileY).toBe(11);
+  });
+
+  it('diagonal drag from (10,10) to (12,12) produces a continuous 4-connected path', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState(true, 10, 10);
+    const { x, y } = tileToScreen(12, 12, 64, 32);
+    handleUndergroundDrag(world, vs, x, y, state);
+    const marks = world.commandQueue.map((c) => {
+      const cc = c as { type: string; tileX: number; tileY: number };
+      return `${cc.tileX},${cc.tileY}`;
+    });
+    expect(marks).toContain('12,12');
+    expect(marks).not.toContain('10,10');
+    // Continuous 4-connected sequence starting from (10,10).
+    const prev: Array<[number, number]> = [[10, 10]];
+    for (const m of marks) {
+      const [xs, ys] = m.split(',').map(Number) as [number, number];
+      const [px, py] = prev[prev.length - 1]!;
+      expect(Math.abs(xs - px) + Math.abs(ys - py)).toBe(1);
+      prev.push([xs, ys]);
+    }
+    expect(state.lastMarkedTileX).toBe(12);
+    expect(state.lastMarkedTileY).toBe(12);
+  });
+
+  it('shallow diagonal drag from (10,10) to (13,11) emits a continuous 4-connected path', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState(true, 10, 10);
+    const { x, y } = tileToScreen(13, 11, 64, 32);
+    handleUndergroundDrag(world, vs, x, y, state);
+    const marks = world.commandQueue.map((c) => {
+      const cc = c as { tileX: number; tileY: number };
+      return `${cc.tileX},${cc.tileY}`;
+    });
+    // Final tile is (13,11).
+    expect(marks[marks.length - 1]).toBe('13,11');
+    // Every successive tile is Manhattan-adjacent (4-connectivity), not just
+    // 8-connected. This is the contract the underground grid requires.
+    const prev: Array<[number, number]> = [[10, 10]];
+    for (const m of marks) {
+      const [xs, ys] = m.split(',').map(Number) as [number, number];
+      const [px, py] = prev[prev.length - 1]!;
+      expect(Math.abs(xs - px) + Math.abs(ys - py)).toBe(1);
+      prev.push([xs, ys]);
+    }
+  });
+
+  it('diagonal drag skips non-markable tiles without aborting the stroke', () => {
+    const world = makeWorld();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    // Put a Marked tile somewhere along the path from (10,10) to (12,12).
+    ugSet(grid, 11, 11, UndergroundTileState.Marked);
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState(true, 10, 10);
+    const { x, y } = tileToScreen(12, 12, 64, 32);
+    handleUndergroundDrag(world, vs, x, y, state);
+    const marks = world.commandQueue.map((c) => {
+      const cc = c as { tileX: number; tileY: number };
+      return `${cc.tileX},${cc.tileY}`;
+    });
+    // (11,11) was Marked already → no command emitted. (12,12) still emitted.
+    expect(marks).not.toContain('11,11');
+    expect(marks).toContain('12,12');
+    expect(state.lastMarkedTileX).toBe(12);
+    expect(state.lastMarkedTileY).toBe(12);
+  });
+
+  it('same-tile drag does not emit extra commands (debounce)', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState(true, 10, 10);
+    const { x, y } = tileToScreen(10, 10, 64, 32);
+    handleUndergroundDrag(world, vs, x, y, state);
+    expect(world.commandQueue).toHaveLength(0);
   });
 });
 

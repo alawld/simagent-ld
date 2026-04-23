@@ -5,14 +5,14 @@
 // and integration tests.
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { tick } from './tick.js';
+import { tick, resetFlowFieldCaches } from './tick.js';
 import { createWorldState, allocateEntityId } from './types.js';
 import { GameOutcome } from './game-over.js';
 import type { SimCommand } from './commands.js';
 import { initAnt } from './ant/ant-store.js';
 import { createColonyRecord } from './colony/colony-store.js';
 import { createPheromoneGrid, phGet, phSet, pheromoneGridKey } from './pheromone/pheromone-store.js';
-import { AntTask, ForagingSubState, PheromoneType, FightingSubState } from './enums.js';
+import { AntTask, ForagingSubState, PheromoneType, FightingSubState, ChamberType } from './enums.js';
 import type { WorldState } from './types.js';
 import type { ColonyId } from './colony/colony-store.js';
 import {
@@ -593,6 +593,17 @@ describe('Step ordering observable proofs', () => {
       }
       colony.larvaeCount = 0;
 
+      // 09 reproduction-gate memo: nurse carveout requires a completed Nursery.
+      // Without this chamber, allocateWorkers returns nurse=0 and the
+      // {3,4,0,3} expectation below would collapse to {0,6,0,4}.
+      colony.chambers.push({
+        chamberId:   9001,
+        chamberType: ChamberType.Nursery,
+        foodStored:  0,
+        posX:        0, posY: 0,
+        width:       2, height: 2,
+      });
+
       for (let i = 0; i < 10; i++) {
         const wid = allocateEntityId(w);
         initAnt(w.ants, wid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0 });
@@ -672,6 +683,131 @@ describe('Step ordering observable proofs', () => {
       expect(w.ants.task[carryWid]).toBe(AntTask.Foraging);
       expect(w.ants.subTask[carryWid]).toBe(ForagingSubState.CarryingFood);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 09 reproduction-gate memo — end-to-end starvation-shape regression
+// ---------------------------------------------------------------------------
+
+describe('09 reproduction-gate memo — starvation-shape regression', () => {
+  it('3 workers + 30 brood + NO Nursery + forage ratio → nurse=0, foragers=3', () => {
+    // This is the exact failure shape from the debug snapshot: a pre-nursery
+    // colony started accumulating brood, computedAllocation carved nurses
+    // from the worker pool, and foraging collapsed because every worker was
+    // stuck en route to a non-existent nursery. After the memo fix,
+    // hasNursery=false forces nurse=0 regardless of brood and the triangle
+    // splits across the full worker pool.
+    const { world: w } = makeWorldWithColony(42);
+    const colony = w.colonies[1]!;
+    colony.workerCount = 3;
+
+    // 30 larvae (already-hatched brood).
+    for (let e = 0; e < 30; e++) {
+      const lid = allocateEntityId(w);
+      initAnt(w.ants, lid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
+      colony.larvae.push(lid);
+      colony.larvaeCount += 1;
+    }
+
+    for (let i = 0; i < 3; i++) {
+      const wid = allocateEntityId(w);
+      initAnt(w.ants, wid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0 });
+      colony.workers.push(wid);
+    }
+
+    // Forage-favored triangle; no chambers at all (intentional — this is the
+    // pre-excavation colony state from the memo).
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.dig    = 0;
+    colony.targetRatio.fight  = 0;
+
+    tick(w, []);
+
+    const alloc = colony.computedAllocation;
+    const tc    = colony.taskCensus;
+
+    // Memo gate: no Nursery → nurse=0 even with 30 brood.
+    expect(alloc.nurse).toBe(0);
+    expect(alloc.forage).toBe(3);
+    // Census matches: every worker is on the forage line.
+    expect(tc.nurse).toBe(0);
+    expect(tc.forage).toBe(3);
+    expect(tc.forage + tc.dig + tc.fight + tc.nurse).toBe(3);
+  });
+
+  it('legacy brood inertness: 30 brood without Nursery does not steal workers', () => {
+    // Save-compat: a legacy save can ship brood that pre-dates the memo.
+    // The fix must leave that brood in the world without forcing nursing.
+    const { world: w } = makeWorldWithColony(42);
+    const colony = w.colonies[1]!;
+    colony.workerCount = 5;
+
+    for (let e = 0; e < 30; e++) {
+      const lid = allocateEntityId(w);
+      initAnt(w.ants, lid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
+      colony.larvae.push(lid);
+      colony.larvaeCount += 1;
+    }
+
+    for (let i = 0; i < 5; i++) {
+      const wid = allocateEntityId(w);
+      initAnt(w.ants, wid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0 });
+      colony.workers.push(wid);
+    }
+
+    colony.targetRatio.forage = 3;
+    colony.targetRatio.dig    = 2;
+    colony.targetRatio.fight  = 0;
+
+    tick(w, []);
+
+    expect(colony.computedAllocation.nurse).toBe(0);
+    expect(colony.taskCensus.nurse).toBe(0);
+    // Brood remains in the colony — not cleared, not killed.
+    expect(colony.larvaeCount).toBe(30);
+    // Workers sum back to workerCount across non-nurse tasks.
+    const tc = colony.taskCensus;
+    expect(tc.forage + tc.dig + tc.fight + tc.nurse).toBe(5);
+  });
+
+  it('Nursery present + 30 brood + 3 workers → nurse capped at ceil(3/4)=1', () => {
+    // Counterpoint: once the Nursery exists, the brood actually demands
+    // nursing — but the ceil(workers/4) cap prevents the whole pool from
+    // being drained. With 3 workers and heavy brood, exactly 1 nurse and
+    // 2 foragers (forage-only ratio).
+    const { world: w } = makeWorldWithColony(42);
+    const colony = w.colonies[1]!;
+    colony.workerCount = 3;
+
+    for (let e = 0; e < 30; e++) {
+      const lid = allocateEntityId(w);
+      initAnt(w.ants, lid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
+      colony.larvae.push(lid);
+      colony.larvaeCount += 1;
+    }
+
+    for (let i = 0; i < 3; i++) {
+      const wid = allocateEntityId(w);
+      initAnt(w.ants, wid, { colonyId: 1, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0 });
+      colony.workers.push(wid);
+    }
+
+    colony.chambers.push({
+      chamberId:   9000,
+      chamberType: ChamberType.Nursery,
+      foodStored:  0,
+      posX: 0, posY: 0, width: 2, height: 2,
+    });
+
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.dig    = 0;
+    colony.targetRatio.fight  = 0;
+
+    tick(w, []);
+
+    expect(colony.computedAllocation.nurse).toBe(1);
+    expect(colony.computedAllocation.forage).toBe(2);
   });
 });
 
@@ -914,7 +1050,7 @@ describe('PHER-02 two-grid integration', () => {
 // ---------------------------------------------------------------------------
 
 import { createUndergroundGrid, UndergroundTileState, ugGet } from './terrain.js';
-import { ChamberType, DiggingSubState } from './enums.js';
+import { DiggingSubState } from './enums.js';
 import type { FoodPile } from './food.js';
 import {
   MAX_ENTRANCES_PER_COLONY,
@@ -1654,6 +1790,64 @@ describe('Regression: reviewer P1 fixes', () => {
     expect(world.pendingChambers[`${colonyId}:10:10`]).toBe(before); // not overwritten
   });
 
+  // --- 09 backlog memo — Queen uniqueness + FoodStorage multiplicity ---
+  it('PlaceChamber rejected: second Queen attempt while a Queen pending', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
+    underground.data[20 * UNDERGROUND_GRID_WIDTH + 30] = UndergroundTileState.Open;
+    const c1: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    tick(world, [c1]);
+    const pendingBefore = Object.keys(world.pendingChambers).length;
+    expect(pendingBefore).toBe(1);
+    const c2: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 30, anchorTileY: 20, issuedAtTick: 1,
+    };
+    tick(world, [c2]);
+    expect(Object.keys(world.pendingChambers).length).toBe(pendingBefore);
+  });
+
+  it('PlaceChamber rejected: second Queen attempt while a Queen already exists', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    // Seed an existing Queen chamber directly in colony.chambers.
+    const colony = world.colonies[colonyId]!;
+    colony.chambers.push({
+      chamberId: 999, chamberType: ChamberType.Queen, foodStored: 0,
+      posX: 5 << FP_SHIFT, posY: 5 << FP_SHIFT, width: 5, height: 3,
+    });
+    underground.data[20 * UNDERGROUND_GRID_WIDTH + 30] = UndergroundTileState.Open;
+    const c: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen, anchorTileX: 30, anchorTileY: 20, issuedAtTick: 0,
+    };
+    tick(world, [c]);
+    expect(world.pendingChambers[`${colonyId}:30:20`]).toBeUndefined();
+  });
+
+  it('PlaceChamber allows multiple FoodStorage placements on the same colony', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[10 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
+    underground.data[20 * UNDERGROUND_GRID_WIDTH + 30] = UndergroundTileState.Open;
+    const c1: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.FoodStorage, anchorTileX: 10, anchorTileY: 10, issuedAtTick: 0,
+    };
+    const c2: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.FoodStorage, anchorTileX: 30, anchorTileY: 20, issuedAtTick: 1,
+    };
+    tick(world, [c1]);
+    tick(world, [c2]);
+    expect(world.pendingChambers[`${colonyId}:10:10`]).toBeDefined();
+    expect(world.pendingChambers[`${colonyId}:30:20`]).toBeDefined();
+  });
+
   // --- DesignateEntrance validation (PRD §3g) ---
   it('DesignateEntrance rejected: surfaceTileX out of bounds', () => {
     const { world, colonyId } = makeWorldWithUnderground();
@@ -2008,5 +2202,217 @@ describe('Phase 9 tick integration', () => {
     // Combat ran: either the enemy fighter or the player queen is dead (or both still alive if no valid combat)
     // At minimum world.tick advanced — confirms tick ran to completion
     expect(world.tick).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: flow-field caches must not leak across worlds/sessions.
+// Module-level entrance/dig/chamber caches keyed by colonyId would otherwise
+// let a second world with the same colonyId inherit the first world's tunnel
+// topology when digFlowFieldDirty=false on the loaded snapshot.
+// ---------------------------------------------------------------------------
+describe('resetFlowFieldCaches — cross-world isolation', () => {
+  // Build a minimal underground-only world where a foraging ant with
+  // foodCarrying=0 routes to the nearest open entrance via the entrance
+  // flow-field. Different entrance locations in world A vs world B make the
+  // expected first-step direction diverge, so stale cache inheritance is
+  // directly observable.
+  async function makeUndergroundWorldWithFighter(
+    entranceCol: number,
+    rallyTileX: number,
+  ): Promise<{ world: WorldState; antId: number; colonyId: ColonyId }> {
+    const { createUndergroundGrid, UndergroundTileState, ugSet, Zone } = await import('./terrain.js');
+    const { FP_ONE } = await import('./fixed.js');
+    const { initAnt: _initAnt } = await import('./ant/ant-store.js');
+    const world = createWorldState(42);
+    const colonyId = 1 as ColonyId;
+    const queenId = allocateEntityId(world);
+    _initAnt(world.ants, queenId, {
+      colonyId,
+      posX: 1024,
+      posY: 1024,
+      task: AntTask.Idle,
+      subTask: 0,
+      speed: 0,
+      lifespan: WORKER_LIFESPAN_TICKS,
+    });
+    const colony = createColonyRecord(colonyId, queenId);
+    colony.foodStored = 10000;
+    // digFlowFieldDirty=false deliberately: this is the stale-cache gate.
+    colony.digFlowFieldDirty = false;
+    // Rally at (rallyTileX, 0) — only used to give updateFightAntTargets a
+    // target; the fighter is underground so it routes to the entrance first.
+    colony.rallyPoint = { tileX: rallyTileX, tileY: 0 };
+    colony.entrances = [{
+      entranceId: 10,
+      surfaceTileX: entranceCol,
+      surfaceTileY: 5,
+      isOpen: true,
+    }];
+    world.colonies[colonyId] = colony;
+
+    // 16x16 underground grid. Fully open in row 0 so the ant can sidestep
+    // toward whichever entrance column is active this world. Row 1 open too,
+    // to give a starting tile one below the shaft cap. All other rows remain
+    // Solid by default.
+    const ug = createUndergroundGrid(16, 16);
+    for (let x = 0; x < 16; x++) {
+      ugSet(ug, x, 0, UndergroundTileState.Open);
+      ugSet(ug, x, 1, UndergroundTileState.Open);
+    }
+    world.undergroundGrids[colonyId] = ug;
+
+    // Fighter at (8, 0) underground. Row 0 is Open end-to-end; the entrance
+    // flow-field's sole source tile is (entranceCol, 0), so at (8,0) the dir
+    // is a pure E/W axis step toward the source column — world A (col 2)
+    // routes west, world B (col 14) routes east. Row 1 is filled too so the
+    // ant never needs row-1 traversal; this keeps the first-tick step strictly
+    // horizontal (no ambiguous N/W tie-breaks from BFS expansion order).
+    const antId = allocateEntityId(world);
+    _initAnt(world.ants, antId, {
+      colonyId,
+      posX: 8 << FP_SHIFT,
+      posY: 0,
+      task: AntTask.Fighting,
+      subTask: 0,
+      speed: FP_ONE,
+      lifespan: WORKER_LIFESPAN_TICKS,
+    });
+    world.ants.zone[antId] = Zone.Underground;
+    // Register in colony.workers so step 10a sees it.
+    colony.workers.push(antId);
+    colony.workerCount = 1;
+    colony.taskCensus.fight = 1;
+
+    return { world, antId, colonyId };
+  }
+
+  it('second world routes per its own topology after resetFlowFieldCaches()', async () => {
+    resetFlowFieldCaches();
+    // World A: entrance at col 2 — first underground step should be west.
+    const { world: worldA, antId: antA } = await makeUndergroundWorldWithFighter(2, 2);
+    const beforeA = worldA.ants.posX[antA]! >> FP_SHIFT;
+    tick(worldA, []);
+    const afterA = worldA.ants.posX[antA]! >> FP_SHIFT;
+    expect(afterA).toBeLessThan(beforeA);  // stepped west toward col 2
+
+    // Clear the module-level caches between worlds (simulates bootFresh /
+    // bootFromSave flow: new world, same colony id).
+    resetFlowFieldCaches();
+
+    // World B: same colony id (1), but entrance at col 14 — first underground
+    // step should be east. If the entrance flow-field cache from world A
+    // leaked, the ant would instead step west (toward col 2 in world A).
+    const { world: worldB, antId: antB } = await makeUndergroundWorldWithFighter(14, 14);
+    const beforeB = worldB.ants.posX[antB]! >> FP_SHIFT;
+    tick(worldB, []);
+    const afterB = worldB.ants.posX[antB]! >> FP_SHIFT;
+    expect(afterB).toBeGreaterThan(beforeB);  // stepped east toward col 14 in world B
+  });
+
+  it('without resetFlowFieldCaches() between worlds, world B would inherit world A topology (negative control)', async () => {
+    // Ensure cache is clean at the start.
+    resetFlowFieldCaches();
+    // World A: entrance at col 2 — populates caches under colonyId=1.
+    const { world: worldA } = await makeUndergroundWorldWithFighter(2, 2);
+    tick(worldA, []);
+
+    // Intentionally skip resetFlowFieldCaches(). World B has same colonyId=1
+    // but entrance at col 14 and digFlowFieldDirty=false — the firstDigCompute
+    // latch is false (cache has key) so the recompute would be skipped UNLESS
+    // the colony dirties the field. With the latch check on both dig and
+    // entrance caches, a lingering cache is reused — confirming why the reset
+    // call is load-bearing in bootFresh / bootFromSave.
+    const { world: worldB, antId: antB } = await makeUndergroundWorldWithFighter(14, 14);
+    const beforeB = worldB.ants.posX[antB]! >> FP_SHIFT;
+    tick(worldB, []);
+    const afterB = worldB.ants.posX[antB]! >> FP_SHIFT;
+    // The fighter steps west (toward world A's entrance col 2), NOT east
+    // toward world B's own entrance col 14 — the exact bug fixed by the
+    // reset hook.
+    expect(afterB).toBeLessThan(beforeB);
+
+    // Leave clean state for the next test.
+    resetFlowFieldCaches();
+  });
+
+  it('food chamber routing honors world-B topology after reset', async () => {
+    const { createUndergroundGrid, UndergroundTileState, ugSet, Zone } = await import('./terrain.js');
+    const { FP_ONE } = await import('./fixed.js');
+    const { initAnt: _initAnt } = await import('./ant/ant-store.js');
+
+    function buildCarrierWorld(chamberTileX: number): { world: WorldState; antId: number } {
+      const world = createWorldState(42);
+      const colonyId = 1 as ColonyId;
+      const queenId = allocateEntityId(world);
+      _initAnt(world.ants, queenId, {
+        colonyId,
+        posX: 1024, posY: 1024,
+        task: AntTask.Idle, subTask: 0,
+        speed: 0, lifespan: WORKER_LIFESPAN_TICKS,
+      });
+      const colony = createColonyRecord(colonyId, queenId);
+      colony.foodStored = 10000;
+      colony.digFlowFieldDirty = false;
+      colony.rallyPoint = null;
+      colony.entrances = [{ entranceId: 1, surfaceTileX: 8, surfaceTileY: 5, isOpen: true }];
+      colony.chambers.push({
+        chamberId: 200,
+        chamberType: ChamberType.FoodStorage,
+        foodStored: 0,
+        posX: chamberTileX << FP_SHIFT,
+        posY: 3 << FP_SHIFT,
+        width: 1, height: 1,
+      });
+      world.colonies[colonyId] = colony;
+
+      // Row-3 tunnel fully open for chamber BFS to reach across.
+      const ug = createUndergroundGrid(16, 16);
+      for (let x = 0; x < 16; x++) {
+        ugSet(ug, x, 0, UndergroundTileState.Open);
+        ugSet(ug, x, 1, UndergroundTileState.Open);
+        ugSet(ug, x, 2, UndergroundTileState.Open);
+        ugSet(ug, x, 3, UndergroundTileState.Open);
+      }
+      world.undergroundGrids[colonyId] = ug;
+
+      // Carrier foraging underground at (8,3) with food — targets FoodStorage
+      // chamber via the chamber flow-field.
+      const antId = allocateEntityId(world);
+      _initAnt(world.ants, antId, {
+        colonyId,
+        posX: 8 << FP_SHIFT,
+        posY: 3 << FP_SHIFT,
+        task: AntTask.Foraging,
+        subTask: ForagingSubState.CarryingFood,
+        speed: FP_ONE,
+        lifespan: WORKER_LIFESPAN_TICKS,
+      });
+      world.ants.zone[antId] = Zone.Underground;
+      world.ants.foodCarrying[antId] = 100;
+      colony.workers.push(antId);
+      colony.workerCount = 1;
+
+      return { world, antId };
+    }
+
+    resetFlowFieldCaches();
+    // World A: FoodStorage chamber at (2, 3) → carrier steps west.
+    const { world: worldA, antId: antIdA } = buildCarrierWorld(2);
+    const beforeA = worldA.ants.posX[antIdA]! >> FP_SHIFT;
+    tick(worldA, []);
+    const afterA = worldA.ants.posX[antIdA]! >> FP_SHIFT;
+    expect(afterA).toBeLessThan(beforeA);
+
+    resetFlowFieldCaches();
+
+    // World B: same colonyId, chamber now at (14, 3) → carrier should step east.
+    const { world: worldB, antId: antIdB } = buildCarrierWorld(14);
+    const beforeB = worldB.ants.posX[antIdB]! >> FP_SHIFT;
+    tick(worldB, []);
+    const afterB = worldB.ants.posX[antIdB]! >> FP_SHIFT;
+    expect(afterB).toBeGreaterThan(beforeB);
+
+    resetFlowFieldCaches();
   });
 });

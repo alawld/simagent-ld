@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 10" shape-rendering="geometricPrecision">
+  <!-- Larva body — C-curved grub, white so pool tint can shift it. -->
+  <g fill="#ffffff">
+    <ellipse cx="6" cy="5" rx="4.5" ry="3"/>
+  </g>
+  <!-- Segmentation lines + head end, dark so the form reads at tile scale. -->
+  <g fill="none" stroke="#3a240a" stroke-width="0.55" opacity="0.9">
+    <ellipse cx="6" cy="5" rx="4.5" ry="3"/>
+    <path d="M 3.5 3.5 Q 4 5 3.5 6.5" />
+    <path d="M 6 3 Q 6.5 5 6 7" />
+    <path d="M 8.5 3.5 Q 9 5 8.5 6.5" />
+  </g>
+  <!-- Tiny head accent on the left. -->
+  <circle cx="2.3" cy="5" r="0.5" fill="#3a240a" opacity="0.8"/>
+</svg>

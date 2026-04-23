@@ -58,13 +58,21 @@ describe('computeAntActivity — bucket mapping', () => {
     expect(a.foraging.total).toBe(3);
   });
 
-  it('folds ReturningToNest into carrying (player-facing "got food, going home")', () => {
+  it('splits ReturningToNest into its own returning bucket (failed-search walk home)', () => {
+    // 09 excursion-foraging memo: ReturningToNest is a real, visible sim state
+    // — empty-handed foragers heading back to reset the search leash. The
+    // HUD surfaces it separately from carrying (delivering food) so the
+    // player can tell "my ants are empty-handed coming back" from "my ants
+    // are delivering food".
     const { world, colony } = setupWorld();
     spawnWorker(world, colony, AntTask.Foraging, ForagingSubState.CarryingFood);
     spawnWorker(world, colony, AntTask.Foraging, ForagingSubState.ReturningToNest);
+    spawnWorker(world, colony, AntTask.Foraging, ForagingSubState.ReturningToNest);
     const a = computeAntActivity(world, colony);
-    expect(a.foraging.carrying).toBe(2);
+    expect(a.foraging.carrying).toBe(1);
+    expect(a.foraging.returning).toBe(2);
     expect(a.foraging.searching).toBe(0);
+    expect(a.foraging.total).toBe(3);
   });
 
   it('splits diggers into moving-to-site vs excavating', () => {
@@ -167,6 +175,7 @@ describe('formatAntActivityLines', () => {
     expect(joined).toContain('Larvae: 1');
     expect(joined).toContain('Foraging: 2');
     expect(joined).toContain('searching: 1');
+    expect(joined).toContain('returning: 0');
     expect(joined).toContain('carrying:  1');
     expect(joined).toContain('Digging:  1');
     expect(joined).toContain('digging:   1');

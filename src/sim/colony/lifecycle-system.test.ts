@@ -11,7 +11,9 @@ import { tickQueenEggProduction, tickLifecycleTransitions } from './lifecycle-sy
 import { createWorldState } from '../types.js';
 import { createColonyRecord } from './colony-store.js';
 import { initAnt } from '../ant/ant-store.js';
-import { AntTask } from '../enums.js';
+import { AntTask, ChamberType } from '../enums.js';
+import { Zone } from '../terrain.js';
+import { FP_SHIFT } from '../fixed.js';
 import {
   QUEEN_EGG_INTERVAL_TICKS,
   QUEEN_EGG_FOOD_THRESHOLD,
@@ -34,11 +36,20 @@ const MAX_TEST_ENTITIES = 512;
  * Create a fresh world + colony with a live queen at position (queenX, queenY).
  * The queen entity is allocated as entity 0; the colony record references it.
  * foodStored defaults to 10_000 (well above QUEEN_EGG_FOOD_THRESHOLD).
+ *
+ * By default, both a Queen chamber and a Nursery chamber are pushed to
+ * colony.chambers as "completed" so the 09 reproduction-gate memo unlocks
+ * egg-laying for the baseline test scenarios. Tests that need to exercise
+ * the chamber gates themselves pass `chambers = []` (or a subset).
  */
 function setupWorldWithQueen(
   foodStored: number = 10_000,
   queenX = 1024,
   queenY = 512,
+  chambers: ReadonlyArray<{ chamberType: ChamberType }> = [
+    { chamberType: ChamberType.Queen },
+    { chamberType: ChamberType.Nursery },
+  ],
 ): { world: WorldState; colony: ColonyRecord } {
   const world = createWorldState(42, MAX_TEST_ENTITIES);
   const queenId = world.nextEntityId; // 0
@@ -54,6 +65,27 @@ function setupWorldWithQueen(
 
   const colony = createColonyRecord(COLONY_ID, queenId);
   colony.foodStored = foodStored;
+  // Gate 6 (seed936214196-tick2401): tickQueenEggProduction requires the
+  // queen to be Underground AND inside a Queen chamber footprint. For tests
+  // that include a Queen chamber, size it around the queen's tile so the
+  // gate passes; also flip the queen's zone to Underground. Tests that pass
+  // chambers explicitly without a Queen (chamber gate tests) keep their
+  // original assertions — Gate 4 short-circuits before Gate 6.
+  const queenTileX = queenX >> FP_SHIFT;
+  const queenTileY = queenY >> FP_SHIFT;
+  world.ants.zone[queenId] = Zone.Underground;
+  for (let i = 0; i < chambers.length; i++) {
+    const isQueen = chambers[i]!.chamberType === ChamberType.Queen;
+    colony.chambers.push({
+      chamberId:   1000 + i,
+      chamberType: chambers[i]!.chamberType,
+      foodStored:  0,
+      posX:        isQueen ? (queenTileX << FP_SHIFT) : 0,
+      posY:        isQueen ? (queenTileY << FP_SHIFT) : 0,
+      width:       2,
+      height:      2,
+    });
+  }
   world.colonies[COLONY_ID] = colony;
 
   return { world, colony };
@@ -130,6 +162,120 @@ describe('tickQueenEggProduction — CLNY-01', () => {
     const eggId = colony.eggs[0]!;
     expect(world.ants.posX[eggId]).toBe(QUEEN_X);
     expect(world.ants.posY[eggId]).toBe(QUEEN_Y);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 09 reproduction-gate memo — chamber gates (Queen AND Nursery required)
+// ---------------------------------------------------------------------------
+
+describe('tickQueenEggProduction — 09 reproduction-gate memo', () => {
+  it('6a. does NOT produce an egg with zero chambers (pre-excavation)', () => {
+    const { world, colony } = setupWorldWithQueen(10_000, 1024, 512, []);
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+    expect(colony.eggCount).toBe(0);
+  });
+
+  it('6b. does NOT produce an egg with only a Queen chamber (Nursery missing)', () => {
+    const { world, colony } = setupWorldWithQueen(
+      10_000, 1024, 512,
+      [{ chamberType: ChamberType.Queen }],
+    );
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+    expect(colony.eggCount).toBe(0);
+  });
+
+  it('6c. does NOT produce an egg with only a Nursery chamber (Queen missing)', () => {
+    const { world, colony } = setupWorldWithQueen(
+      10_000, 1024, 512,
+      [{ chamberType: ChamberType.Nursery }],
+    );
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+    expect(colony.eggCount).toBe(0);
+  });
+
+  it('6d. produces an egg once both Queen and Nursery are present', () => {
+    const { world, colony } = setupWorldWithQueen(
+      10_000, 1024, 512,
+      [{ chamberType: ChamberType.Queen }, { chamberType: ChamberType.Nursery }],
+    );
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(1);
+    expect(colony.eggCount).toBe(1);
+  });
+
+  it('6e. FoodStorage alone does not satisfy either gate', () => {
+    const { world, colony } = setupWorldWithQueen(
+      10_000, 1024, 512,
+      [{ chamberType: ChamberType.FoodStorage }],
+    );
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gate 6 — queen must be Underground and inside Queen chamber footprint.
+// seed936214196-tick2401 fix: eggs no longer spawn while the queen is still
+// routing (Surface or tunnel). Once she arrives, eggs spawn at her tile,
+// which is guaranteed to be inside the Queen chamber.
+// ---------------------------------------------------------------------------
+
+describe('tickQueenEggProduction — Gate 6 queen-in-chamber', () => {
+  it('6f. does NOT lay egg while queen is on the surface (in transit)', () => {
+    const { world, colony } = setupWorldWithQueen();
+    world.tick = 0;
+    world.ants.zone[colony.queenEntityId] = Zone.Surface;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+  });
+
+  it('6g. does NOT lay egg while queen is underground but outside Queen chamber', () => {
+    const { world, colony } = setupWorldWithQueen();
+    world.tick = 0;
+    // Move queen outside any Queen chamber footprint (far-away tile).
+    world.ants.posX[colony.queenEntityId] = 40 << FP_SHIFT;
+    world.ants.posY[colony.queenEntityId] = 40 << FP_SHIFT;
+    // zone already Underground from setup helper.
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+  });
+
+  it('6h. lays egg (Zone.Underground) at queen position once she is inside Queen chamber', () => {
+    const QUEEN_X = 10 << FP_SHIFT;
+    const QUEEN_Y = 10 << FP_SHIFT;
+    const { world, colony } = setupWorldWithQueen(10_000, QUEEN_X, QUEEN_Y);
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(1);
+    const eggId = colony.eggs[0]!;
+    expect(world.ants.posX[eggId]).toBe(QUEEN_X);
+    expect(world.ants.posY[eggId]).toBe(QUEEN_Y);
+    expect(world.ants.zone[eggId]).toBe(Zone.Underground);
   });
 });
 
@@ -329,6 +475,162 @@ describe('tickLifecycleTransitions — dead entity cleanup', () => {
 
     expect(colony.larvae.length).toBe(0);
     expect(colony.larvaeCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 09 reproduction-gate memo — brood-aging gate (legacy / save-loaded brood)
+//
+// Even though tickQueenEggProduction cannot lay eggs without a completed
+// Nursery, the brood-aging loops must also be frozen if the colony lacks a
+// completed Nursery at this tick. Otherwise a save file with brood but no
+// Nursery could still produce workers, violating the design rule that brood
+// requires Nursery support. Worker aging (Loop 3) is unaffected.
+// ---------------------------------------------------------------------------
+
+describe('tickLifecycleTransitions — brood-aging gate (09 reproduction-gate memo)', () => {
+  it('17. egg does NOT age without a completed Nursery chamber', () => {
+    // No chambers at all — brood should freeze.
+    const { world, colony } = setupWorldWithQueen(10_000, 1024, 512, []);
+
+    const eggId = world.nextEntityId++;
+    initAnt(world.ants, eggId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.age[eggId] = 0;
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+
+    // Run well past EGG_HATCH_TICKS — without a Nursery the egg must not age.
+    for (let t = 0; t < EGG_HATCH_TICKS + 500; t++) {
+      tickLifecycleTransitions(world, colony);
+    }
+
+    expect(world.ants.age[eggId]).toBe(0);
+    expect(colony.eggs.length).toBe(1);
+    expect(colony.eggs).toContain(eggId);
+    expect(colony.larvae.length).toBe(0);
+    expect(colony.workers.length).toBe(0);
+  });
+
+  it('18. larva does NOT age or promote without a completed Nursery chamber', () => {
+    const { world, colony } = setupWorldWithQueen(10_000, 1024, 512, []);
+
+    const larvaId = world.nextEntityId++;
+    initAnt(world.ants, larvaId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.age[larvaId] = 0;
+    colony.larvae.push(larvaId);
+    colony.larvaeCount = 1;
+
+    for (let t = 0; t < LARVA_MATURE_TICKS + 500; t++) {
+      tickLifecycleTransitions(world, colony);
+    }
+
+    expect(world.ants.age[larvaId]).toBe(0);
+    expect(colony.larvae.length).toBe(1);
+    expect(colony.larvae).toContain(larvaId);
+    expect(colony.workers.length).toBe(0);
+  });
+
+  it('19. Queen chamber alone (Nursery missing) still freezes brood', () => {
+    const { world, colony } = setupWorldWithQueen(
+      10_000, 1024, 512,
+      [{ chamberType: ChamberType.Queen }],
+    );
+
+    const eggId = world.nextEntityId++;
+    initAnt(world.ants, eggId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.age[eggId] = EGG_HATCH_TICKS - 1; // one tick from hatching
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+
+    tickLifecycleTransitions(world, colony);
+
+    // Without a Nursery, the egg must not hatch even when on the hatch threshold.
+    expect(world.ants.age[eggId]).toBe(EGG_HATCH_TICKS - 1);
+    expect(colony.eggs).toContain(eggId);
+    expect(colony.larvae.length).toBe(0);
+  });
+
+  it('20. dead brood is still cleaned up when Nursery is missing', () => {
+    // Freeze does NOT delay death cleanup — dead entries must still be
+    // swap-removed so starvation / death pipelines stay responsive.
+    const { world, colony } = setupWorldWithQueen(10_000, 1024, 512, []);
+
+    const eggId = world.nextEntityId++;
+    initAnt(world.ants, eggId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.alive[eggId] = 0;
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+
+    const larvaId = world.nextEntityId++;
+    initAnt(world.ants, larvaId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.alive[larvaId] = 0;
+    colony.larvae.push(larvaId);
+    colony.larvaeCount = 1;
+
+    tickLifecycleTransitions(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+    expect(colony.eggCount).toBe(0);
+    expect(colony.larvae.length).toBe(0);
+    expect(colony.larvaeCount).toBe(0);
+  });
+
+  it('21. workers continue aging even when Nursery is missing', () => {
+    // The brood freeze applies only to eggs/larvae. Adult workers keep aging
+    // regardless of chamber state — losing the Nursery does not freeze
+    // existing adults.
+    const { world, colony } = setupWorldWithQueen(10_000, 1024, 512, []);
+
+    const workerId = world.nextEntityId++;
+    initAnt(world.ants, workerId, {
+      colonyId: COLONY_ID,
+      posX:     0,
+      posY:     0,
+      task:     AntTask.Idle,
+      speed:    WORKER_BASE_SPEED,
+    });
+    world.ants.age[workerId] = 0;
+    colony.workers.push(workerId);
+    colony.workerCount = 1;
+
+    tickLifecycleTransitions(world, colony);
+    tickLifecycleTransitions(world, colony);
+    tickLifecycleTransitions(world, colony);
+
+    expect(world.ants.age[workerId]).toBe(3);
+    expect(colony.workers).toContain(workerId);
+  });
+
+  it('22. adding a Nursery mid-life unfreezes brood (hatch completes)', () => {
+    // Legacy brood carried over from a save: if the player completes a Nursery
+    // later, brood must resume aging and promote normally.
+    const { world, colony } = setupWorldWithQueen(10_000, 1024, 512, []);
+
+    const eggId = world.nextEntityId++;
+    initAnt(world.ants, eggId, { colonyId: COLONY_ID, posX: 0, posY: 0 });
+    world.ants.age[eggId] = 0;
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+
+    // Freeze for 500 ticks without Nursery
+    for (let t = 0; t < 500; t++) tickLifecycleTransitions(world, colony);
+    expect(world.ants.age[eggId]).toBe(0);
+
+    // Complete a Nursery — brood unfreezes.
+    colony.chambers.push({
+      chamberId:   2001,
+      chamberType: ChamberType.Nursery,
+      foodStored:  0,
+      posX:        0,
+      posY:        0,
+      width:       2,
+      height:      2,
+    });
+
+    for (let t = 0; t < EGG_HATCH_TICKS; t++) tickLifecycleTransitions(world, colony);
+
+    expect(colony.eggs.length).toBe(0);
+    expect(colony.larvae).toContain(eggId);
   });
 });
 

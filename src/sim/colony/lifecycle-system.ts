@@ -20,7 +20,10 @@ import type { WorldState } from '../types.js';
 import { allocateEntityId } from '../types.js';
 import { initAnt } from '../ant/ant-store.js';
 import type { ColonyRecord } from './colony-store.js';
-import { AntTask } from '../enums.js';
+import { AntTask, ChamberType } from '../enums.js';
+import { hasCompletedChamber } from './colony-system.js';
+import { Zone } from '../terrain.js';
+import { FP_SHIFT } from '../fixed.js';
 import {
   QUEEN_EGG_INTERVAL_TICKS,
   QUEEN_EGG_FOOD_THRESHOLD,
@@ -34,10 +37,27 @@ import {
 // ---------------------------------------------------------------------------
 // tickQueenEggProduction — CLNY-01
 //
-// Gating order (PRD §4b line 980):
+// Gating order (PRD §4b line 980 + 09 reproduction-gate memo):
 //   1. Tick-modulo gate:  world.tick % QUEEN_EGG_INTERVAL_TICKS !== 0 → return
 //   2. Food threshold:    colony.foodStored < QUEEN_EGG_FOOD_THRESHOLD → return
 //   3. Queen alive:       world.ants.alive[colony.queenEntityId] !== 1 → return
+//   4. Queen chamber:     colony has at least one COMPLETED Queen chamber (09 memo)
+//   5. Nursery chamber:   colony has at least one COMPLETED Nursery chamber (09 memo)
+//   6. Queen in chamber:  queen entity Underground and inside a Queen chamber
+//                         footprint — debug seed936214196-tick2401 fix. While
+//                         she is still routing (Surface / tunnel), no eggs lay
+//                         so brood never spawns on the surface. Once she
+//                         arrives, eggs naturally spawn at her Queen-chamber
+//                         tile (reused spawn at queen posX/posY).
+//
+// The chamber gates turn reproduction into an explicit progression unlock: the
+// player must excavate both a Queen chamber and a Nursery before brood can
+// accumulate. This prevents the pre-memo failure mode where a brand-new colony
+// started laying eggs against an empty tunnel, forcing every worker into
+// Nursing and starving the queen (see gsd-debug 09 session).
+//
+// Pending chambers do NOT satisfy either gate — colony.chambers only contains
+// promoted entries (see checkPendingChambers, single-path creation invariant).
 //
 // When all gates pass:
 //   - Allocate new entity via allocateEntityId(world)
@@ -58,6 +78,35 @@ export function tickQueenEggProduction(world: WorldState, colony: ColonyRecord):
   // Gate 3: queen alive
   if (world.ants.alive[colony.queenEntityId] !== 1) return;
 
+  // Gate 4/5 (09 reproduction-gate memo): require completed Queen + Nursery
+  // chambers before the queen starts laying. Either missing → no eggs.
+  if (!hasCompletedChamber(colony, ChamberType.Queen))   return;
+  if (!hasCompletedChamber(colony, ChamberType.Nursery)) return;
+
+  // Gate 6 (seed936214196-tick2401 fix): queen must be inside the Queen
+  // chamber footprint. Until she has physically routed there (handled by
+  // moveQueens in ant-system.ts), no eggs lay — this prevents eggs being
+  // spawned on the surface at the queen's starting tile.
+  const queenId = colony.queenEntityId;
+  if (world.ants.zone[queenId] !== Zone.Underground) return;
+  const queenTileX = world.ants.posX[queenId]! >> FP_SHIFT;
+  const queenTileY = world.ants.posY[queenId]! >> FP_SHIFT;
+  let queenHome = false;
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const ch = colony.chambers[c]!;
+    if (ch.chamberType !== ChamberType.Queen) continue;
+    const bx = ch.posX >> FP_SHIFT;
+    const by = ch.posY >> FP_SHIFT;
+    if (
+      queenTileX >= bx && queenTileX < bx + ch.width &&
+      queenTileY >= by && queenTileY < by + ch.height
+    ) {
+      queenHome = true;
+      break;
+    }
+  }
+  if (!queenHome) return;
+
   // Allocate + init new egg entity
   const eggId = allocateEntityId(world);
   initAnt(world.ants, eggId, {
@@ -68,6 +117,7 @@ export function tickQueenEggProduction(world: WorldState, colony: ColonyRecord):
     subTask:  0,
     speed:    0,                  // eggs don't move
     lifespan: WORKER_LIFESPAN_TICKS,
+    zone:     Zone.Underground,   // Gate 6 guarantees queen is Underground
   });
 
   colony.eggs.push(eggId);
@@ -100,6 +150,20 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
   const larvaeSnapLen  = colony.larvae.length;
   const workersSnapLen = colony.workers.length;
 
+  // 09 reproduction-gate memo — brood-aging gate. Egg production is already
+  // blocked without a completed Queen + Nursery chamber (tickQueenEggProduction
+  // gate 4/5), but legacy / save-loaded / debug-seeded eggs and larvae must
+  // also be frozen if the colony lacks a completed Nursery at this tick — they
+  // must not age or promote. Without this, a save file with brood but no
+  // Nursery could still produce workers, violating the agreed design rule
+  // that brood requires Nursery support.
+  //
+  // Freeze semantics: age++ and promotion are skipped for eggs and larvae.
+  // Dead-entry swap-remove still runs so starvation / death cleanup is not
+  // delayed. Worker aging (Loop 3) is unaffected — existing workers continue
+  // to age normally regardless of chamber state.
+  const broodFrozen = !hasCompletedChamber(colony, ChamberType.Nursery);
+
   // ------------------------------------------------------------------
   // Loop 1: Eggs — age + transition to larva on EGG_HATCH_TICKS
   // Backwards iteration + swap-remove preserves O(1) per promotion.
@@ -115,6 +179,8 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
       colony.eggCount -= 1;
       continue;
     }
+
+    if (broodFrozen) continue; // no age++, no promotion while Nursery missing
 
     const eggAge = ants.age[id]! + 1;
     ants.age[id] = eggAge;
@@ -146,6 +212,8 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
       colony.larvaeCount -= 1;
       continue;
     }
+
+    if (broodFrozen) continue; // no age++, no promotion while Nursery missing
 
     const larvaAge = ants.age[id]! + 1;
     ants.age[id] = larvaAge;

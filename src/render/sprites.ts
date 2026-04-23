@@ -66,6 +66,9 @@ export const COLOR_CHAMBER_NURSERY = 0x0d1a0d;
 /** PRD §7g — Food storage chamber floor color. */
 export const COLOR_CHAMBER_FOOD_STORAGE = 0x1a1400;
 
+/** Visible amber for the stored-food fill inside FoodStorage chambers. */
+export const COLOR_CHAMBER_FOOD_STORAGE_FILL = 0xb8872a;
+
 /** PRD §7g — Player colony ant body color. */
 export const COLOR_PLAYER_COLONY = 0x4a2800;
 

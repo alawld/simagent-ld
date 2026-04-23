@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" shape-rendering="crispEdges">
+  <!-- Stacked amber food crumbs / grain pile.
+       Rendered as a cluster of rounded squares so multiple stacked tiles
+       still read as distinct caches. White fill — the pool applies the
+       amber tint (COLOR_CHAMBER_FOOD_STORAGE_FILL) so future callers can
+       retint without touching the SVG. -->
+  <g fill="#ffffff">
+    <rect x="2"  y="9"  width="4" height="4" rx="0.8"/>
+    <rect x="7"  y="8"  width="4" height="5" rx="0.8"/>
+    <rect x="11" y="10" width="3" height="3" rx="0.8"/>
+    <rect x="5"  y="4"  width="4" height="4" rx="0.8"/>
+    <rect x="9"  y="3"  width="3" height="3" rx="0.8"/>
+  </g>
+  <!-- Subtle outline so the caches pop against the amber chamber floor. -->
+  <g fill="none" stroke="#4a2d08" stroke-width="0.6" opacity="0.7">
+    <rect x="2"  y="9"  width="4" height="4" rx="0.8"/>
+    <rect x="7"  y="8"  width="4" height="5" rx="0.8"/>
+    <rect x="11" y="10" width="3" height="3" rx="0.8"/>
+    <rect x="5"  y="4"  width="4" height="4" rx="0.8"/>
+    <rect x="9"  y="3"  width="3" height="3" rx="0.8"/>
+  </g>
+</svg>

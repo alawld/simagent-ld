@@ -196,6 +196,28 @@ describe('WorldState', () => {
         src.ants.searchWave[0] = 0;
         expect(dst.ants.searchWave[0]).toBe(3);
       });
+
+      it('Phase 9 ant fields: searchPrevTileX/Y copied (09 excursion-foraging follow-up)', () => {
+        // Anti-backtrack prev-tile fields are live sim state read by the
+        // pheromone sampler and excursion-boundary stale-trap check. A dropped
+        // copy would desync prevState from curr and also mask anti-backtrack
+        // regressions in any test that drives ticks via the render loop.
+        src.ants.searchPrevTileX[0] = 11;
+        src.ants.searchPrevTileY[0] = 22;
+        src.ants.searchPrevTileX[1] = -1; // sentinel round-trips unchanged
+        src.ants.searchPrevTileY[1] = -1;
+        copyWorldState(src, dst);
+        expect(dst.ants.searchPrevTileX[0]).toBe(11);
+        expect(dst.ants.searchPrevTileY[0]).toBe(22);
+        expect(dst.ants.searchPrevTileX[1]).toBe(-1);
+        expect(dst.ants.searchPrevTileY[1]).toBe(-1);
+        // Independence: mutating src after copy must NOT propagate to dst
+        // (set() copies by value — this proves the arrays aren't aliased).
+        src.ants.searchPrevTileX[0] = 99;
+        src.ants.searchPrevTileY[0] = 99;
+        expect(dst.ants.searchPrevTileX[0]).toBe(11);
+        expect(dst.ants.searchPrevTileY[0]).toBe(22);
+      });
     });
 
     describe('colonies', () => {

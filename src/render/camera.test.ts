@@ -10,6 +10,7 @@ import { describe, it, expect } from 'vitest';
 import {
   VIEWPORT_WIDTH_TILES,
   VIEWPORT_HEIGHT_TILES,
+  UNDERGROUND_INITIAL_CAMERA_Y,
   createViewState,
   resetViewState,
   toggleView,
@@ -17,7 +18,6 @@ import {
   screenToTile,
 } from './camera.js';
 import { TILE_SIZE_PX } from './sprites.js';
-import { UNDERGROUND_GRID_HEIGHT } from '../sim/constants.js';
 
 // Convenience: default viewport camera
 function makeCamera(x: number, y: number) {
@@ -40,10 +40,15 @@ describe('createViewState', () => {
     expect(vs.surfaceCamera.y).toBe(64);
   });
 
-  it('undergroundCamera starts at (startTileX, UNDERGROUND_GRID_HEIGHT/2 = 32)', () => {
+  it('undergroundCamera starts at (startTileX, UNDERGROUND_INITIAL_CAMERA_Y) — starter shaft near top', () => {
+    // UNDERGROUND_INITIAL_CAMERA_Y = VIEWPORT_HEIGHT_TILES / 2 = 18.5 (the clamp
+    // minimum Y), which places underground tile row 0 at the very top of the
+    // viewport. The starter entrance / shaft row is visible on first view,
+    // giving the player an immediate surface→underground connection.
     const vs = createViewState(24, 64);
     expect(vs.undergroundCamera.x).toBe(24);
-    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2); // 32
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_INITIAL_CAMERA_Y);
+    expect(UNDERGROUND_INITIAL_CAMERA_Y).toBe(VIEWPORT_HEIGHT_TILES / 2);
   });
 
   it('undergroundVisited is false initially', () => {
@@ -91,26 +96,26 @@ describe('resetViewState', () => {
     expect(vs.surfaceCamera.y).toBe(64);
   });
 
-  it('rebinds undergroundCamera to (start, UNDERGROUND_GRID_HEIGHT/2)', () => {
+  it('rebinds undergroundCamera to (start, UNDERGROUND_INITIAL_CAMERA_Y) — starter shaft near top', () => {
     const vs = createViewState(10, 10);
     vs.undergroundCamera.x = 999;
     vs.undergroundCamera.y = 999;
     resetViewState(vs, 24, 64);
     expect(vs.undergroundCamera.x).toBe(24);
-    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_INITIAL_CAMERA_Y);
   });
 
-  it('clears undergroundVisited so the next toggle re-centers Y', () => {
+  it('clears undergroundVisited so the next toggle re-anchors the shaft near the top', () => {
     const vs = createViewState(24, 64);
     toggleView(vs); // → underground, visited=true
     toggleView(vs); // → surface
     expect(vs.undergroundVisited).toBe(true);
     resetViewState(vs, 24, 64);
     expect(vs.undergroundVisited).toBe(false);
-    // Next underground toggle should re-center Y (first-visit semantics).
+    // Next underground toggle should restore the first-visit top anchor.
     vs.undergroundCamera.y = 5;
     toggleView(vs);
-    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_INITIAL_CAMERA_Y);
   });
 
   it('preserves the ViewState object identity (mutates in place)', () => {
@@ -148,7 +153,7 @@ describe('resetViewState', () => {
     expect(vs.surfaceCamera.x).toBe(24);
     expect(vs.surfaceCamera.y).toBe(64);
     expect(vs.undergroundCamera.x).toBe(24);
-    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+    expect(vs.undergroundCamera.y).toBe(UNDERGROUND_INITIAL_CAMERA_Y);
     expect(vs.undergroundVisited).toBe(false);
   });
 });
@@ -166,11 +171,11 @@ describe('toggleView', () => {
       expect(vs.undergroundCamera.x).toBe(50);
     });
 
-    it('undergroundCamera.y is set to UNDERGROUND_GRID_HEIGHT/2 on first visit', () => {
+    it('undergroundCamera.y is anchored at UNDERGROUND_INITIAL_CAMERA_Y (starter shaft near top) on first visit', () => {
       const vs = createViewState(24, 64);
-      vs.undergroundCamera.y = 99; // set to something other than 32 to verify override
+      vs.undergroundCamera.y = 99; // override a prior value to verify the first-visit anchor wins
       toggleView(vs);
-      expect(vs.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2); // 32
+      expect(vs.undergroundCamera.y).toBe(UNDERGROUND_INITIAL_CAMERA_Y);
     });
 
     it('undergroundVisited becomes true', () => {
@@ -212,12 +217,12 @@ describe('toggleView', () => {
   });
 
   describe('third toggle: surface → underground (already visited)', () => {
-    it('undergroundCamera.y is NOT re-centered (preserves prior underground.y)', () => {
+    it('undergroundCamera.y is NOT re-anchored (preserves user-panned underground.y)', () => {
       const vs = createViewState(24, 64);
-      toggleView(vs); // first visit → y set to 32, visited=true
-      vs.undergroundCamera.y = 55; // change underground Y after first visit
+      toggleView(vs); // first visit → y set to UNDERGROUND_INITIAL_CAMERA_Y, visited=true
+      vs.undergroundCamera.y = 55; // simulate a user pan after first visit
       toggleView(vs); // → surface
-      toggleView(vs); // second visit → should NOT re-center to 32
+      toggleView(vs); // second visit → must preserve 55, NOT snap back to the top anchor
       expect(vs.undergroundCamera.y).toBe(55);
     });
 

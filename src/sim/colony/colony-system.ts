@@ -35,6 +35,7 @@ import {
   STARVATION_GRACE_TICKS,
   RECONCILE_INTERVAL_TICKS,
   FOOD_CHAMBER_CAPACITY,
+  BASE_FOOD_STORAGE_CAPACITY,
 } from '../constants.js';
 import { ChamberType } from '../enums.js';
 import { allocateWorkers } from '../behavior/allocation-system.js';
@@ -61,6 +62,56 @@ export function withdrawFood(colony: ColonyRecord, amount: number): boolean {
   if (colony.foodStored < amount) return false;
   colony.foodStored -= amount;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// colonyFoodCapacity — 09 backlog memo: BASE + N × FOOD_CHAMBER_CAPACITY
+//
+// Returns the authoritative capacity for colony.foodStored. N counts only
+// COMPLETED FoodStorage chambers (entries in colony.chambers). Pending
+// FoodStorage chambers do NOT contribute — capacity grows only when the
+// chamber is fully excavated and promoted by checkPendingChambers.
+// ---------------------------------------------------------------------------
+
+/**
+ * Total colony food-storage capacity (fp): BASE + N × FOOD_CHAMBER_CAPACITY,
+ * where N is the number of completed FoodStorage chambers in colony.chambers.
+ *
+ * Pending FoodStorage chambers (world.pendingChambers) do NOT contribute —
+ * promotion happens in checkPendingChambers once excavation completes.
+ */
+export function colonyFoodCapacity(colony: ColonyRecord): number {
+  let n = 0;
+  for (let i = 0; i < colony.chambers.length; i++) {
+    if (colony.chambers[i]!.chamberType === ChamberType.FoodStorage) n += 1;
+  }
+  return BASE_FOOD_STORAGE_CAPACITY + n * FOOD_CHAMBER_CAPACITY;
+}
+
+// ---------------------------------------------------------------------------
+// hasCompletedChamber — generic "colony has chamber of this type" query.
+//
+// Used by the 09 reproduction-gate memo to require Queen + Nursery chambers
+// before the queen lays eggs and before any worker is assigned to Nursing.
+// Pending (un-excavated) chambers do NOT count — only fully-promoted entries
+// in colony.chambers, matching the single-path chamber-creation invariant
+// in checkPendingChambers.
+// ---------------------------------------------------------------------------
+
+/**
+ * True if `colony` owns at least one COMPLETED chamber of `chamberType`.
+ * Pending chambers (world.pendingChambers) are ignored — capacity/feature
+ * unlocks only trigger once excavation finishes and checkPendingChambers
+ * promotes the pending record into colony.chambers.
+ */
+export function hasCompletedChamber(
+  colony: ColonyRecord,
+  chamberType: ChamberType,
+): boolean {
+  for (let i = 0; i < colony.chambers.length; i++) {
+    if (colony.chambers[i]!.chamberType === chamberType) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +317,12 @@ export function tickReconcile(world: WorldState, colony: ColonyRecord): void {
   // When FoodStorage chambers exist, derive their contents from the authoritative
   // total (each capped at FOOD_CHAMBER_CAPACITY). colony.foodStored stays unchanged.
   if (colony.foodStored < 0) colony.foodStored = 0;
+  // 09 backlog memo — defensively clamp to colonyFoodCapacity. Deposits are
+  // clamped at the antDepositFood source, so this should be a no-op in steady
+  // state; the clamp is a backstop against any future code path that writes
+  // colony.foodStored directly without going through antDepositFood.
+  const cap = colonyFoodCapacity(colony);
+  if (colony.foodStored > cap) colony.foodStored = cap;
 
   if (colony.chambers.length > 0) {
     let distributed = 0;
@@ -279,9 +336,11 @@ export function tickReconcile(world: WorldState, colony: ColonyRecord): void {
     }
   }
 
-  // Recompute allocation with corrected counts (PRD §2 reconcile contract)
+  // Recompute allocation with corrected counts (PRD §2 reconcile contract +
+  // 09 reproduction-gate memo: nursing requires a completed Nursery chamber).
   const brood = colony.eggCount + colony.larvaeCount;
-  const alloc = allocateWorkers(colony.workerCount, brood, colony.targetRatio);
+  const hasNursery = hasCompletedChamber(colony, ChamberType.Nursery);
+  const alloc = allocateWorkers(colony.workerCount, brood, colony.targetRatio, hasNursery);
   colony.computedAllocation.nurse  = alloc.nurse;
   colony.computedAllocation.forage = alloc.forage;
   colony.computedAllocation.dig    = alloc.dig;

@@ -1,10 +1,13 @@
 // draw-surface.ts — Phase 8 surface view drawing module.
 //
-// Pure functions: take a GfxLike + WorldState snapshots, issue Graphics API calls.
-// No scene management, no input handling, no state mutation.
+// Pure functions: take a GfxLike + AntSpriteLayer + WorldState snapshots,
+// issue Graphics API calls and AntSpriteLayer.drawAnt calls. No scene
+// management, no input handling, no state mutation.
 //
-// Uses ONLY Graphics primitives: fillRect, fillCircle, strokeCircle, fillTriangle,
-// lineStyle, fillStyle — NO Image, NO Sprite, NO texture loading (HUD-05).
+// Non-ant primitives use ONLY Graphics: fillRect, fillCircle, strokeCircle,
+// fillTriangle, lineStyle, fillStyle. Ants go through the AntSpriteLayer —
+// GameScene plugs in a Phaser-backed sprite pool; tests plug in a recording
+// mock. draw-surface.ts itself remains Phaser-free.
 //
 // Draw order: drawSurface calls drawSurfaceTerrain then drawSurfaceEntities.
 // Pheromone overlay is NOT called from here — GameScene calls drawPheromoneOverlay
@@ -15,6 +18,7 @@ import { isAlive } from '../sim/ant/ant-store.js';
 import { FP_ONE } from '../sim/fixed.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { WorldState } from '../sim/types.js';
+import type { AntSpriteLayer } from './ant-sprite-layer.js';
 import {
   TILE_SIZE_PX,
   COLOR_SURFACE_GRASS_PRIMARY,
@@ -27,6 +31,7 @@ import {
   COLOR_QUEEN_OUTLINE,
   COLOR_RALLY_POINT,
 } from './sprites.js';
+export type { AntSpriteLayer } from './ant-sprite-layer.js';
 import type { CameraState } from './camera.js';
 
 // ---------------------------------------------------------------------------
@@ -109,6 +114,7 @@ export function drawSurfaceTerrain(gfx: GfxLike, world: WorldState, cam: CameraS
  */
 export function drawSurfaceEntities(
   gfx: GfxLike,
+  sprites: AntSpriteLayer,
   prev: WorldState,
   curr: WorldState,
   alpha: number,
@@ -165,10 +171,17 @@ export function drawSurfaceEntities(
   }
 
   // --- Ants on surface (zone === 0) ---
+  // Wrong-plane flicker guard (09 render polish): when an ant's zone flipped
+  // between prev and curr (e.g. queen descending through an entrance), OR when
+  // the slot wasn't alive in prev (a freshly-spawned ant whose prev.posX/Y is
+  // a stale default like 0), interpolating prev→curr briefly draws the ant
+  // somewhere it never actually was. Snap to the curr position in those cases.
   const maxId = curr.ants.alive.length;
   for (let id = 0; id < maxId; id++) {
     if (!isAlive(curr.ants, id)) continue;
     if (curr.ants.zone[id] !== 0) continue; // surface only
+
+    const useInterp = isAlive(prev.ants, id) && prev.ants.zone[id] === curr.ants.zone[id];
 
     // Interpolate position: fixed-point → pixel. Multiply BEFORE dividing so
     // sub-tile precision survives — truncating with `>> FP_SHIFT` first would
@@ -179,8 +192,10 @@ export function drawSurfaceEntities(
     const prevPxY = (prev.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
     const currPxY = (curr.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
 
-    const screenX = prevPxX + (currPxX - prevPxX) * alpha - left * TILE_SIZE_PX;
-    const screenY = prevPxY + (currPxY - prevPxY) * alpha - top  * TILE_SIZE_PX;
+    const baseX = useInterp ? prevPxX + (currPxX - prevPxX) * alpha : currPxX;
+    const baseY = useInterp ? prevPxY + (currPxY - prevPxY) * alpha : currPxY;
+    const screenX = baseX - left * TILE_SIZE_PX;
+    const screenY = baseY - top  * TILE_SIZE_PX;
 
     // Trivial viewport cull
     if (screenX < -TILE_SIZE_PX || screenX > canvasW || screenY < -TILE_SIZE_PX || screenY > canvasH) continue;
@@ -191,17 +206,23 @@ export function drawSurfaceEntities(
 
     const color = colonyId === PLAYER_COLONY_ID ? COLOR_PLAYER_COLONY : COLOR_ENEMY_COLONY;
 
-    if (isQueen) {
-      // Phase 8.5 readability: larger body + thicker gold ring so the queen
-      // is immediately distinguishable from a worker cluster.
-      gfx.fillStyle(color, 1);
-      gfx.fillRect(screenX - 6, screenY - 6, 12, 12);
-      gfx.lineStyle(2, COLOR_QUEEN_OUTLINE, 1);
-      gfx.strokeCircle(screenX, screenY, 9);
-    } else {
-      gfx.fillStyle(color, 1);
-      gfx.fillRect(screenX - 3, screenY - 3, 6, 6);
-    }
+    // Facing: rotate the SVG (head on -x natively) so the head points along
+    // the interpolated motion vector. When the ant is stationary (dx=dy=0)
+    // use rotation=0 so the sprite holds a stable default pose instead of
+    // jittering. When we skipped interpolation (zone flip / spawn frame), the
+    // prev→curr delta doesn't represent motion either — also fall back to 0.
+    // See AntSpriteDrawOptions.rotation for the math.
+    const dx = currPxX - prevPxX;
+    const dy = currPxY - prevPxY;
+    const rotation = (!useInterp || Math.abs(dx) + Math.abs(dy) < 0.01) ? 0 : Math.atan2(-dy, -dx);
+
+    sprites.drawAnt({
+      kind: isQueen ? 'queen' : 'worker',
+      x: screenX,
+      y: screenY,
+      tint: color,
+      rotation,
+    });
   }
 
   // --- Rally-point marker (Phase 9 usability fix) ---
@@ -261,6 +282,7 @@ export function drawSurfaceEntities(
  */
 export function drawSurface(
   gfx: GfxLike,
+  sprites: AntSpriteLayer,
   prev: WorldState,
   curr: WorldState,
   alpha: number,
@@ -268,5 +290,5 @@ export function drawSurface(
   pendingEntrance: { tileX: number; tileY: number } | null = null,
 ): void {
   drawSurfaceTerrain(gfx, curr, cam);
-  drawSurfaceEntities(gfx, prev, curr, alpha, cam, pendingEntrance);
+  drawSurfaceEntities(gfx, sprites, prev, curr, alpha, cam, pendingEntrance);
 }

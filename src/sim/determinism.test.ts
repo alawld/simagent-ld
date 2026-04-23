@@ -12,7 +12,7 @@ import { createWorldState, allocateEntityId } from './types.js';
 import { initAnt } from './ant/ant-store.js';
 import { createColonyRecord } from './colony/colony-store.js';
 import { createPheromoneGrid, phGet, pheromoneGridKey } from './pheromone/pheromone-store.js';
-import { AntTask, PheromoneType, ForagingSubState } from './enums.js';
+import { AntTask, PheromoneType, ForagingSubState, ChamberType } from './enums.js';
 import {
   WORKER_LIFESPAN_TICKS,
   WORKER_BASE_SPEED,
@@ -120,6 +120,45 @@ function buildWorld(seed: number): { world: WorldState; queenId: number; colonyI
   });
   world.colonies[1] = createColonyRecord(1, queenId);
   world.colonies[1]!.foodStored = 100000;
+  // 09 backlog: seed enough FoodStorage chambers so colonyFoodCapacity accommodates
+  // the synthetic 100000fp head-start (tickReconcile now clamps foodStored to
+  // capacity, so a chamberless colony would lose all but BASE_FOOD_STORAGE_CAPACITY
+  // at tick 100 and starve the queen before Test 6's pipeline completes).
+  // 20 chambers ⇒ cap = 2048 + 20×5120 = 104448fp, comfortably above 100000.
+  for (let i = 0; i < 20; i++) {
+    world.colonies[1]!.chambers.push({
+      chamberId:   1000 + i,
+      chamberType: ChamberType.FoodStorage,
+      foodStored:  0,
+      posX:        0,
+      posY:        0,
+      width:       3,
+      height:      3,
+    });
+  }
+  // 09 reproduction-gate memo: queen egg production requires a completed
+  // Queen chamber AND a completed Nursery chamber. Seed both so the lifecycle
+  // pipeline (Test 6) reaches the first worker by tick 3600.
+  //
+  // seed936214196-tick2401 Gate 6: tickQueenEggProduction now also requires
+  // the queen to be Underground AND physically inside the Queen chamber
+  // footprint. Anchor the Queen chamber around the queen's tile (32,32) and
+  // flip her zone to Underground so the pipeline is unblocked without having
+  // to simulate relocation via entrances (Test 6 has no entrances or
+  // underground grid — it's a behavior-free lifecycle harness).
+  world.colonies[1]!.chambers.push({
+    chamberId:   1100,
+    chamberType: ChamberType.Queen,
+    foodStored:  0,
+    posX:        32 << FP_SHIFT, posY: 32 << FP_SHIFT, width: 2, height: 2,
+  });
+  world.colonies[1]!.chambers.push({
+    chamberId:   1101,
+    chamberType: ChamberType.Nursery,
+    foodStored:  0,
+    posX:        0, posY: 0, width: 2, height: 2,
+  });
+  world.ants.zone[queenId] = 1; // Zone.Underground — Gate 6 precondition
   // Phase 3 PRD §2a caller-side extension fields (factory does not set these):
   world.colonies[1]!.entrances         = [];
   world.colonies[1]!.rallyPoint        = null;

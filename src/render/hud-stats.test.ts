@@ -6,8 +6,10 @@ import {
   computeHudStats,
   formatAntsLabel,
   formatFoodLabel,
+  formatQueenLabel,
   formatStatsPrefix,
   queenBarRect,
+  queenLabelRect,
   queenHealthBarColor,
   queenHealthBarFillWidth,
   queenHealthState,
@@ -21,8 +23,12 @@ import { allocateEntityId } from '../sim/types.js';
 import { initAnt, killAnt } from '../sim/ant/ant-store.js';
 import { createColonyRecord } from '../sim/colony/colony-store.js';
 import type { ColonyRecord } from '../sim/colony/colony-store.js';
-import { AntTask } from '../sim/enums.js';
-import { STARVATION_GRACE_TICKS } from '../sim/constants.js';
+import { AntTask, ChamberType } from '../sim/enums.js';
+import {
+  STARVATION_GRACE_TICKS,
+  BASE_FOOD_STORAGE_CAPACITY,
+  FOOD_CHAMBER_CAPACITY,
+} from '../sim/constants.js';
 import { FP_SHIFT } from '../sim/fixed.js';
 
 function setupWorld(): { world: WorldState; colony: ColonyRecord; queenId: number } {
@@ -41,6 +47,7 @@ function makeStats(overrides: Partial<HudStats> = {}): HudStats {
   return {
     antCount:       1,
     foodDisplay:    0,
+    foodCapacity:   BASE_FOOD_STORAGE_CAPACITY >> FP_SHIFT,
     queenHealthPct: 100,
     queenAlive:     true,
     ...overrides,
@@ -77,6 +84,32 @@ describe('computeHudStats', () => {
     colony.foodStored = 10 << FP_SHIFT;
     const s = computeHudStats(world, colony);
     expect(s.foodDisplay).toBe(10);
+  });
+
+  it('foodCapacity = base capacity with no FoodStorage chambers', () => {
+    // 09 HUD clarity pass: capacity is reported alongside current food so
+    // the player sees "Food: C/M" and can tell at a glance how much head-
+    // room remains before foragers top out.
+    const { world, colony } = setupWorld();
+    const s = computeHudStats(world, colony);
+    expect(s.foodCapacity).toBe(BASE_FOOD_STORAGE_CAPACITY >> FP_SHIFT);
+  });
+
+  it('foodCapacity grows with completed FoodStorage chambers', () => {
+    const { world, colony } = setupWorld();
+    // Two completed FoodStorage chambers → capacity = BASE + 2 × CHAMBER.
+    // Matches colonyFoodCapacity source-of-truth (sim/colony/colony-system).
+    colony.chambers.push({
+      chamberId: 9001, chamberType: ChamberType.FoodStorage,
+      foodStored: 0, posX: 0, posY: 0, width: 3, height: 3,
+    });
+    colony.chambers.push({
+      chamberId: 9002, chamberType: ChamberType.FoodStorage,
+      foodStored: 0, posX: 10, posY: 10, width: 3, height: 3,
+    });
+    const s = computeHudStats(world, colony);
+    const expected = (BASE_FOOD_STORAGE_CAPACITY + 2 * FOOD_CHAMBER_CAPACITY) >> FP_SHIFT;
+    expect(s.foodCapacity).toBe(expected);
   });
 
   it('queenHealthPct = 100 at full grace', () => {
@@ -118,13 +151,34 @@ describe('label formatters', () => {
     expect(formatAntsLabel(makeStats({ antCount: 42 }))).toBe('Ants: 42');
   });
 
-  it('formatFoodLabel reports integer food', () => {
-    expect(formatFoodLabel(makeStats({ foodDisplay: 7 }))).toBe('Food: 7');
+  it('formatFoodLabel reports current/capacity in human units', () => {
+    // 09 HUD clarity pass: food label is now "Food: C/M" so players can
+    // see headroom at a glance. At base capacity with nothing stored:
+    // "Food: 0/8" (BASE_FOOD_STORAGE_CAPACITY = 2048fp → 8 human units).
+    expect(formatFoodLabel(makeStats({ foodDisplay: 0, foodCapacity: 8 })))
+      .toBe('Food: 0/8');
+    expect(formatFoodLabel(makeStats({ foodDisplay: 8, foodCapacity: 8 })))
+      .toBe('Food: 8/8');
+    // One FoodStorage chamber added: base 8 + chamber 20 = capacity 28.
+    expect(formatFoodLabel(makeStats({ foodDisplay: 8, foodCapacity: 28 })))
+      .toBe('Food: 8/28');
+    expect(formatFoodLabel(makeStats({ foodDisplay: 48, foodCapacity: 48 })))
+      .toBe('Food: 48/48');
   });
 
   it('formatStatsPrefix combines both with two-space separator', () => {
-    expect(formatStatsPrefix(makeStats({ antCount: 11, foodDisplay: 4 })))
-      .toBe('Ants: 11  Food: 4');
+    expect(formatStatsPrefix(makeStats({ antCount: 11, foodDisplay: 4, foodCapacity: 8 })))
+      .toBe('Ants: 11  Food: 4/8');
+  });
+
+  it('formatQueenLabel returns the readable "Queen" word, not a single char', () => {
+    // 09 HUD clarity pass: previous layout used a single 'Q' which players
+    // could not reliably associate with the color-coded bar. Assert the
+    // label is explicitly multi-char and starts with a capital Q.
+    const s = formatQueenLabel();
+    expect(s.length).toBeGreaterThanOrEqual(4);
+    expect(s.startsWith('Q')).toBe(true);
+    expect(s.toLowerCase()).toContain('queen');
   });
 });
 
@@ -199,43 +253,79 @@ describe('queenBarRect', () => {
   });
 });
 
-describe('food/queen layout (09 HUD food-overlap fix)', () => {
-  // The UIScene renderer right-anchors foodText against queenBarRect with a
-  // 6-px gap. These tests lock the math invariant: for any reasonable
-  // monospace text width the food box never runs into the queen bar region,
-  // which was the root of the pre-09 overlap at food ≥ ~100.
-  const FOOD_GAP = 6;
-
-  function foodEndsBeforeQueenBar(foodTextWidth: number): boolean {
-    const bar = queenBarRect({ x: 8, y: 8, w: 200, h: 24 });
-    const foodX = bar.x - foodTextWidth - FOOD_GAP;
-    const foodRightEdge = foodX + foodTextWidth;
-    return foodRightEdge <= bar.x - FOOD_GAP;
-  }
-
-  function antsEndsBeforeFood(antsTextX: number, antsTextWidth: number, foodTextWidth: number): boolean {
-    const bar = queenBarRect({ x: 8, y: 8, w: 200, h: 24 });
-    const foodX = bar.x - foodTextWidth - FOOD_GAP;
-    return antsTextX + antsTextWidth <= foodX;
-  }
-
-  it('right-anchored food for 4-digit totals does not collide with the queen bar', () => {
-    // 10-char monospace "Food: 9999" at 10px font ≈ 60px; leave headroom.
-    expect(foodEndsBeforeQueenBar(60)).toBe(true);
-    expect(foodEndsBeforeQueenBar(70)).toBe(true);
+describe('queenLabelRect (09 HUD clarity pass — two-row layout)', () => {
+  it('sits on row 2, left-anchored with the configured inset', () => {
+    const stats = { x: 8, y: 8, w: 200, h: 24 };
+    const label = queenLabelRect(stats);
+    const { w, yOffset } = HUD_STATS_LAYOUT.queenLabel;
+    expect(label.w).toBe(w);
+    expect(label.x).toBe(stats.x + HUD_STATS_LAYOUT.leftTextInset);
+    expect(label.y).toBe(stats.y + yOffset);
   });
 
-  it('right-anchored food for 6-digit totals does not collide with the queen bar', () => {
-    // 12-char monospace "Food: 999999" ≈ 72px — worst reasonable case.
-    expect(foodEndsBeforeQueenBar(72)).toBe(true);
+  it('label and queen bar on the same row do not overlap', () => {
+    const stats = { x: 8, y: 8, w: 200, h: 24 };
+    const bar   = queenBarRect(stats);
+    const label = queenLabelRect(stats);
+    // Label ends before bar starts — leaves visible spacing.
+    expect(label.x + label.w).toBeLessThan(bar.x);
   });
 
-  it('ants + right-anchored food stay disjoint at realistic colony sizes', () => {
-    // STATS_TEXT_X in ui-scene.ts is HUD.STATS.x + 4 = 12.
-    const antsX = 12;
-    // "Ants: 999" ≈ 54px (9 chars × 6px).
-    expect(antsEndsBeforeFood(antsX, 54, 60)).toBe(true);
-    // Bigger Ants + bigger Food — still OK thanks to the 200px rect budget.
-    expect(antsEndsBeforeFood(antsX, 60, 60)).toBe(true);
+  it('stays inside HUD.STATS both horizontally and vertically', () => {
+    const stats = { x: 8, y: 8, w: 200, h: 24 };
+    const label = queenLabelRect(stats);
+    expect(label.x).toBeGreaterThanOrEqual(stats.x);
+    expect(label.x + label.w).toBeLessThanOrEqual(stats.x + stats.w);
+    expect(label.y).toBeGreaterThanOrEqual(stats.y);
+    expect(label.y + label.h).toBeLessThanOrEqual(stats.y + stats.h);
+  });
+});
+
+describe('two-row stats layout (09 HUD clarity pass)', () => {
+  // Row 1 (Ants + Food) and row 2 (Queen label + bar) must occupy disjoint
+  // vertical bands inside the 24px rect. Food is right-anchored against the
+  // stats rect's right edge (minus FOOD_RIGHT_INSET), so at worst-case food
+  // values it still doesn't collide with anything on row 2.
+  const FOOD_RIGHT_INSET = 6;
+  const stats = { x: 8, y: 8, w: 200, h: 24 };
+
+  it('row 1 and row 2 y-offsets leave at least 10px between baselines', () => {
+    expect(HUD_STATS_LAYOUT.row2YOffset - HUD_STATS_LAYOUT.row1YOffset).toBeGreaterThanOrEqual(10);
+  });
+
+  it('right-anchored food on row 1 never overlaps the queen bar on row 2 horizontally, even at worst-case width', () => {
+    // "Food: 999/999" ≈ 13 chars × 6.4px monospace ≈ 84px — realistic worst case.
+    // Rows are vertically disjoint, so this is a sanity check: food still fits
+    // inside the rect when right-anchored.
+    const foodTextWidth = 90;
+    const foodX = stats.x + stats.w - FOOD_RIGHT_INSET - foodTextWidth;
+    expect(foodX).toBeGreaterThanOrEqual(stats.x + HUD_STATS_LAYOUT.leftTextInset);
+  });
+
+  it('ants + food on row 1 stay disjoint at realistic colony sizes', () => {
+    const antsX = stats.x + HUD_STATS_LAYOUT.leftTextInset;
+    const antsTextWidth = 60;  // "Ants: 999" ≈ 54px, leave headroom
+    const foodTextWidth = 72;  // "Food: 999/999" generous estimate
+    const foodX = stats.x + stats.w - FOOD_RIGHT_INSET - foodTextWidth;
+    expect(antsX + antsTextWidth).toBeLessThanOrEqual(foodX);
+  });
+
+  it('queen label + bar on row 2 stay disjoint', () => {
+    const label = queenLabelRect(stats);
+    const bar   = queenBarRect(stats);
+    expect(label.x + label.w).toBeLessThanOrEqual(bar.x);
+  });
+
+  it('both rows remain inside the HUD.STATS rect vertically', () => {
+    // Approximate rendered height of a 10px monospace Text widget.
+    const TEXT_HEIGHT = 12;
+    const row1Top = stats.y + HUD_STATS_LAYOUT.row1YOffset;
+    const row1Bot = row1Top + TEXT_HEIGHT;
+    const row2Top = stats.y + HUD_STATS_LAYOUT.row2YOffset;
+    const row2Bot = row2Top + TEXT_HEIGHT;
+    expect(row1Top).toBeGreaterThanOrEqual(stats.y);
+    expect(row1Bot).toBeLessThanOrEqual(stats.y + stats.h + 1); // 1px visual slop
+    expect(row2Top).toBeGreaterThanOrEqual(stats.y);
+    expect(row2Bot).toBeLessThanOrEqual(stats.y + stats.h + 2); // 1-2px visual slop
   });
 });

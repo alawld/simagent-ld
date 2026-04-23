@@ -31,11 +31,11 @@
 
 import type { WorldState } from '../types.js';
 import type { ColonyRecord } from '../colony/colony-store.js';
-import { AntTask, ForagingSubState, DiggingSubState, ChamberType, PheromoneType } from '../enums.js';
+import { colonyFoodCapacity, hasCompletedChamber } from '../colony/colony-system.js';
+import { AntTask, ForagingSubState, DiggingSubState, NursingSubState, ChamberType, PheromoneType } from '../enums.js';
 import {
   WORKER_CARRY_CAPACITY,
   FOOD_PICKUP_AMOUNT,
-  FOOD_CHAMBER_CAPACITY,
   DIG_TICKS_PER_TILE,
   SURFACE_GRID_WIDTH,
   SURFACE_GRID_HEIGHT,
@@ -43,12 +43,19 @@ import {
   UNDERGROUND_GRID_HEIGHT,
   SEARCH_LEASH_RADII,
   SEARCH_LEASH_MAX_WAVE,
+  EXCURSION_HEADING_MIN_TICKS,
+  EXCURSION_HEADING_JITTER_TICKS,
+  EXCURSION_TURN_PERCENT,
+  EXCURSION_WOBBLE_PERCENT,
+  ENTRANCE_DEPOSIT_SUPPRESS_RADIUS,
 } from '../constants.js';
 import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import { Rng } from '../rng.js';
 import { depositFoodTrail, sampleForagingDirection } from '../pheromone/pheromone-system.js';
-import { pheromoneGridKey } from '../pheromone/pheromone-store.js';
+import { pheromoneGridKey, phGet, type PheromoneGrid } from '../pheromone/pheromone-store.js';
 import type { DigFlowFields } from '../dig-system.js';
+import type { EntranceFlowFields } from '../entrance-flow.js';
+import type { ChamberFlowFields } from '../chamber-flow.js';
 import { Zone, UndergroundTileState, ugGet, ugSet, type UndergroundGrid } from '../terrain.js';
 
 // ---------------------------------------------------------------------------
@@ -111,72 +118,110 @@ export function antPickupFood(
   // with the base 25-tile radius again.
   ants.searchWave[antId] = 0;
 
+  // 09 excursion-foraging memo — clear the outbound heading so a post-deposit
+  // re-promotion to SearchingFood re-picks a fresh outward direction instead
+  // of resuming the stale heading that led to this pile. Follow-up: prev-tile
+  // memory is search-state, not carry-state; clear so a future SearchingFood
+  // pass starts without anti-backtrack bias.
+  ants.searchHeadingX[antId] = 0;
+  ants.searchHeadingY[antId] = 0;
+  ants.searchHeadingTicks[antId] = 0;
+  ants.searchPrevTileX[antId] = -1;
+  ants.searchPrevTileY[antId] = -1;
+
   return available;
 }
 
 // ---------------------------------------------------------------------------
-// antDepositFood — chamber-aware routing per UNDR-07 + chamberless fallback
+// antDepositFood — authoritative-pool deposit
 //
-// Transfers ants.foodCarrying[antId] into colony food storage.
-// Zeros foodCarrying. Writes task=Idle, subTask=0 (idle-checkpoint transition).
+// Transfers ants.foodCarrying[antId] into the colony food pool.
+// On full deposit: zeros foodCarrying and writes task=Idle, subTask=0
+// (Errata E-01 idle-checkpoint transition). On partial deposit (pool
+// at capacity): leaves leftover on the ant and preserves
+// Foraging+CarryingFood for a next-tick retry.
 //
 // Errata E-01 (2026-04-16) is authoritative for the completion-write contract:
 //   task = AntTask.Idle, subTask = 0   (NOT SearchingFood as the original §4c stated)
 //   Plan 10 step 9 next tick reassigns — back to Foraging+SearchingFood if allocation
 //   still demands forage, or to a different task if the triangle shifted.
 //
-// Phase 7 (UNDR-07): if colony has a FoodStorage chamber, route food there first.
-//   - Overflow (if chamber is full or multiple chambers) goes to colony.foodStored.
-//   - Chamberless fallback (Phase 6 behavior) preserved when no FoodStorage chamber exists.
+// 09 backlog memo — food source-of-truth model:
+//   colony.foodStored is the authoritative pooled total (fp). Deposits go
+//   directly to the pool, clamped at colonyFoodCapacity(colony) =
+//   BASE_FOOD_STORAGE_CAPACITY + N × FOOD_CHAMBER_CAPACITY where N is the
+//   count of COMPLETED FoodStorage chambers.
+//
+//   ChamberRecord.foodStored is DERIVED visualization state, recomputed by
+//   tickReconcile from the authoritative pool (each chamber filled up to
+//   FOOD_CHAMBER_CAPACITY in array order). antDepositFood MUST NOT write
+//   chamber.foodStored — doing so would be silently erased by the next
+//   reconcile AND would hide the food from queen/larvae consumption, which
+//   reads only colony.foodStored.
+//
 // Early-return if foodCarrying <= 0 (defensive guard per PRD §4c — deposit is only
 // called when an ant arrives carrying food; the guard pins exact no-op behavior).
 // ---------------------------------------------------------------------------
 
 /**
- * Deposit all food an ant is carrying into the colony food store.
+ * Deposit all food an ant is carrying into the authoritative colony pool.
  *
- * Phase 7 (UNDR-07): routes to food storage chamber when one exists.
- * Chamberless fallback (Phase 6): deposits to colony.foodStored directly.
- * Writes AntTask.Idle + subTask=0 (Errata E-01 idle-checkpoint transition).
+ * The pool (colony.foodStored) is the single source of truth for stored food;
+ * per-chamber ChamberRecord.foodStored values are projected by tickReconcile
+ * and MUST NOT be written here (they would be overwritten and would mask the
+ * food from consumption, which reads colony.foodStored directly).
+ *
+ * Deposit is clamped to colonyFoodCapacity(colony) = BASE + N × CHAMBER.
+ * Leftover that does not fit stays on ants.foodCarrying; the ant keeps
+ * task=Foraging, subTask=CarryingFood so step 16b retries next tick once
+ * consumption opens space. On FULL deposit (foodCarrying reaches 0),
+ * Errata E-01 idle-checkpoint fires: task=Idle, subTask=0, step 10a
+ * reassigns next tick.
+ *
  * Early-returns if foodCarrying === 0 (no-op; no task transition occurs).
  *
  * @param world    WorldState (reads ants, writes ants.foodCarrying, task, subTask).
- * @param colony   ColonyRecord (writes chamber.foodStored or colony.foodStored).
+ * @param colony   ColonyRecord (writes colony.foodStored; never writes chambers).
  * @param antId    Entity ID of the depositing forager.
  */
 export function antDepositFood(world: WorldState, colony: ColonyRecord, antId: number): void {
   const amount = world.ants.foodCarrying[antId]!;
   if (amount <= 0) return;
 
-  let remaining = amount;
+  // 09 backlog memo — pool is authoritative. Deposit directly to
+  // colony.foodStored clamped at colonyFoodCapacity. Chambers are derived
+  // state and are left untouched here; tickReconcile projects them.
+  const capacity = colonyFoodCapacity(colony);
+  const space = capacity - colony.foodStored;
+  const toPool = amount < space ? amount : (space > 0 ? space : 0);
+  colony.foodStored += toPool;
+  const remaining = amount - toPool;
 
-  // Phase 7 UNDR-07: chamber-aware routing
-  for (let i = 0; i < colony.chambers.length && remaining > 0; i++) {
-    const chamber = colony.chambers[i]!;
-    if (chamber.chamberType !== ChamberType.FoodStorage) continue;
-
-    const space = FOOD_CHAMBER_CAPACITY - chamber.foodStored;
-    if (space <= 0) continue; // this chamber is full — try next
-
-    const toDeposit = remaining < space ? remaining : space;
-    chamber.foodStored += toDeposit;
-    remaining -= toDeposit;
-    break; // deposit to first available food chamber, overflow to colony pool
-  }
-
-  // Chamberless fallback (Phase 6 behavior) — also handles overflow from full chambers
-  if (remaining > 0) {
-    colony.foodStored += remaining;
-  }
-
-  world.ants.foodCarrying[antId] = 0;
+  world.ants.foodCarrying[antId] = remaining;
 
   // Idle-checkpoint transition per PRD §4c + §7c as revised by Errata E-01 (2026-04-16):
-  // on full deposit the action system writes task=Idle, subTask=0. Plan 10 step 9
-  // next tick reassigns (back to Foraging+SearchingFood if allocation still demands
-  // forage, or to a different task if the triangle shifted).
-  world.ants.task[antId] = AntTask.Idle;
-  world.ants.subTask[antId] = 0;
+  // on FULL deposit (remaining === 0) the action system writes task=Idle, subTask=0.
+  // Plan 10 step 9 next tick reassigns (back to Foraging+SearchingFood if allocation
+  // still demands forage, or to a different task if the triangle shifted).
+  //
+  // 09 backlog memo — near-full deposit: if leftover remains on the ant (colony /
+  // chambers were at capacity), preserve the Foraging + CarryingFood state and the
+  // active outbound heading so routeForagerPriority can re-route the ant back to
+  // the chamber next tick without a round-trip through Idle.
+  if (remaining === 0) {
+    world.ants.task[antId] = AntTask.Idle;
+    world.ants.subTask[antId] = 0;
+
+    // 09 excursion-foraging memo — clear heading on deposit so the re-promoted
+    // SearchingFood pass after step 10a starts fresh. Follow-up: also clear
+    // prev-tile memory — a fresh outbound excursion should have no anti-
+    // backtrack bias.
+    world.ants.searchHeadingX[antId] = 0;
+    world.ants.searchHeadingY[antId] = 0;
+    world.ants.searchHeadingTicks[antId] = 0;
+    world.ants.searchPrevTileX[antId] = -1;
+    world.ants.searchPrevTileY[antId] = -1;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,8 +273,17 @@ export function tickForagerActions(world: WorldState): void {
     const subTask = ants.subTask[id]!;
     const zone = ants.zone[id]!;
 
-    if (zone === Zone.Surface && subTask === ForagingSubState.SearchingFood) {
+    if (
+      zone === Zone.Surface &&
+      (subTask === ForagingSubState.SearchingFood ||
+       subTask === ForagingSubState.ReturningToNest)
+    ) {
       // Pickup path — ant must be exactly on a food pile tile.
+      // ReturningToNest is included per the 09 excursion-foraging memo: a
+      // forager heading home after an over-leash failed search that crosses
+      // a pile en route picks up and seamlessly flips to CarryingFood (via
+      // antPickupFood's internal subTask write). Skipping it would silently
+      // drop free food the ant is literally standing on.
       const tileX = ants.posX[id]! >> FP_SHIFT;
       const tileY = ants.posY[id]! >> FP_SHIFT;
       for (let p = 0; p < world.foodPiles.length; p++) {
@@ -284,10 +338,184 @@ export function tickForagerActions(world: WorldState): void {
       }
 
       if (depositSite) {
-        antDepositFood(world, colony, id);       // writes task=Idle, subTask=0, foodCarrying=0
+        // antDepositFood — on full deposit flips to Idle (step 10a reassigns);
+        // on partial deposit (colony at cap) leaves leftover on ants.foodCarrying
+        // and keeps task=Foraging, subTask=CarryingFood so the forager retries.
+        antDepositFood(world, colony, id);
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// tickNurseActions — 09 reproduction-gate memo: make nursing FINITE
+//
+// Runs at tick step 16c, AFTER tickAntMovement (step 16) and tickForagerActions
+// (step 16b). Closes the final gap in the nursing loop: before this step,
+// nursing ants would walk to a Queen/Nursery chamber and then loop forever,
+// because no code wrote them back to AntTask.Idle. Step 10a only reassigns
+// Idle ants, so nurses remained nurses forever — the "3 nurses / 0 foragers"
+// lock seen in the colony snapshot.
+//
+// Two-step service state machine using NursingSubState:
+//   MovingToBrood (0) + ON a Queen/Nursery chamber tile → subTask = Feeding (1)
+//   Feeding (1)                                         → task = Idle, subTask = 0
+//
+// The one-tick Feeding dwell models a "service/check" beat before the ant
+// re-enters the Idle pool. Step 10a next tick re-considers the ant against
+// the current computedAllocation — if brood still requires nursing and the
+// ceil(workers/4) cap is not yet met, it may be re-promoted to nurse; if the
+// triangle asks for foragers, it goes foraging. This is how nursing becomes
+// an overdispatchable task instead of a sticky terminal state.
+//
+// Chamber footprint test uses the promoted chambers array (single-path
+// creation — colony.chambers only contains completed entries). Pending
+// chambers do not count, matching the memo's "completed only" rule.
+//
+// P2 brood transport (seed936214196-tick2401 fix): on the same service tick
+// (MovingToBrood → Feeding transition), if the colony has a completed Nursery,
+// pick the minimum-entity-id alive brood (eggs ∪ larvae) that is NOT already
+// inside any Nursery footprint and teleport it to the first Nursery Open tile
+// (row-major within the chosen chamber; chambers iterated in storage order).
+// This is the minimal pass that satisfies "nurse moves brood to Nursery"
+// without introducing per-brood pathing — foragers/nurses handle movement via
+// the main dispatch; direct relocation is the nurse's service effect. Eggs
+// and larvae are passive entities (speed=0) so teleport == deterministic
+// one-tick transport.
+//
+// Deterministic: iterates ant entity IDs ascending. No Math.random. No
+// allocations. Mirrors the tickForagerActions iteration shape.
+// ---------------------------------------------------------------------------
+
+/**
+ * Finalize nursing: on arrival at a Queen/Nursery chamber, perform a one-tick
+ * service (MovingToBrood → Feeding) and then return the ant to Idle so step
+ * 10a can reassign it next tick per the current allocation.
+ *
+ * Only acts on ants with alive=1 AND task=Nursing. Ignores any other task.
+ *
+ * @param world  WorldState (reads ants, colonies; writes ants.task, ants.subTask).
+ */
+export function tickNurseActions(world: WorldState): void {
+  const ants = world.ants;
+
+  for (let id = 0; id < world.nextEntityId; id++) {
+    if (ants.alive[id] !== 1) continue;
+    if (ants.task[id] !== AntTask.Nursing) continue;
+
+    const subTask = ants.subTask[id]!;
+
+    // Feeding → Idle: the dwell tick is already spent; release the ant.
+    // Step 10a on the next tick sees an Idle ant and routes per allocation.
+    if (subTask === NursingSubState.Feeding) {
+      ants.task[id]    = AntTask.Idle;
+      ants.subTask[id] = 0;
+      continue;
+    }
+
+    // MovingToBrood → Feeding iff ant is inside a Queen or Nursery footprint.
+    if (subTask !== NursingSubState.MovingToBrood) continue;
+
+    const colonyId = ants.colonyId[id]!;
+    const colony = world.colonies[colonyId];
+    if (!colony || colony.chambers.length === 0) continue;
+
+    const tileX = ants.posX[id]! >> FP_SHIFT;
+    const tileY = ants.posY[id]! >> FP_SHIFT;
+
+    let onServiceTile = false;
+    for (let c = 0; c < colony.chambers.length; c++) {
+      const chamber = colony.chambers[c]!;
+      const ct = chamber.chamberType;
+      if (ct !== ChamberType.Queen && ct !== ChamberType.Nursery) continue;
+      const baseX = chamber.posX >> FP_SHIFT;
+      const baseY = chamber.posY >> FP_SHIFT;
+      if (
+        tileX >= baseX && tileX < baseX + chamber.width &&
+        tileY >= baseY && tileY < baseY + chamber.height
+      ) {
+        ants.subTask[id] = NursingSubState.Feeding;
+        onServiceTile = true;
+        break;
+      }
+    }
+
+    // P2 brood transport: on the MovingToBrood→Feeding flip, relocate one
+    // brood entity into the Nursery. Gated on a completed Nursery — without
+    // one there is no target tile to deposit brood on.
+    if (onServiceTile && hasCompletedChamber(colony, ChamberType.Nursery)) {
+      transportBroodToNursery(world, colony);
+    }
+  }
+}
+
+/**
+ * Move a single brood entity (egg or larva) into the colony's Nursery.
+ *
+ * Selection: deterministic min-entity-id across colony.eggs ∪ colony.larvae,
+ * restricted to alive entities whose tile is NOT already inside any Nursery
+ * footprint. If every brood is already in a Nursery, does nothing.
+ *
+ * Destination: first Nursery chamber in colony.chambers order; within it,
+ * the first Open tile in row-major iteration over its footprint. Writes
+ * posX/posY in fixed-point (tile-center) and zone=Underground.
+ *
+ * No allocations, no RNG, no wall-clock.
+ */
+function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void {
+  const ants = world.ants;
+
+  // 1. Select the minimum-id brood entity that is alive and not already in a
+  //    Nursery footprint.
+  let pickId = -1;
+  for (let i = 0; i < colony.eggs.length; i++) {
+    const bid = colony.eggs[i]!;
+    if (ants.alive[bid] !== 1) continue;
+    if (isInsideNursery(colony, ants.posX[bid]! >> FP_SHIFT, ants.posY[bid]! >> FP_SHIFT)) continue;
+    if (pickId < 0 || bid < pickId) pickId = bid;
+  }
+  for (let i = 0; i < colony.larvae.length; i++) {
+    const bid = colony.larvae[i]!;
+    if (ants.alive[bid] !== 1) continue;
+    if (isInsideNursery(colony, ants.posX[bid]! >> FP_SHIFT, ants.posY[bid]! >> FP_SHIFT)) continue;
+    if (pickId < 0 || bid < pickId) pickId = bid;
+  }
+  if (pickId < 0) return;
+
+  // 2. Find the first Nursery Open tile (row-major within the first Nursery
+  //    chamber). Requires the colony's underground grid to check state.
+  const underground = world.undergroundGrids[colony.colonyId];
+  if (!underground) return;
+
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const ch = colony.chambers[c]!;
+    if (ch.chamberType !== ChamberType.Nursery) continue;
+    const bx = ch.posX >> FP_SHIFT;
+    const by = ch.posY >> FP_SHIFT;
+    for (let ty = 0; ty < ch.height; ty++) {
+      for (let tx = 0; tx < ch.width; tx++) {
+        const cx = bx + tx;
+        const cy = by + ty;
+        if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
+        // Fixed-point tile-center position.
+        ants.posX[pickId] = (cx << FP_SHIFT) + (FP_ONE >> 1);
+        ants.posY[pickId] = (cy << FP_SHIFT) + (FP_ONE >> 1);
+        ants.zone[pickId] = Zone.Underground;
+        return;
+      }
+    }
+  }
+}
+
+function isInsideNursery(colony: ColonyRecord, tileX: number, tileY: number): boolean {
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const ch = colony.chambers[c]!;
+    if (ch.chamberType !== ChamberType.Nursery) continue;
+    const bx = ch.posX >> FP_SHIFT;
+    const by = ch.posY >> FP_SHIFT;
+    if (tileX >= bx && tileX < bx + ch.width && tileY >= by && tileY < by + ch.height) return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,20 +537,29 @@ export function tickForagerActions(world: WorldState): void {
  *   Direction=-1 (ant is ON the Marked tile) → return {0,0} so the ant holds
  *   position until step 10 claims the tile next tick.
  * Dig workers in Excavating: return {0,0} (stationary while digging).
- * Nursing ants: move toward nearest nursery or queen chamber tile (Manhattan).
- *   If no such chamber, {0,0}.
- * Fighting ants: {0,0} (Phase 9 fills rally logic).
+ * Nursing ants: read the nursing chamber flow-field (seeded from Queen+Nursery
+ *   Open tiles). -1 (on chamber tile) → {0,0} so tickNurseActions can flip
+ *   subTask=Feeding. -2 (no tunnel connection) → {0,0} as a deterministic
+ *   failsafe. When no cache is supplied (legacy test harnesses) falls back to
+ *   Manhattan steering.
+ * Fighting ants: {0,0} here — rally steering lives in tickAntMovement so the
+ *   fighter can consume ants.targetPosX/Y (written by updateFightAntTargets)
+ *   with the same Manhattan step pattern as the priority-forager branch.
  * Idle ants: {0,0} (awaiting task assignment).
  *
- * @param world         WorldState (reads ants, colonies, undergroundGrids).
- * @param antId         Entity ID of the ant.
- * @param digFlowFields Per-colony flow-field cache.
- * @returns             Direction vector {dx, dy}.
+ * @param world              WorldState (reads ants, colonies, undergroundGrids).
+ * @param antId              Entity ID of the ant.
+ * @param digFlowFields      Per-colony flow-field cache (dig targets).
+ * @param chamberFlowFields  Optional per-colony chamber flow-field cache. When
+ *                           provided, nurses consume the `nursing` field
+ *                           instead of Manhattan steering.
+ * @returns                  Direction vector {dx, dy}.
  */
 export function getTaskDirection(
   world: WorldState,
   antId: number,
   digFlowFields: DigFlowFields,
+  chamberFlowFields?: ChamberFlowFields,
 ): { dx: number; dy: number } {
   const ants = world.ants;
   const task = ants.task[antId]!;
@@ -356,8 +593,39 @@ export function getTaskDirection(
   }
 
   if (task === AntTask.Nursing) {
-    // Move toward nearest nursery or queen chamber tile (Manhattan distance)
     const colonyId = ants.colonyId[antId]!;
+
+    // Prefer the nursing flow-field. Seeded from Open tiles inside every
+    // Queen/Nursery chamber footprint, so the nurse routes through tunnels
+    // instead of straight-line stepping into Solid dirt on bends. See the
+    // seed-920076605 debug snapshot: ant 19 at (14,16) targeted Nursery
+    // (13,9) and straight-line steering picked (14,15) = Solid every tick.
+    if (chamberFlowFields !== undefined) {
+      const flowField = chamberFlowFields.nursing[colonyId];
+      const underground = world.undergroundGrids[colonyId];
+      if (flowField && underground) {
+        const tileX = ants.posX[antId]! >> FP_SHIFT;
+        const tileY = ants.posY[antId]! >> FP_SHIFT;
+        const dir = flowField[tileY * underground.width + tileX];
+        if (dir === undefined) return { dx: 0, dy: 0 };
+        if (dir === -1) {
+          // On a Queen/Nursery chamber tile — hold. tickNurseActions flips
+          // subTask to Feeding this same tick (it runs at step 16c after
+          // tickAntMovement at step 16) and to Idle next tick.
+          return { dx: 0, dy: 0 };
+        }
+        if (dir === -2) {
+          // Unreachable. Failsafe: hold. Better than oscillating into dirt;
+          // the debug trace reports 'nursing-chamber' so the stuck ant is
+          // still visually attributable to the nursing path.
+          return { dx: 0, dy: 0 };
+        }
+        return { dx: DIR_DX[dir]!, dy: DIR_DY[dir]! };
+      }
+      // flowField/grid absent — fall through to Manhattan legacy path.
+    }
+
+    // Legacy Manhattan path (test harnesses without chamberFlowFields).
     const colony = world.colonies[colonyId];
     if (!colony || colony.chambers.length === 0) return { dx: 0, dy: 0 };
 
@@ -512,6 +780,17 @@ export function tickSearchLeash(world: WorldState): void {
     ants.subTask[id] = 0;
     ants.targetPosX[id] = -1;
     ants.targetPosY[id] = -1;
+
+    // 09 excursion-foraging memo — clear heading so the re-promoted ant
+    // chooses a fresh outward direction from its current position instead
+    // of continuing the stale heading that just leashed it. Follow-up:
+    // also clear prev-tile so the next SearchingFood pass isn't biased by
+    // stale anti-backtrack memory from the leashed route.
+    ants.searchHeadingX[id] = 0;
+    ants.searchHeadingY[id] = 0;
+    ants.searchHeadingTicks[id] = 0;
+    ants.searchPrevTileX[id] = -1;
+    ants.searchPrevTileY[id] = -1;
 
     const nextWave = wave + 1;
     ants.searchWave[id] = nextWave > SEARCH_LEASH_MAX_WAVE
@@ -803,109 +1082,415 @@ export function routeForagerPriority(world: WorldState): void {
 }
 
 // ---------------------------------------------------------------------------
-// chooseWanderDirection — bootstrap exploration for SearchingFood foragers
+// chooseExcursionDirection — 09 excursion-foraging memo correlated outward walk
 //
-// When a surface SearchingFood forager has no priority target AND the pheromone
-// gradient is flat (no trail within one tile), the previous behavior was to
-// stand still — which effectively required the player to hand-mark a food pile
-// before the colony could eat. The 09 foraging-autonomy memo re-scopes food
-// selection as a priority override, not a survival prerequisite, so this
-// function provides the autonomous fallback.
+// Replaces the older chooseWanderDirection (scatter-ring + diffusion) with a
+// correlated outward walk: a SearchingFood forager without a priority target
+// or pheromone gradient commits to an outward cardinal heading for a short
+// run, occasionally turning 90° left or right, and gets leashed back to the
+// nest by tickExcursionBoundary when it has travelled past the current wave
+// radius. The combined effect is a bounded outbound arc rather than 2-D
+// Brownian motion, which covers more ground per tile of travel and produces
+// a visibly more ant-like outbound trail that the player can read.
 //
-// Strategy: a "scatter ring" + diffusion model.
-//   - Inside WANDER_SCATTER_RADIUS tiles of the nearest entrance: step
-//     outward along the larger |out| axis (tie → antId-parity). This breaks
-//     up the initial cluster at the entrance quickly.
-//   - Outside the ring: uniform random cardinal. A persistent outward pull
-//     in this region would pin ants against a world edge; instead we let
-//     2-D diffusion cover ground, which is how foragers actually find
-//     distant piles.
+// Per-ant state (no colony memory, per the 09 memo):
+//   searchHeadingX, searchHeadingY  ∈ {-1, 0, 1}; exactly one axis nonzero
+//                                    when active; (0,0) means "pick a new
+//                                    outward heading now".
+//   searchHeadingTicks             ticks until the next turn check; counts
+//                                    down each call; when it hits 0 we roll
+//                                    a turn and reset to MIN + rng jitter.
 //
-// Determinism: exactly one rng.nextInt(4) call per invocation — the "random
-// cardinal" direction roll. The outward branch ignores the roll but still
-// consumes it, so the RNG stream advances uniformly regardless of where
-// the ant is standing.
+// RNG consumption is uniform: exactly three rng calls per invocation
+// (turnRoll, turnDir, jitter). This keeps RNG-stream advance identical
+// across branches for replay determinism.
+//
+// Priority order is preserved upstream — priority target > food scent >
+// pheromone gradient > excursion exploration. This function is only
+// consulted when all three upstream branches have no direction to offer.
 // ---------------------------------------------------------------------------
 
 /**
- * PRD 09 foraging-autonomy — scatter-ring + diffusion wander for a
+ * 09 excursion-foraging memo — correlated outward walk direction for a
  * SearchingFood forager with no priority target and no pheromone gradient
  * to follow.
  *
- * Consumes exactly one rng.nextInt(4) call.
+ * Reads and writes ants.searchHeadingX / searchHeadingY / searchHeadingTicks.
+ * Consumes exactly three rng calls (turnRoll, turnDir, jitter) regardless of
+ * branch taken, so the RNG stream advances uniformly across replays.
  *
- * @param world  WorldState (reads ants and colonies).
+ * @param world  WorldState (reads ants and colonies, writes heading fields).
  * @param antId  Entity ID of the searching forager.
  * @param rng    Deterministic world Rng.
  * @returns      Cardinal direction vector { dx, dy } with |dx| + |dy| === 1.
  */
-export function chooseWanderDirection(
+export function chooseExcursionDirection(
   world: WorldState,
   antId: number,
   rng: Rng,
 ): { dx: number; dy: number } {
   const ants = world.ants;
 
-  // Always consume one rng call so stream advance is uniform across
-  // branches (same ant in two different worlds with different entrance
-  // topology still consumes RNG at the same rate).
-  const dirIdx = rng.nextInt(4);
-  const randomCardinal = (): { dx: number; dy: number } => {
-    switch (dirIdx) {
-      case 0: return { dx: 0,  dy: -1 };
-      case 1: return { dx: 0,  dy:  1 };
-      case 2: return { dx: -1, dy:  0 };
-      default: return { dx: 1, dy:  0 };
-    }
-  };
+  // Consume RNG uniformly — even branches that don't need every roll still
+  // read them so replay/save-load determinism is preserved regardless of
+  // which branch each invocation takes.
+  const turnRoll = rng.nextInt(100);
+  const turnDir = rng.nextInt(2); // 0 = left, 1 = right
+  const jitter = rng.nextInt(EXCURSION_HEADING_JITTER_TICKS);
 
-  const colonyId = ants.colonyId[antId]!;
-  const colony = world.colonies[colonyId];
-  const entrances = colony?.entrances;
-  if (!entrances || entrances.length === 0) return randomCardinal();
+  let hx = ants.searchHeadingX[antId]!;
+  let hy = ants.searchHeadingY[antId]!;
+  let ticks = ants.searchHeadingTicks[antId]!;
 
   const tileX = ants.posX[antId]! >> FP_SHIFT;
   const tileY = ants.posY[antId]! >> FP_SHIFT;
 
-  // Nearest entrance by Manhattan distance.
-  let bestEx = entrances[0]!.surfaceTileX;
-  let bestEy = entrances[0]!.surfaceTileY;
-  let bestDist = Math.abs(tileX - bestEx) + Math.abs(tileY - bestEy);
-  for (let e = 1; e < entrances.length; e++) {
-    const ent = entrances[e]!;
-    const d = Math.abs(tileX - ent.surfaceTileX) + Math.abs(tileY - ent.surfaceTileY);
-    if (d < bestDist) {
-      bestDist = d;
-      bestEx = ent.surfaceTileX;
-      bestEy = ent.surfaceTileY;
+  // Pick or refresh heading based on current state.
+  if (hx === 0 && hy === 0) {
+    // No active heading — derive an outward-biased initial heading from
+    // nearest own-colony entrance. Ties and "ant sitting on an entrance"
+    // fall back to antId-parity so initial fan-out is deterministic.
+    const colonyId = ants.colonyId[antId]!;
+    const colony = world.colonies[colonyId];
+    const entrances = colony?.entrances;
+
+    let outX = 0;
+    let outY = 0;
+    if (entrances && entrances.length > 0) {
+      let bestEx = entrances[0]!.surfaceTileX;
+      let bestEy = entrances[0]!.surfaceTileY;
+      let bestDist = Math.abs(tileX - bestEx) + Math.abs(tileY - bestEy);
+      for (let e = 1; e < entrances.length; e++) {
+        const ent = entrances[e]!;
+        const d = Math.abs(tileX - ent.surfaceTileX) + Math.abs(tileY - ent.surfaceTileY);
+        if (d < bestDist) {
+          bestDist = d;
+          bestEx = ent.surfaceTileX;
+          bestEy = ent.surfaceTileY;
+        }
+      }
+      outX = tileX - bestEx;
+      outY = tileY - bestEy;
     }
+
+    if (outX === 0 && outY === 0) {
+      // Ant is standing on the entrance (or there are no entrances) — deal
+      // an initial cardinal by antId so colony members fan out to four
+      // different compass directions rather than all piling the same way.
+      switch (antId & 3) {
+        case 0:  hx =  1; hy =  0; break;
+        case 1:  hx = -1; hy =  0; break;
+        case 2:  hx =  0; hy =  1; break;
+        default: hx =  0; hy = -1; break;
+      }
+    } else {
+      const absX = outX < 0 ? -outX : outX;
+      const absY = outY < 0 ? -outY : outY;
+      let pickX: boolean;
+      if (absX > absY) pickX = true;
+      else if (absY > absX) pickX = false;
+      else pickX = (antId & 1) === 0;
+
+      if (pickX) {
+        hx = outX > 0 ? 1 : -1;
+        hy = 0;
+      } else {
+        hx = 0;
+        hy = outY > 0 ? 1 : -1;
+      }
+    }
+
+    ticks = EXCURSION_HEADING_MIN_TICKS + jitter;
+  } else if (ticks <= 0) {
+    // Turn-check expired. Three possible outcomes on a single turnRoll:
+    //   [0, EXCURSION_TURN_PERCENT)                        → hard 90° turn
+    //   [100 - EXCURSION_WOBBLE_PERCENT, 100)              → lateral wobble
+    //                                                        (heading preserved,
+    //                                                         one-tick side step)
+    //   otherwise                                          → keep heading
+    // The two branches MUST NOT overlap — this is enforced in constants.ts.
+    // Wobble produces a single perpendicular step while leaving the committed
+    // heading intact; the next tick continues outward along the original
+    // cardinal, yielding a subtle meander without regressing to random walk
+    // (09 excursion-foraging follow-up, issue 3).
+    if (turnRoll < EXCURSION_TURN_PERCENT) {
+      // Rotate 90° — left: (hx,hy) → (hy, -hx); right: (hx,hy) → (-hy, hx).
+      if (turnDir === 0) {
+        const nhx =  hy;
+        const nhy = -hx;
+        hx = nhx;
+        hy = nhy;
+      } else {
+        const nhx = -hy;
+        const nhy =  hx;
+        hx = nhx;
+        hy = nhy;
+      }
+      ticks = EXCURSION_HEADING_MIN_TICKS + jitter;
+    } else if (turnRoll >= 100 - EXCURSION_WOBBLE_PERCENT) {
+      // Lateral wobble — one-tick perpendicular step, heading preserved.
+      // Perpendicular of (hx,hy) is (hy,-hx) (left) or (-hy,hx) (right).
+      const lhx = turnDir === 0 ?  hy : -hy;
+      const lhy = turnDir === 0 ? -hx :  hx;
+      const nx = tileX + lhx;
+      const ny = tileY + lhy;
+      if (nx >= 0 && nx < SURFACE_GRID_WIDTH && ny >= 0 && ny < SURFACE_GRID_HEIGHT) {
+        // Persist the (unchanged) heading and reset ticks — the NEXT turn-check
+        // fires after another MIN+jitter run along the original heading.
+        ants.searchHeadingX[antId] = hx;
+        ants.searchHeadingY[antId] = hy;
+        ants.searchHeadingTicks[antId] = EXCURSION_HEADING_MIN_TICKS + jitter;
+        return { dx: lhx, dy: lhy };
+      }
+      // Lateral would step off-grid → fall through to keep-heading branch.
+      ticks = EXCURSION_HEADING_MIN_TICKS + jitter;
+    } else {
+      // Keep heading, reset the turn-check clock.
+      ticks = EXCURSION_HEADING_MIN_TICKS + jitter;
+    }
+  } else {
+    ticks = ticks - 1;
   }
 
-  if (bestDist >= WANDER_SCATTER_RADIUS) return randomCardinal();
+  // World-edge bounce: if the chosen cardinal would step off the surface
+  // grid, rotate it 90° right deterministically until we find a valid one.
+  // Cardinal-only movement on a rectangular grid always has at least two
+  // valid options, so this converges in ≤ 3 rotations.
+  for (let attempts = 0; attempts < 4; attempts++) {
+    const nx = tileX + hx;
+    const ny = tileY + hy;
+    if (nx >= 0 && nx < SURFACE_GRID_WIDTH && ny >= 0 && ny < SURFACE_GRID_HEIGHT) break;
+    const nhx = -hy;
+    const nhy =  hx;
+    hx = nhx;
+    hy = nhy;
+  }
 
-  const outX = tileX - bestEx;
-  const outY = tileY - bestEy;
-  if (outX === 0 && outY === 0) return randomCardinal();
+  ants.searchHeadingX[antId] = hx;
+  ants.searchHeadingY[antId] = hy;
+  ants.searchHeadingTicks[antId] = ticks;
 
-  const absX = outX < 0 ? -outX : outX;
-  const absY = outY < 0 ? -outY : outY;
-  let pickX: boolean;
-  if (absX > absY) pickX = true;
-  else if (absY > absX) pickX = false;
-  else pickX = (antId & 1) === 0;
+  return { dx: hx, dy: hy };
+}
 
-  if (pickX) return { dx: outX > 0 ? 1 : -1, dy: 0 };
-  return { dx: 0, dy: outY > 0 ? 1 : -1 };
+// ---------------------------------------------------------------------------
+// tickExcursionBoundary — 09 excursion-foraging memo (+ follow-up)
+//
+// At step 9c (after tickSearchLeash, before step 10a idle-reassignment),
+// manage the excursion ↔ ReturningToNest state flip for surface foragers.
+//
+// Two directions:
+//   (a) SearchingFood ants past their current wave radius with NO higher
+//       priority signal → flip to ReturningToNest, clear heading.
+//   (b) ReturningToNest ants that encounter a higher priority signal →
+//       flip back to SearchingFood, clear heading so the next excursion
+//       derives a fresh outward direction.
+//
+// Higher-priority signals, evaluated in this order:
+//   1. explicit priority food target (colony.priorityFoodPileId set)
+//   2. direct food scent within FOOD_SCENT_RADIUS
+//   3. useful food-trail pheromone within SIGNAL_PHEROMONE_RADIUS
+//
+// These mirror the priority order the movement step (tickAntMovement)
+// consults — so the boundary pass never strands an ant that actually has
+// somewhere useful to go (09 excursion-foraging follow-up, issue 1).
+//
+// This is distinct from (and complementary to) tickSearchLeash:
+//   tickSearchLeash demotes stuck SearchingFood ants to Idle so the
+//     behavior-triangle allocation can rebalance workers to dig/fight —
+//     it only fires when the colony is over-foraged AND player wants
+//     dig/fight work ("triangle responsiveness").
+//   tickExcursionBoundary implements the bounded-excursion loop from the
+//     memo: regardless of allocation, an ant that has searched past its
+//     current wave radius and has NO signal heads home and resets.
+//
+// Per-ant state only — no colony-level known-food memory.
+// ---------------------------------------------------------------------------
+
+/**
+ * Manhattan radius scanned around a forager for an "any pheromone present"
+ * signal. Mirrors REACQUIRE_RADIUS in pheromone-system.ts — if this scan
+ * returns true, sampleForagingDirection is guaranteed to return a non-zero
+ * direction, so we must not flip the ant into ReturningToNest (or keep it
+ * there). Kept as a local constant to avoid widening pheromone-system's
+ * public surface for what is otherwise an internal implementation detail.
+ */
+const SIGNAL_PHEROMONE_RADIUS = 3;
+
+/**
+ * Return true if any pheromone cell in the REACQUIRE_RADIUS Manhattan
+ * diamond around (tileX, tileY) has a nonzero strength that
+ * sampleForagingDirection() could actually follow. Early exits on the first
+ * usable hit; no RNG consumption, no mutation.
+ *
+ * Anti-backtrack alignment (09 excursion-foraging follow-up, issues 1 & 2):
+ * this helper MUST match the candidate-rejection rules inside
+ * sampleForagingDirection so tickExcursionBoundary's "hasSignal" decision
+ * agrees with the sampler's "could I pick a move" decision. Two filters:
+ *   1. Exact prev-tile skip — the ant's own just-left trail is never signal.
+ *   2. Major-axis-step skip — a cell whose major-axis step from (tileX,tileY)
+ *      lands on prev is a prev-side reacquire candidate; the sampler would
+ *      reject it, so it must not hold the ant on SearchingFood either.
+ * Without (2), pheromone two or three tiles "behind" an ant would keep it
+ * over-leash forever even though the sampler returns {0,0} and the ant has
+ * no real follow-target — an exact repeat of the far-from-nest stutter.
+ *
+ * Pass prevTileX = prevTileY = -1 when the ant has no prev tile; the
+ * function then behaves as a plain nonzero-within-radius scan.
+ */
+function hasNearbyPheromoneSignal(
+  grid: PheromoneGrid,
+  tileX: number,
+  tileY: number,
+  prevTileX: number = -1,
+  prevTileY: number = -1,
+): boolean {
+  const hasPrev = prevTileX >= 0 && prevTileY >= 0;
+  for (let dy = -SIGNAL_PHEROMONE_RADIUS; dy <= SIGNAL_PHEROMONE_RADIUS; dy++) {
+    const absY = dy < 0 ? -dy : dy;
+    const xRange = SIGNAL_PHEROMONE_RADIUS - absY;
+    for (let dx = -xRange; dx <= xRange; dx++) {
+      if (dx === 0 && dy === 0) continue;
+      const sx = tileX + dx;
+      const sy = tileY + dy;
+      if (hasPrev && sx === prevTileX && sy === prevTileY) continue;
+      // Major-axis candidate filter — mirrors sampleForagingDirection's
+      // reacquire-layer skip. For dist==1 immediate neighbors the major-axis
+      // step equals the cell itself, which the exact-coord check above
+      // already handles, so this branch only prunes dist>=2 cells whose
+      // first step would route through prev.
+      if (hasPrev) {
+        const absX = dx < 0 ? -dx : dx;
+        const stepX = absX >= absY ? (dx > 0 ? 1 : dx < 0 ? -1 : 0) : 0;
+        const stepY = absX >= absY ? 0 : (dy > 0 ? 1 : dy < 0 ? -1 : 0);
+        if (tileX + stepX === prevTileX && tileY + stepY === prevTileY) continue;
+      }
+      if (phGet(grid, sx, sy) > 0) return true;
+    }
+  }
+  return false;
 }
 
 /**
- * Manhattan radius around the nearest entrance within which
- * chooseWanderDirection applies deterministic outward scatter. Beyond this
- * ring the forager switches to uniform random-walk diffusion. Chosen to
- * match FOOD_PILE_MIN_COLONY_DISTANCE so the scatter kicks ants out past
- * the guaranteed food-pile exclusion zone before diffusion takes over.
+ * Return true if the colony has a priority food pile id pointing at an
+ * extant pile — the player-marked target routeForagerPriority propagates to
+ * targetPosX/Y at step 13. Checked directly (not via targetPosX) so the
+ * answer is correct for ReturningToNest ants too, whose targetPosX is not
+ * refreshed by routeForagerPriority.
  */
-const WANDER_SCATTER_RADIUS = 8;
+function colonyHasPriorityPile(world: WorldState, colonyId: number): boolean {
+  const colony = world.colonies[colonyId];
+  if (!colony || colony.priorityFoodPileId === null) return false;
+  const pileId = colony.priorityFoodPileId;
+  for (let p = 0; p < world.foodPiles.length; p++) {
+    if (world.foodPiles[p]!.foodPileId === pileId) return true;
+  }
+  return false;
+}
+
+/**
+ * Step-9c — excursion boundary state flip with priority-aware skipping.
+ *
+ * Only affects surface Foraging ants in SearchingFood or ReturningToNest.
+ *
+ * SearchingFood over-leash rule: if the ant is past
+ * SEARCH_LEASH_RADII[searchWave] AND has NO priority target, scent, or
+ * pheromone signal, flip to ReturningToNest and clear heading. If any signal
+ * is present the ant stays SearchingFood — the movement step will follow it.
+ *
+ * ReturningToNest breakout rule: if a ReturningToNest ant has ANY priority
+ * target, scent, or pheromone signal, flip back to SearchingFood and clear
+ * heading so the next excursion re-derives an outward direction. This stops
+ * the boundary pass from overriding meaningful food signals an ant picks up
+ * en route home (09 excursion-foraging follow-up, issue 1).
+ *
+ * The wave counter is NOT incremented here — that happens on the return
+ * side when the ant actually reaches the entrance (see tickAntMovement
+ * Surface zone-transition block). An ant that picks up food en route via
+ * tickForagerActions bypasses ReturningToNest entirely and resets wave to 0.
+ *
+ * @param world  WorldState (reads ants, colonies, foodPiles, pheromoneGrids;
+ *               writes ants.subTask, searchHeadingX/Y/Ticks).
+ */
+export function tickExcursionBoundary(world: WorldState): void {
+  const ants = world.ants;
+
+  for (let id = 0; id < world.nextEntityId; id++) {
+    if (ants.alive[id] !== 1) continue;
+    if (ants.task[id] !== AntTask.Foraging) continue;
+    if (ants.zone[id] !== Zone.Surface) continue;
+    const sub = ants.subTask[id]!;
+    if (sub !== ForagingSubState.SearchingFood && sub !== ForagingSubState.ReturningToNest) continue;
+
+    const colonyId = ants.colonyId[id]!;
+    const colony = world.colonies[colonyId];
+    if (!colony || !colony.entrances || colony.entrances.length === 0) continue;
+
+    const tileX = ants.posX[id]! >> FP_SHIFT;
+    const tileY = ants.posY[id]! >> FP_SHIFT;
+
+    // Signal detection — priority target > scent > pheromone (09 follow-up).
+    const hasPriority = colonyHasPriorityPile(world, colonyId);
+    const hasScent = hasPriority ? false : findNearestScentPile(world, tileX, tileY) !== null;
+    let hasPheromone = false;
+    if (!hasPriority && !hasScent) {
+      const key = pheromoneGridKey(colonyId, PheromoneType.FoodTrail, 'surface');
+      const grid = world.pheromoneGrids[key];
+      if (grid) {
+        // 09 follow-up issue 2: skip the ant's prev tile so its own just-left
+        // trail doesn't count as "signal" and trap it in ReturningToNest
+        // purgatory. Sentinels (-1,-1) are treated as "no prev" by the helper.
+        hasPheromone = hasNearbyPheromoneSignal(
+          grid,
+          tileX,
+          tileY,
+          ants.searchPrevTileX[id]!,
+          ants.searchPrevTileY[id]!,
+        );
+      }
+    }
+    const hasSignal = hasPriority || hasScent || hasPheromone;
+
+    if (sub === ForagingSubState.ReturningToNest) {
+      // Breakout: a returning ant that now senses food or a trail should go
+      // search/follow rather than complete the return leg.
+      if (hasSignal) {
+        ants.subTask[id] = ForagingSubState.SearchingFood;
+        ants.searchHeadingX[id] = 0;
+        ants.searchHeadingY[id] = 0;
+        ants.searchHeadingTicks[id] = 0;
+        ants.searchPrevTileX[id] = -1;
+        ants.searchPrevTileY[id] = -1;
+      }
+      continue;
+    }
+
+    // sub === SearchingFood: boundary check.
+    if (hasSignal) continue; // priority/scent/pheromone overrides the boundary.
+
+    let bestDist = -1;
+    for (let e = 0; e < colony.entrances.length; e++) {
+      const ent = colony.entrances[e]!;
+      const d = Math.abs(tileX - ent.surfaceTileX) + Math.abs(tileY - ent.surfaceTileY);
+      if (bestDist < 0 || d < bestDist) bestDist = d;
+    }
+    if (bestDist < 0) continue;
+
+    let wave = ants.searchWave[id]!;
+    if (wave < 0) wave = 0;
+    if (wave > SEARCH_LEASH_MAX_WAVE) wave = SEARCH_LEASH_MAX_WAVE;
+    const radius = SEARCH_LEASH_RADII[wave]!;
+
+    if (bestDist <= radius) continue;
+
+    ants.subTask[id] = ForagingSubState.ReturningToNest;
+    ants.searchHeadingX[id] = 0;
+    ants.searchHeadingY[id] = 0;
+    ants.searchHeadingTicks[id] = 0;
+    ants.searchPrevTileX[id] = -1;
+    ants.searchPrevTileY[id] = -1;
+  }
+}
 
 /**
  * Manhattan radius within which a SearchingFood forager can sense a food pile
@@ -967,7 +1552,16 @@ function findNearestScentPile(
 // If the grid is missing, the deposit is silently skipped (scenario-dependent presence).
 // Dead slots (alive !== 1) are skipped. Non-carrying ants (foodCarrying <= 0) are skipped.
 //
-// O(nextEntityId) — unused slots skipped via the alive === 1 guard.
+// 09 excursion-foraging follow-up (issue 2): deposits WITHIN
+// ENTRANCE_DEPOSIT_SUPPRESS_RADIUS Manhattan tiles of any own-colony entrance
+// are suppressed. Multiple carrying ants passing the same few tiles at the
+// entrance mouth otherwise build a strong local scalar peak that greedy
+// gradient-following turns into two-tile oscillation, trapping searchers
+// near the nest. Suppressing the entrance-adjacent deposits keeps the
+// useful trail peak out along the path toward food, not on the nest tile.
+//
+// O(nextEntityId * entrances_per_colony) — entrances count is bounded by
+// MAX_ENTRANCES_PER_COLONY so the extra work is O(N) in ant count.
 // ---------------------------------------------------------------------------
 
 /**
@@ -976,7 +1570,11 @@ function findNearestScentPile(
  * PRD §5b carry-only rule (PHER-03): only ants with foodCarrying > 0 deposit.
  * Deposit targets the colony's food-trail surface grid (Phase 6 hardcoded zone).
  *
- * @param world  WorldState (reads ants, pheromoneGrids).
+ * Near-entrance suppression (09 excursion-foraging follow-up): deposits within
+ * ENTRANCE_DEPOSIT_SUPPRESS_RADIUS Manhattan tiles of any own-colony entrance
+ * are skipped to prevent nest-mouth scalar-peak oscillation for searchers.
+ *
+ * @param world  WorldState (reads ants, colonies, pheromoneGrids).
  */
 export function tickPheromoneDeposit(world: WorldState): void {
   const ants = world.ants;
@@ -988,6 +1586,24 @@ export function tickPheromoneDeposit(world: WorldState): void {
     const colonyId = ants.colonyId[id]!;
     const tileX = ants.posX[id]! >> FP_SHIFT;
     const tileY = ants.posY[id]! >> FP_SHIFT;
+
+    // 09 excursion-foraging follow-up (issue 2): suppress deposits near any
+    // own-colony entrance to keep the trail peak out along the path toward
+    // food rather than stacking it at the nest mouth.
+    const colony = world.colonies[colonyId];
+    if (colony && colony.entrances && colony.entrances.length > 0) {
+      let nearEntrance = false;
+      for (let e = 0; e < colony.entrances.length; e++) {
+        const ent = colony.entrances[e]!;
+        const d = Math.abs(tileX - ent.surfaceTileX) + Math.abs(tileY - ent.surfaceTileY);
+        if (d <= ENTRANCE_DEPOSIT_SUPPRESS_RADIUS) {
+          nearEntrance = true;
+          break;
+        }
+      }
+      if (nearEntrance) continue;
+    }
+
     const key = pheromoneGridKey(colonyId, PheromoneType.FoodTrail, 'surface');
     const grid = world.pheromoneGrids[key];
     if (!grid) continue; // grid missing — silently skip (scenario-dependent presence)
@@ -1039,6 +1655,280 @@ export function canEnterUndergroundTile(
 }
 
 // ---------------------------------------------------------------------------
+// P1 queen relocation — Phase 3 chamber behavior.
+//
+// Once a completed Queen chamber exists, the queen routes from her current
+// tile to the Queen chamber footprint and remains there. She routes surface →
+// open entrance → underground → Queen chamber Open tile through the existing
+// flow-field machinery so she never steps through Solid / Marked dirt.
+//
+// Queens never return to the surface once they've descended. Eggs laid while
+// the queen is in transit (i.e. Queen chamber exists but queen is not yet
+// inside the footprint) are suppressed by tickQueenEggProduction — see its
+// Gate 6 in lifecycle-system.ts.
+// ---------------------------------------------------------------------------
+
+function collectAliveQueenIds(world: WorldState): Set<number> | null {
+  // Only skip ants that the relocation pass actually drives. That requires a
+  // completed Queen chamber AND task=Idle (the queen's canonical task). This
+  // narrowing matters for test fixtures where the colony's queenEntityId
+  // placeholder may point at a non-queen entity (e.g. setupForagerWorld uses
+  // entity 0 as a forager and createColonyRecord(..., 0) as the queen slot).
+  // Without a Queen chamber moveQueens is a no-op, so the main loop must
+  // remain responsible for moving that entity.
+  let set: Set<number> | null = null;
+  for (const key in world.colonies) {
+    if (!Object.hasOwn(world.colonies, key)) continue;
+    const colony = world.colonies[key as unknown as number]!;
+    const qId = colony.queenEntityId;
+    if (world.ants.alive[qId] !== 1) continue;
+    if (world.ants.task[qId] !== AntTask.Idle) continue;
+    if (!hasCompletedChamber(colony, ChamberType.Queen)) continue;
+    if (set === null) set = new Set<number>();
+    set.add(qId);
+  }
+  return set;
+}
+
+/**
+ * True if tile (tileX, tileY) lies inside any completed Queen chamber
+ * footprint in `colony`. Inclusive of the anchor tile; exclusive of tiles at
+ * anchor + dims boundary (the footprint is [anchor, anchor + dims)).
+ */
+function isInsideQueenChamber(colony: ColonyRecord, tileX: number, tileY: number): boolean {
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const ch = colony.chambers[c]!;
+    if (ch.chamberType !== ChamberType.Queen) continue;
+    const bx = ch.posX >> FP_SHIFT;
+    const by = ch.posY >> FP_SHIFT;
+    if (tileX >= bx && tileX < bx + ch.width && tileY >= by && tileY < by + ch.height) return true;
+  }
+  return false;
+}
+
+/**
+ * Move every alive colony queen one step toward her Queen chamber.
+ *
+ * No Queen chamber → queen holds (initial state — any starting position is
+ * the "home" position for Phase 3 playability).
+ * Queen already inside Queen chamber footprint → hold.
+ * Surface → step toward nearest OPEN entrance; descend when on the entrance
+ * tile (Surface → Underground, posY = 0).
+ * Underground → consume the per-colony `queen` chamber flow-field; fall back
+ * to Manhattan step toward the nearest Queen-chamber Open tile when the
+ * cache is absent (test harness path).
+ *
+ * Queens NEVER return to the surface once underground. Their passability
+ * uses AntTask.Idle rules (blocks Solid + Marked) — the queen is not a
+ * digger and must never cut through dirt.
+ */
+function moveQueens(
+  world: WorldState,
+  queenIds: Set<number> | null,
+  entranceFlowFields?: EntranceFlowFields,
+  chamberFlowFields?: ChamberFlowFields,
+): void {
+  void entranceFlowFields; // entrance steering for queens uses Manhattan — no flow-field needed on surface.
+  if (queenIds === null || queenIds.size === 0) return;
+
+  const ants = world.ants;
+  const surfaceMaxX = (SURFACE_GRID_WIDTH << FP_SHIFT) - 1;
+  const surfaceMaxY = (SURFACE_GRID_HEIGHT << FP_SHIFT) - 1;
+  const undergroundMaxX = (UNDERGROUND_GRID_WIDTH << FP_SHIFT) - 1;
+  const undergroundMaxY = (UNDERGROUND_GRID_HEIGHT << FP_SHIFT) - 1;
+
+  for (const key in world.colonies) {
+    if (!Object.hasOwn(world.colonies, key)) continue;
+    const colony = world.colonies[key as unknown as number]!;
+    const qId = colony.queenEntityId;
+    if (!queenIds.has(qId)) continue;
+
+    // Gate: no completed Queen chamber → queen holds at her current tile.
+    if (!hasCompletedChamber(colony, ChamberType.Queen)) continue;
+
+    const zone = ants.zone[qId]!;
+    const prevPosX = ants.posX[qId]!;
+    const prevPosY = ants.posY[qId]!;
+    const tileX = prevPosX >> FP_SHIFT;
+    const tileY = prevPosY >> FP_SHIFT;
+
+    // Already home — no movement.
+    if (zone === Zone.Underground && isInsideQueenChamber(colony, tileX, tileY)) continue;
+
+    // Pre-move descent: if the queen is already standing on one of her
+    // colony's OPEN entrance tiles, descend immediately rather than computing
+    // a (0,0) Manhattan delta and bailing via the zero-delta early return.
+    // Debug case: starter colony spawns the queen on the entrance tile with a
+    // completed Queen chamber already in place — without this short-circuit
+    // she would sit on the entrance forever and Gate 6 would block egg
+    // production indefinitely.
+    if (zone === Zone.Surface) {
+      for (let e = 0; e < colony.entrances.length; e++) {
+        const entrance = colony.entrances[e]!;
+        if (!entrance.isOpen) continue;
+        if (entrance.surfaceTileX !== tileX || entrance.surfaceTileY !== tileY) continue;
+        ants.zone[qId] = Zone.Underground;
+        ants.posY[qId] = 0;
+        // posX preserved (entrance shaft is the same column); next tick the
+        // underground branch steers her toward the Queen chamber via the
+        // queen flow-field.
+        break;
+      }
+      if (ants.zone[qId] === Zone.Underground) continue;
+    }
+
+    let dx = 0;
+    let dy = 0;
+
+    if (zone === Zone.Surface) {
+      // Route to the nearest OPEN entrance. Deterministic tie-break:
+      // smallest entranceId wins (same rule tickAntMovement uses).
+      let bestDist = -1;
+      let bestId = -1;
+      let targetTileX = -1;
+      let targetTileY = -1;
+      for (let e = 0; e < colony.entrances.length; e++) {
+        const ent = colony.entrances[e]!;
+        if (!ent.isOpen) continue;
+        const d = Math.abs(ent.surfaceTileX - tileX) + Math.abs(ent.surfaceTileY - tileY);
+        if (bestDist < 0 || d < bestDist || (d === bestDist && ent.entranceId < bestId)) {
+          bestDist = d;
+          bestId = ent.entranceId;
+          targetTileX = ent.surfaceTileX;
+          targetTileY = ent.surfaceTileY;
+        }
+      }
+      if (targetTileX < 0) continue; // no open entrance — queen cannot descend yet.
+      const rawDx = targetTileX - tileX;
+      const rawDy = targetTileY - tileY;
+      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+      } else {
+        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+      }
+    } else {
+      // Underground → follow the queen flow-field (seeded only from Queen
+      // chamber Open tiles). A Nursery-only chamber tile must NOT be a
+      // resting target for the queen, so we never consume the nursing field
+      // here.
+      const underground = world.undergroundGrids[colony.colonyId];
+      if (!underground) continue;
+
+      let stepped = false;
+      if (chamberFlowFields) {
+        const flowField = chamberFlowFields.queen[colony.colonyId];
+        if (flowField) {
+          const idx = tileY * underground.width + tileX;
+          const dir = flowField[idx]!;
+          if (dir === -1) {
+            // On a Queen chamber Open tile — isInsideQueenChamber covers this
+            // earlier in the function, but the flow-field may still report
+            // -1 on a queen-chamber Marked-tile-turned-Open boundary race.
+            continue;
+          }
+          if (dir === -2) {
+            // Unreachable — failsafe: hold. The queen cannot cut through
+            // dirt. Once a digger excavates the intervening tile, dirty
+            // flag will recompute the field.
+            continue;
+          }
+          if (dir >= 0 && dir < 4) {
+            dx = DIR_DX[dir]!;
+            dy = DIR_DY[dir]!;
+            stepped = true;
+          }
+        }
+      }
+
+      if (!stepped) {
+        // No cache or no field yet — Manhattan fallback: nearest Queen
+        // chamber Open tile.
+        let bestDist = -1;
+        let targetTileX = -1;
+        let targetTileY = -1;
+        for (let c = 0; c < colony.chambers.length; c++) {
+          const ch = colony.chambers[c]!;
+          if (ch.chamberType !== ChamberType.Queen) continue;
+          const bx = ch.posX >> FP_SHIFT;
+          const by = ch.posY >> FP_SHIFT;
+          for (let ty = 0; ty < ch.height; ty++) {
+            for (let tx = 0; tx < ch.width; tx++) {
+              const cx = bx + tx;
+              const cy = by + ty;
+              if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
+              const d = Math.abs(cx - tileX) + Math.abs(cy - tileY);
+              if (bestDist < 0 || d < bestDist) {
+                bestDist = d;
+                targetTileX = cx;
+                targetTileY = cy;
+              }
+            }
+          }
+        }
+        if (targetTileX < 0) continue;
+        const rawDx = targetTileX - tileX;
+        const rawDy = targetTileY - tileY;
+        if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+          dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+        } else {
+          dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+        }
+      }
+    }
+
+    if (dx === 0 && dy === 0) continue;
+
+    const speed = ants.speed[qId]!;
+    let posX = prevPosX + dx * speed;
+    let posY = prevPosY + dy * speed;
+
+    // Underground passability guard — queen uses AntTask.Idle rules, so
+    // Solid and Marked are both blocked. She can only traverse Open and
+    // BeingDug tiles, guaranteeing no dirt-cutting.
+    if (zone === Zone.Underground) {
+      const underground = world.undergroundGrids[colony.colonyId];
+      if (underground) {
+        const newTileX = posX >> FP_SHIFT;
+        const newTileY = posY >> FP_SHIFT;
+        if (newTileX !== tileX || newTileY !== tileY) {
+          if (!canEnterUndergroundTile(underground, newTileX, newTileY, AntTask.Idle)) {
+            posX = prevPosX;
+            posY = prevPosY;
+          }
+        }
+      }
+    }
+
+    // Clamp to zone bounds
+    if (zone === Zone.Underground) {
+      if (posX < 0) posX = 0; else if (posX > undergroundMaxX) posX = undergroundMaxX;
+      if (posY < 0) posY = 0; else if (posY > undergroundMaxY) posY = undergroundMaxY;
+    } else {
+      if (posX < 0) posX = 0; else if (posX > surfaceMaxX) posX = surfaceMaxX;
+      if (posY < 0) posY = 0; else if (posY > surfaceMaxY) posY = surfaceMaxY;
+    }
+
+    ants.posX[qId] = posX;
+    ants.posY[qId] = posY;
+
+    // Zone transition — Surface → Underground only. Queens never return to
+    // the surface once they descend.
+    if (zone === Zone.Surface) {
+      const newTileX = posX >> FP_SHIFT;
+      const newTileY = posY >> FP_SHIFT;
+      for (let e = 0; e < colony.entrances.length; e++) {
+        const entrance = colony.entrances[e]!;
+        if (entrance.isOpen && entrance.surfaceTileX === newTileX && entrance.surfaceTileY === newTileY) {
+          ants.zone[qId] = Zone.Underground;
+          ants.posY[qId] = 0;
+          break;
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // tickAntMovement — PRD §8a step 16 (zone-aware, SURF-05)
 //
 // For each alive ant:
@@ -1068,23 +1958,58 @@ export function canEnterUndergroundTile(
  *
  * @param world          WorldState (reads + writes ants, reads pheromoneGrids, undergroundGrids, colonies).
  * @param rng            WorldState Rng instance (passed explicitly — no singletons).
- * @param digFlowFields  Per-colony flow-field cache (passed to getTaskDirection for dig workers).
+ * @param digFlowFields       Per-colony flow-field cache (passed to getTaskDirection for dig workers).
+ * @param entranceFlowFields  Optional per-colony flow-field cache seeded from open
+ *                            entrance underground tiles. When provided, underground
+ *                            zone-transitioning ants read this field to avoid
+ *                            straight-line steering into solid dirt on bent tunnels.
+ *                            Tests that don't exercise underground entrance routing
+ *                            may omit this parameter.
+ * @param chamberFlowFields   Optional per-colony chamber flow-field cache. When
+ *                            provided, underground carrying foragers consume the
+ *                            `food` field (FoodStorage target) and Nursing ants
+ *                            consume the `nursing` field (Queen/Nursery target)
+ *                            instead of straight-line chamber steering. Tests that
+ *                            don't exercise underground chamber routing may omit it.
  */
-export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigFlowFields): void {
+export function tickAntMovement(
+  world: WorldState,
+  rng: Rng,
+  digFlowFields: DigFlowFields,
+  entranceFlowFields?: EntranceFlowFields,
+  chamberFlowFields?: ChamberFlowFields,
+): void {
   const ants = world.ants;
   const surfaceMaxX = (SURFACE_GRID_WIDTH << FP_SHIFT) - 1;
   const surfaceMaxY = (SURFACE_GRID_HEIGHT << FP_SHIFT) - 1;
   const undergroundMaxX = (UNDERGROUND_GRID_WIDTH << FP_SHIFT) - 1;
   const undergroundMaxY = (UNDERGROUND_GRID_HEIGHT << FP_SHIFT) - 1;
 
+  // P1 queen-relocation: queens have their own movement path (route to Queen
+  // chamber). They must be skipped in the main loop below so the default
+  // Idle-task branch (which triggers needsSurface zone-transition) does not
+  // yank a relocated queen back to the surface. Collect the ID set up front.
+  const queenIds = collectAliveQueenIds(world);
+  moveQueens(world, queenIds, entranceFlowFields, chamberFlowFields);
+
+  // Same-colony occupancy enforcement is applied as a POST-PASS after the
+  // movement loop — see resolveSameColonyOccupancy below. The in-loop
+  // check (the previous revision) only saw already-processed ants, so a
+  // lower-id ant could move onto a higher-id ant that had not yet been
+  // processed. The post-pass walks every live ant in entity-id order after
+  // all moves and zone transitions are committed, so every collision
+  // (mobile-into-mobile, mobile-into-stationary, pre-existing stationary
+  // duplicate) is visible at resolution time.
+
   for (let id = 0; id < world.nextEntityId; id++) {
     if (ants.alive[id] !== 1) continue;
+    if (queenIds !== null && queenIds.has(id)) continue; // queen moved above
 
     const task = ants.task[id]!;
     const zone = ants.zone[id]!;
     const foodCarrying = ants.foodCarrying[id]!;
-    let dx: number;
-    let dy: number;
+    let dx = 0;
+    let dy = 0;
 
     // --- PRD §4d Food Storage chamber routing (underground carrying foragers) ---
     // Underground + Foraging + foodCarrying > 0 → target the nearest OPEN tile
@@ -1096,7 +2021,6 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
     // then row-major tile iteration — stable across ticks given stable inputs.
     let chamberTargetX = -1;
     let chamberTargetY = -1;
-    let hasFoodStorage = false;
     if (
       zone === Zone.Underground &&
       task === AntTask.Foraging &&
@@ -1112,7 +2036,6 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         for (let c = 0; c < colony.chambers.length; c++) {
           const chamber = colony.chambers[c]!;
           if (chamber.chamberType !== ChamberType.FoodStorage) continue;
-          hasFoodStorage = true;
           const baseX = chamber.posX >> FP_SHIFT;
           const baseY = chamber.posY >> FP_SHIFT;
           for (let ty = 0; ty < chamber.height; ty++) {
@@ -1135,29 +2058,37 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
     // --- PRD §5c entrance targeting (zone-transitioning ants) ---
     // Surface→Underground: Digging, Nursing, or Foraging+CarryingFood.
     // Underground→Surface: Foraging+SearchingFood (foodCarrying=0), or Fighting.
-    // Underground+Foraging+CarryingFood falls here ONLY when no FoodStorage chamber
-    // exists (PRD §4d fallback) — target is the underground side of the nearest open
-    // entrance at tileY=0.
+    // Underground+Foraging+CarryingFood also computes an entrance target — it
+    // serves as the fallback path when (a) no FoodStorage chamber exists
+    // (PRD §4d fallback) or (b) FoodStorage exists but the chamber flow-field
+    // reports it unreachable from the ant's current tile.
     // Target the nearest OPEN entrance (Manhattan; lower entranceId breaks ties).
     // Step overrides any priority target set by routeForagerPriority (step 13) —
     // only SearchingFood surface foragers (non-transitioning) keep that target.
     let entranceTargetX = -1;
     let entranceTargetY = -1;
-    if (chamberTargetX === -1) {
+    {
       let needsTransition = false;
       if (zone === Zone.Surface) {
+        // 09 excursion-foraging memo — ReturningToNest foragers share the
+        // entrance-routing path. The Surface→Underground descent logic
+        // further down (zone-transition block) is gated on CarryingFood, so
+        // a ReturningToNest ant arriving at the entrance tile stays on the
+        // surface and flips back to SearchingFood there.
         needsTransition =
           task === AntTask.Digging ||
           task === AntTask.Nursing ||
-          (task === AntTask.Foraging && foodCarrying > 0);
+          (task === AntTask.Foraging && foodCarrying > 0) ||
+          (task === AntTask.Foraging &&
+           ants.subTask[id] === ForagingSubState.ReturningToNest);
       } else {
-        // Zone.Underground
+        // Zone.Underground — underground carriers compute an entrance target
+        // whether or not a FoodStorage chamber exists, so the chamber-flow
+        // unreachable failsafe has a fallback ready.
         needsTransition =
           (task === AntTask.Foraging && foodCarrying === 0) ||
           task === AntTask.Fighting ||
-          // PRD §4d fallback: carrying forager with no FoodStorage chamber routes
-          // to underground side of nearest open entrance.
-          (task === AntTask.Foraging && foodCarrying > 0 && !hasFoodStorage);
+          (task === AntTask.Foraging && foodCarrying > 0);
       }
 
       if (needsTransition) {
@@ -1193,31 +2124,123 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
       }
     }
 
-    if (chamberTargetX !== -1) {
-      // PRD §4d: underground carrying forager routes to nearest Open FoodStorage tile.
+    // chamberFoodUnreachable is set when the FoodStorage flow-field reports
+    // -2 at the ant's current tile. That forces a fall-through to the
+    // entrance branch so a pocketed carrier heads for the surface rather
+    // than freezing inside a chamber footprint still awaiting excavation.
+    // Peeked here (before the steering if/elseif chain) so the branch
+    // selection can consume it as a guard.
+    let chamberFoodUnreachable = false;
+    if (chamberTargetX !== -1 && chamberFlowFields !== undefined) {
+      const colonyId = ants.colonyId[id]!;
+      const flowField = chamberFlowFields.food[colonyId];
+      const underground = world.undergroundGrids[colonyId];
+      if (flowField && underground) {
+        const tileX = ants.posX[id]! >> FP_SHIFT;
+        const tileY = ants.posY[id]! >> FP_SHIFT;
+        const idx = tileY * underground.width + tileX;
+        if (flowField[idx] === -2) chamberFoodUnreachable = true;
+      }
+    }
+
+    if (chamberTargetX !== -1 && !chamberFoodUnreachable) {
+      // PRD §4d: underground carrying forager routes to a FoodStorage Open
+      // tile. Prefer the food flow-field when available — straight-line
+      // steering walks through Solid dirt on bent tunnels (see the
+      // seed-920076605 debug snapshot where carriers froze at 23,7 because
+      // the next axis-step landed on Solid at 23,8).
       const posX = ants.posX[id]!;
       const posY = ants.posY[id]!;
-      const rawDx = chamberTargetX - posX;
-      const rawDy = chamberTargetY - posY;
-      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
-        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
-        dy = 0;
-      } else {
-        dx = 0;
-        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+      let stepped = false;
+      if (chamberFlowFields !== undefined) {
+        const colonyId = ants.colonyId[id]!;
+        const flowField = chamberFlowFields.food[colonyId];
+        const underground = world.undergroundGrids[colonyId];
+        if (flowField && underground) {
+          const tileX = posX >> FP_SHIFT;
+          const tileY = posY >> FP_SHIFT;
+          const idx = tileY * underground.width + tileX;
+          const dir = flowField[idx]!;
+          if (dir === -1) {
+            // On a FoodStorage chamber tile — hold. antDepositFood at step
+            // 16b completes the hand-off and flips task=Idle.
+            dx = 0;
+            dy = 0;
+            stepped = true;
+          } else if (dir >= 0 && dir < 4) {
+            dx = DIR_DX[dir]!;
+            dy = DIR_DY[dir]!;
+            stepped = true;
+          }
+          // dir === -2 is unreachable here — chamberFoodUnreachable was set
+          // above and the outer branch guards against entering this block.
+        }
+      }
+      if (!stepped) {
+        // Cache absent (test harness) — retain the original Manhattan step.
+        const rawDx = chamberTargetX - posX;
+        const rawDy = chamberTargetY - posY;
+        if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+          dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+          dy = 0;
+        } else {
+          dx = 0;
+          dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+        }
       }
     } else if (entranceTargetX !== -1) {
       // Zone-transitioning ant — move toward nearest open entrance.
       const posX = ants.posX[id]!;
       const posY = ants.posY[id]!;
-      const rawDx = entranceTargetX - posX;
-      const rawDy = entranceTargetY - posY;
-      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
-        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
-        dy = 0;
-      } else {
-        dx = 0;
-        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+
+      // Underground: consume the entrance flow-field so we route through
+      // Open/BeingDug tunnels instead of steering straight-line into dirt on
+      // bends. See entrance-flow.ts for BFS details. Fall back to straight-line
+      // when no cache is passed (test harnesses) or the colony's field is
+      // missing (shouldn't happen at step 16 — step 9 seeds lazily).
+      let stepped = false;
+      if (zone === Zone.Underground && entranceFlowFields !== undefined) {
+        const colonyId = ants.colonyId[id]!;
+        const flowField = entranceFlowFields.fields[colonyId];
+        const underground = world.undergroundGrids[colonyId];
+        if (flowField && underground) {
+          const tileX = posX >> FP_SHIFT;
+          const tileY = posY >> FP_SHIFT;
+          const idx = tileY * underground.width + tileX;
+          const dir = flowField[idx]!;
+          if (dir === -1) {
+            // Source tile — at underground side of an open entrance. Hold so
+            // the zone-transition block below can promote to Surface.
+            dx = 0;
+            dy = 0;
+            stepped = true;
+          } else if (dir >= 0 && dir < 4) {
+            dx = DIR_DX[dir]!;
+            dy = DIR_DY[dir]!;
+            stepped = true;
+          } else {
+            // dir === -2 (unreachable). Deterministic failsafe: hold position
+            // rather than oscillate straight-line into a wall. Happens when
+            // the ant is on a Marked/Solid tile with no tunnel connection to
+            // any open entrance — e.g. stranded on a chamber footprint still
+            // awaiting excavation.
+            dx = 0;
+            dy = 0;
+            stepped = true;
+          }
+        }
+      }
+
+      if (!stepped) {
+        const rawDx = entranceTargetX - posX;
+        const rawDy = entranceTargetY - posY;
+        if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+          dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+          dy = 0;
+        } else {
+          dx = 0;
+          dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+        }
       }
     } else if (task === AntTask.Foraging) {
       // Non-transitioning forager — priority target (step 13) or pheromone gradient.
@@ -1267,27 +2290,64 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
             // successful routes get reused instead of randomly discarded.
             // Still returns (0,0) when no pheromone is within range → fall
             // through to the bootstrap wander (09 foraging-autonomy memo).
-            const dir = sampleForagingDirection(grid, tileX, tileY, rng);
+            // 09 follow-up issue 1: pass the ant's prev tile so the sampler
+            // can filter out an immediate-reverse pick — breaks the ABAB
+            // scalar-gradient loop.
+            const dir = sampleForagingDirection(
+              grid,
+              tileX,
+              tileY,
+              rng,
+              ants.searchPrevTileX[id]!,
+              ants.searchPrevTileY[id]!,
+            );
             if (dir.dx !== 0 || dir.dy !== 0) {
               dx = dir.dx;
               dy = dir.dy;
             } else {
-              const wander = chooseWanderDirection(world, id, rng);
+              const wander = chooseExcursionDirection(world, id, rng);
               dx = wander.dx;
               dy = wander.dy;
             }
           } else {
             // No pheromone grid (scenario-dependent presence) — still wander
             // so the forager is not pinned at the entrance.
-            const wander = chooseWanderDirection(world, id, rng);
+            const wander = chooseExcursionDirection(world, id, rng);
             dx = wander.dx;
             dy = wander.dy;
           }
         }
       }
+    } else if (task === AntTask.Fighting) {
+      // Surface fighter routes to colony.rallyPoint via ants.targetPosX/Y
+      // (written by updateFightAntTargets at step 10c each tick). Underground
+      // fighters computed entranceTargetX via needsTransition above and were
+      // handled by the entrance branch — they only reach this branch after
+      // transitioning to the surface, when targetPosX/Y now holds the rally.
+      const posX = ants.posX[id]!;
+      const posY = ants.posY[id]!;
+      const targetX = ants.targetPosX[id]!;
+      const targetY = ants.targetPosY[id]!;
+      if (targetX !== -1 && targetY !== -1) {
+        const rawDx = targetX - posX;
+        const rawDy = targetY - posY;
+        if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+          dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+          dy = 0;
+        } else {
+          dx = 0;
+          dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+        }
+      } else {
+        // No target and no entrance fallback — hold. updateFightAntTargets
+        // writes targetPosX/Y whenever rallyPoint or entrances exist, so this
+        // is only reached when a fighter has neither rally nor entrance.
+        dx = 0;
+        dy = 0;
+      }
     } else {
       // Non-forager, non-transitioning: pure direction lookup (no state mutations).
-      const dir = getTaskDirection(world, id, digFlowFields);
+      const dir = getTaskDirection(world, id, digFlowFields, chamberFlowFields);
       dx = dir.dx;
       dy = dir.dy;
     }
@@ -1337,9 +2397,64 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
     ants.posX[id] = posX;
     ants.posY[id] = posY;
 
+    // 09 excursion-foraging follow-up — record prev tile for a surface
+    // Foraging + SearchingFood ant that actually crossed a tile boundary.
+    // sampleForagingDirection and hasNearbyPheromoneSignal use this to avoid
+    // reversing onto the just-vacated cell (anti-backtrack). Only the
+    // SearchingFood state needs this — CarryingFood/ReturningToNest paths
+    // navigate by scent/target/entrance, not by scalar gradient.
+    if (
+      zone === Zone.Surface &&
+      task === AntTask.Foraging &&
+      ants.subTask[id] === ForagingSubState.SearchingFood
+    ) {
+      const preTileX = prevPosX >> FP_SHIFT;
+      const preTileY = prevPosY >> FP_SHIFT;
+      const newTileX = posX >> FP_SHIFT;
+      const newTileY = posY >> FP_SHIFT;
+      if (newTileX !== preTileX || newTileY !== preTileY) {
+        ants.searchPrevTileX[id] = preTileX;
+        ants.searchPrevTileY[id] = preTileY;
+      }
+    }
+
     // --- Zone transitions (PRD §5d — applied AFTER position update) ---
     // Surface → Underground: ant on surface at an open entrance, task requires underground
     if (zone === Zone.Surface) {
+      // 09 excursion-foraging memo — ReturningToNest arrival check. A forager
+      // heading home after a failed search reaches the entrance tile on the
+      // surface, flips back to SearchingFood, bumps its wave counter (capped
+      // at SEARCH_LEASH_MAX_WAVE), and clears the heading so the next
+      // excursion re-derives an outward direction from the entrance.
+      if (
+        task === AntTask.Foraging &&
+        ants.subTask[id] === ForagingSubState.ReturningToNest
+      ) {
+        const tileXR = posX >> FP_SHIFT;
+        const tileYR = posY >> FP_SHIFT;
+        const colonyIdR = ants.colonyId[id]!;
+        const colonyR = world.colonies[colonyIdR];
+        if (colonyR && colonyR.entrances) {
+          for (let e = 0; e < colonyR.entrances.length; e++) {
+            const ent = colonyR.entrances[e]!;
+            if (ent.surfaceTileX === tileXR && ent.surfaceTileY === tileYR) {
+              ants.subTask[id] = ForagingSubState.SearchingFood;
+              const curWave = ants.searchWave[id]!;
+              const nextWave = curWave + 1;
+              ants.searchWave[id] = nextWave > SEARCH_LEASH_MAX_WAVE
+                ? SEARCH_LEASH_MAX_WAVE
+                : nextWave;
+              ants.searchHeadingX[id] = 0;
+              ants.searchHeadingY[id] = 0;
+              ants.searchHeadingTicks[id] = 0;
+              ants.searchPrevTileX[id] = -1;
+              ants.searchPrevTileY[id] = -1;
+              break;
+            }
+          }
+        }
+      }
+
       const needsUnderground =
         task === AntTask.Digging ||
         task === AntTask.Nursing ||
@@ -1394,5 +2509,151 @@ export function tickAntMovement(world: WorldState, rng: Rng, digFlowFields: DigF
         }
       }
     }
+
   }
+
+  // POST-PASS: resolve same-colony occupancy after every ant has moved and
+  // zone-transitioned. See resolveSameColonyOccupancy for semantics.
+  resolveSameColonyOccupancy(world);
+}
+
+// ---------------------------------------------------------------------------
+// resolveSameColonyOccupancy — enforce "no two same-colony mobile ants end a
+// tick on the same (zone, tile)" invariant.
+//
+// Runs after tickAntMovement's per-ant move + zone transition loop. Iterates
+// every live ant in entity-id order (lower-id wins contested tiles). On a
+// collision with an already-claimed same-colony tile, the higher-id ant is
+// deterministically shifted to the first passable adjacent tile (N, E, S, W
+// order) that is not claimed by another same-colony ant in this pass. When no
+// adjacent tile is available (extreme corner cases — fully walled in) the ant
+// accepts the overlap rather than invalidating the scene. Cross-colony overlap
+// is preserved: the key encodes colonyId, so different colonies never contest.
+//
+// "Work site" tiles (chamber footprints, entrance tiles, food piles) are
+// exempt: they are explicit stacking zones where multiple ants must coexist to
+// deposit food, nurse brood, excavate, or pick up. Exempt tiles never enter
+// the occupancy map.
+// ---------------------------------------------------------------------------
+function resolveSameColonyOccupancy(world: WorldState): void {
+  const ants = world.ants;
+  const occupancy = new Map<number, number>(); // tileKey → lowest-id claimant
+
+  for (let id = 0; id < world.nextEntityId; id++) {
+    if (ants.alive[id] !== 1) continue;
+
+    const colonyId = ants.colonyId[id]!;
+    const zone = ants.zone[id]!;
+    let tileX = ants.posX[id]! >> FP_SHIFT;
+    let tileY = ants.posY[id]! >> FP_SHIFT;
+
+    if (isOccupancyExempt(world, colonyId, zone, tileX, tileY)) continue;
+
+    const key = (colonyId << 16) | (zone << 15) | (tileY << 7) | tileX;
+    if (!occupancy.has(key)) {
+      occupancy.set(key, id);
+      continue;
+    }
+
+    // Collision: a lower-id same-colony ant already claimed this tile.
+    // Try to shift this ant to a passable, unclaimed adjacent tile.
+    const task = ants.task[id]! as AntTask;
+    const underground =
+      zone === Zone.Underground ? world.undergroundGrids[colonyId] : undefined;
+    let shifted = false;
+    for (let d = 0; d < 4; d++) {
+      const nx = tileX + DIR_DX[d]!;
+      const ny = tileY + DIR_DY[d]!;
+      if (zone === Zone.Underground) {
+        if (nx < 0 || nx >= UNDERGROUND_GRID_WIDTH) continue;
+        if (ny < 0 || ny >= UNDERGROUND_GRID_HEIGHT) continue;
+        if (underground && !canEnterUndergroundTile(underground, nx, ny, task)) continue;
+      } else {
+        if (nx < 0 || nx >= SURFACE_GRID_WIDTH) continue;
+        if (ny < 0 || ny >= SURFACE_GRID_HEIGHT) continue;
+      }
+      // Exempt adjacent tiles are always "free" — we shift into them and do
+      // not claim them (keeping them open for further stacking).
+      if (isOccupancyExempt(world, colonyId, zone, nx, ny)) {
+        tileX = nx;
+        tileY = ny;
+        ants.posX[id] = tileX << FP_SHIFT;
+        ants.posY[id] = tileY << FP_SHIFT;
+        shifted = true;
+        break;
+      }
+      const adjKey = (colonyId << 16) | (zone << 15) | (ny << 7) | nx;
+      if (occupancy.has(adjKey)) continue;
+      tileX = nx;
+      tileY = ny;
+      ants.posX[id] = tileX << FP_SHIFT;
+      ants.posY[id] = tileY << FP_SHIFT;
+      occupancy.set(adjKey, id);
+      shifted = true;
+      break;
+    }
+    // If no shift found, forced overlap — rare. Leave the ant at the original
+    // tile; do not pollute the occupancy map (the lower-id claimant remains
+    // registered). Visual overlap persists this tick; natural drift on the
+    // next tick usually breaks the tie.
+    void shifted;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// isOccupancyExempt — tile-based exemption for same-colony occupancy rule.
+//
+// Returns true when (zone, tileX, tileY) is a "work site" where multiple
+// same-colony ants must be able to stack:
+//   - Any same-colony chamber footprint (food deposit, nursing, expansion).
+//   - Any same-colony entrance (surface tile; underground shaft bottom at tileY=0).
+//   - Any food pile (surface only; piles are infinite pickup sources per SURF-02).
+//
+// Inlined per-ant. Chamber / entrance / pile counts are small in practice
+// (bounded by colony design), so the linear scan is acceptable in the movement
+// hot path. Runs O(chambers + entrances + piles) per move rather than per ant
+// per work-site lookup — no Set/Map allocation.
+// ---------------------------------------------------------------------------
+function isOccupancyExempt(
+  world: WorldState,
+  colonyId: number,
+  zone: number,
+  tileX: number,
+  tileY: number,
+): boolean {
+  const colony = world.colonies[colonyId];
+  if (!colony) return false;
+
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const chamber = colony.chambers[c]!;
+    const bx = chamber.posX >> FP_SHIFT;
+    const by = chamber.posY >> FP_SHIFT;
+    if (
+      tileX >= bx && tileX < bx + chamber.width &&
+      tileY >= by && tileY < by + chamber.height
+    ) {
+      return true;
+    }
+  }
+
+  if (colony.entrances) {
+    for (let e = 0; e < colony.entrances.length; e++) {
+      const ent = colony.entrances[e]!;
+      if (zone === Zone.Surface) {
+        if (ent.surfaceTileX === tileX && ent.surfaceTileY === tileY) return true;
+      } else {
+        // Underground shaft bottom at (entrance col, tileY=0)
+        if (ent.surfaceTileX === tileX && tileY === 0) return true;
+      }
+    }
+  }
+
+  if (zone === Zone.Surface) {
+    for (let p = 0; p < world.foodPiles.length; p++) {
+      const pile = world.foodPiles[p]!;
+      if (pile.tileX === tileX && pile.tileY === tileY) return true;
+    }
+  }
+
+  return false;
 }

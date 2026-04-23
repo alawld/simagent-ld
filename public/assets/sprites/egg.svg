@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" shape-rendering="geometricPrecision">
+  <!-- Cream egg body — one white ellipse that tinting layers can shift. -->
+  <g fill="#ffffff">
+    <ellipse cx="5" cy="5.3" rx="3.2" ry="4.2"/>
+  </g>
+  <!-- Thin dark outline so the egg reads against the chamber floor. -->
+  <g fill="none" stroke="#2a1c0a" stroke-width="0.6" opacity="0.85">
+    <ellipse cx="5" cy="5.3" rx="3.2" ry="4.2"/>
+  </g>
+</svg>

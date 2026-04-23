@@ -59,6 +59,17 @@ interface SerializedAnts {
   // Optional for backward compatibility with pre-Phase-9 saves; deserializer
   // treats absent as zero-init (base wave).
   searchWave?: number[];
+  // Phase 9 / 09 excursion-foraging memo — correlated outward walk heading
+  // (per-ant, no colony-memory). Optional for backward compatibility — a save
+  // written before the excursion pass simply re-rolls the heading next tick.
+  searchHeadingX?: number[];
+  searchHeadingY?: number[];
+  searchHeadingTicks?: number[];
+  // Phase 9 / 09 excursion-foraging follow-up — per-ant anti-backtrack prev
+  // tile. Optional for backward compatibility; absent means "no previous tile",
+  // so an ant one tick post-load cannot be anti-backtracked on its first move.
+  searchPrevTileX?: number[];
+  searchPrevTileY?: number[];
 }
 
 interface SerializedColony {
@@ -131,6 +142,11 @@ function serializeAnts(a: AntComponents): SerializedAnts {
     targetPosX:        Array.from(a.targetPosX),
     targetPosY:        Array.from(a.targetPosY),
     searchWave:        Array.from(a.searchWave),
+    searchHeadingX:    Array.from(a.searchHeadingX),
+    searchHeadingY:    Array.from(a.searchHeadingY),
+    searchHeadingTicks:Array.from(a.searchHeadingTicks),
+    searchPrevTileX:   Array.from(a.searchPrevTileX),
+    searchPrevTileY:   Array.from(a.searchPrevTileY),
   };
 }
 
@@ -239,6 +255,26 @@ function deserializeAnts(saved: SerializedAnts, capacity: number): AntComponents
   // zero-initialized the field (base wave), so skip the copy when absent.
   if (saved.searchWave !== undefined) {
     copyIntoInt32(a.searchWave, saved.searchWave);
+  }
+  // Phase 9 excursion-foraging — heading fields are optional for forward
+  // compatibility with older saves written before the excursion pass landed.
+  if (saved.searchHeadingX !== undefined) {
+    copyIntoInt32(a.searchHeadingX, saved.searchHeadingX);
+  }
+  if (saved.searchHeadingY !== undefined) {
+    copyIntoInt32(a.searchHeadingY, saved.searchHeadingY);
+  }
+  if (saved.searchHeadingTicks !== undefined) {
+    copyIntoInt32(a.searchHeadingTicks, saved.searchHeadingTicks);
+  }
+  // 09 excursion-foraging follow-up — prev-tile fields. Pre-follow-up saves
+  // omit these; createAntComponents already -1-filled them, so a loaded ant
+  // starts with "no previous tile" exactly as if it had just been promoted.
+  if (saved.searchPrevTileX !== undefined) {
+    copyIntoInt32(a.searchPrevTileX, saved.searchPrevTileX);
+  }
+  if (saved.searchPrevTileY !== undefined) {
+    copyIntoInt32(a.searchPrevTileY, saved.searchPrevTileY);
   }
   return a;
 }

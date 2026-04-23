@@ -16,6 +16,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   withdrawFood,
+  colonyFoodCapacity,
   tickFoodConsumption,
   tickStarvationCheck,
   tickDeathCleanup,
@@ -34,6 +35,7 @@ import {
   QUEEN_FOOD_PER_TICK,
   LARVA_FOOD_PER_TICK,
   FOOD_CHAMBER_CAPACITY,
+  BASE_FOOD_STORAGE_CAPACITY,
 } from '../constants.js';
 import { createUndergroundGrid, ugSet, UndergroundTileState } from '../terrain.js';
 import { FP_SHIFT } from '../fixed.js';
@@ -389,6 +391,51 @@ describe('tickDeathCleanup', () => {
 // tickReconcile
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// colonyFoodCapacity — 09 backlog memo
+// ---------------------------------------------------------------------------
+
+describe('colonyFoodCapacity', () => {
+  it('base-only cap — no chambers → BASE_FOOD_STORAGE_CAPACITY', () => {
+    const { colony } = setupWorldWithQueen();
+    expect(colonyFoodCapacity(colony)).toBe(BASE_FOOD_STORAGE_CAPACITY);
+  });
+
+  it('base + 1× FoodStorage chamber → BASE + 1 × FOOD_CHAMBER_CAPACITY', () => {
+    const { colony } = setupWorldWithQueen();
+    colony.chambers.push(
+      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+    );
+    expect(colonyFoodCapacity(colony)).toBe(BASE_FOOD_STORAGE_CAPACITY + FOOD_CHAMBER_CAPACITY);
+  });
+
+  it('base + 2× FoodStorage chamber → BASE + 2 × FOOD_CHAMBER_CAPACITY', () => {
+    const { colony } = setupWorldWithQueen();
+    colony.chambers.push(
+      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+      { chamberId: 101, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 4, posY: 0, width: 3, height: 3 },
+    );
+    expect(colonyFoodCapacity(colony)).toBe(BASE_FOOD_STORAGE_CAPACITY + 2 * FOOD_CHAMBER_CAPACITY);
+  });
+
+  it('Queen / Nursery chambers do NOT contribute to capacity', () => {
+    const { colony } = setupWorldWithQueen();
+    colony.chambers.push(
+      { chamberId: 100, chamberType: ChamberType.Queen,   foodStored: 0, posX: 0, posY: 0, width: 5, height: 3 },
+      { chamberId: 101, chamberType: ChamberType.Nursery, foodStored: 0, posX: 8, posY: 0, width: 4, height: 3 },
+    );
+    expect(colonyFoodCapacity(colony)).toBe(BASE_FOOD_STORAGE_CAPACITY);
+  });
+
+  it('pending FoodStorage chambers do NOT contribute — only completed chambers in colony.chambers count', () => {
+    // Capacity helper reads only colony.chambers; world.pendingChambers is not inspected.
+    // Promotion happens in checkPendingChambers once excavation completes.
+    const { colony } = setupWorldWithQueen();
+    expect(colony.chambers).toHaveLength(0);
+    expect(colonyFoodCapacity(colony)).toBe(BASE_FOOD_STORAGE_CAPACITY);
+  });
+});
+
 describe('tickReconcile', () => {
   it('16. countdown decrement — recount does NOT run when countdown > 0 after decrement', () => {
     const { world, colony } = setupWorldWithQueen();
@@ -471,6 +518,45 @@ describe('tickReconcile', () => {
     expect(colony.foodStored).toBe(0);
   });
 
+  it('20a. reconcile clamps foodStored over capacity down to colonyFoodCapacity (no chambers)', () => {
+    const { world, colony } = setupWorldWithQueen();
+    colony.foodStored = BASE_FOOD_STORAGE_CAPACITY + 500; // simulated overshoot
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+    expect(colony.foodStored).toBe(BASE_FOOD_STORAGE_CAPACITY);
+  });
+
+  it('20b. reconcile clamps foodStored to BASE + N × FOOD_CHAMBER_CAPACITY when FoodStorage chambers exist', () => {
+    const { world, colony } = setupWorldWithQueen();
+    colony.chambers.push(
+      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+    );
+    const cap = BASE_FOOD_STORAGE_CAPACITY + FOOD_CHAMBER_CAPACITY;
+    colony.foodStored = cap + 1000; // overshoot
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+    expect(colony.foodStored).toBe(cap);
+    // Chamber distribution still caps at FOOD_CHAMBER_CAPACITY — no inflation
+    expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
+  });
+
+  it('20c. reconcile does NOT inflate foodStored when under capacity', () => {
+    const { world, colony } = setupWorldWithQueen(1000);
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+    expect(colony.foodStored).toBe(1000);
+  });
+
+  it('20d. reconcile does NOT interfere with food consumption — consumption still decrements foodStored', () => {
+    const { world, colony } = setupWorldWithQueen(1000);
+    // Force reconcile to run then consume on the same tick via the per-colony contract
+    colony.reconcileCountdown = 1;
+    tickReconcile(world, colony);
+    expect(colony.foodStored).toBe(1000); // no-op for a colony below cap
+    tickFoodConsumption(world, colony);
+    expect(colony.foodStored).toBe(1000 - QUEEN_FOOD_PER_TICK);
+  });
+
   it('22. reconcile derives FoodStorage chamber contents from authoritative foodStored', () => {
     const { world, colony } = setupWorldWithQueen(8000);
     // Add two FoodStorage chambers and one Nursery (non-food)
@@ -494,7 +580,10 @@ describe('tickReconcile', () => {
     expect(colony.foodStored).toBe(8000);
   });
 
-  it('23. reconcile overflow — colony.foodStored unchanged when chambers cannot hold all', () => {
+  it('23. reconcile overshoot clamped — colony.foodStored is pulled down to colonyFoodCapacity (09 backlog memo)', () => {
+    // Pre-memo behaviour was "colony.foodStored stays authoritative unchanged".
+    // Post-memo: reconcile defensively clamps to BASE + N × FOOD_CHAMBER_CAPACITY
+    // so an overshoot introduced by any non-deposit write path is corrected.
     const { world, colony } = setupWorldWithQueen(15000);
     colony.chambers.push(
       { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
@@ -503,9 +592,9 @@ describe('tickReconcile', () => {
     colony.reconcileCountdown = 1;
     tickReconcile(world, colony);
 
-    // Chamber gets FOOD_CHAMBER_CAPACITY (5120); colony.foodStored stays authoritative
+    const cap = BASE_FOOD_STORAGE_CAPACITY + FOOD_CHAMBER_CAPACITY; // 7168
     expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
-    expect(colony.foodStored).toBe(15000);
+    expect(colony.foodStored).toBe(cap);
   });
 });
 

@@ -441,6 +441,96 @@ describe('sampleForagingDirection (09 pheromone-reacquisition memo)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// sampleForagingDirection — 09 excursion-foraging follow-up (anti-backtrack)
+//
+// Regression coverage for the ABAB scalar-gradient loop observed far from
+// the entrance (Codex repro: seed 29 ticks 270-305, ant 17 bouncing between
+// (15,54) and (15,55) at distance 18 from entrance). The fix: pass the
+// ant's prev tile, and the sampler filters it out of the candidate set.
+// ---------------------------------------------------------------------------
+
+describe('sampleForagingDirection — anti-backtrack (09 follow-up issue 1)', () => {
+  it('ignores prev tile when it would be the strongest immediate neighbor', () => {
+    // The canonical trap: (4,5) and (6,5) both have max pheromone; ant at (5,5)
+    // with prev=(4,5) would greedily return to prev. With anti-backtrack it
+    // picks the non-prev strong cell (6,5), moving +x.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 4, 5, PHEROMONE_CAP);
+    phSet(grid, 6, 5, PHEROMONE_CAP);
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng, /*prevX*/ 4, /*prevY*/ 5);
+    expect(dir).toEqual({ dx: 1, dy: 0 }); // steps right, away from prev
+  });
+
+  it('returns {0,0} when the ONLY immediate pheromone is on the prev tile', () => {
+    // The ABAB trap state from the opposite end: ant just arrived from (4,5)
+    // and the only pheromone around is back at (4,5). Anti-backtrack should
+    // emit (0,0) so the caller falls through to wander, breaking the loop.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 4, 5, PHEROMONE_CAP);
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng, 4, 5);
+    expect(dir).toEqual({ dx: 0, dy: 0 });
+  });
+
+  it('without prev hint (-1,-1), strong neighbor still drives selection', () => {
+    // Backward-compat: prevX/prevY default to -1 for non-SearchingFood callers.
+    const grid = createPheromoneGrid(10, 10);
+    phSet(grid, 4, 5, PHEROMONE_CAP);
+    const rng = new Rng(1);
+    // No prev supplied → pick the only strong neighbor.
+    expect(sampleForagingDirection(grid, 5, 5, rng)).toEqual({ dx: -1, dy: 0 });
+  });
+
+  it('prev hint also filters the reacquire (layer-3) scan', () => {
+    // Ant at (5,5). The only nonzero cells are (3,5) (prev-side, dist 2) and
+    // (7,5) (non-prev side, dist 2). With prev=(4,5), the reacquire pick
+    // should not route through prev — step to (+1,0) toward the non-prev cell.
+    const grid = createPheromoneGrid(12, 12);
+    phSet(grid, 3, 5, FOOD_TRAIL_DEPOSIT);
+    phSet(grid, 7, 5, FOOD_TRAIL_DEPOSIT);
+    const rng = new Rng(1);
+    const dir = sampleForagingDirection(grid, 5, 5, rng, 4, 5);
+    expect(dir).toEqual({ dx: 1, dy: 0 });
+  });
+
+  it('ABAB scenario over several ticks: ant does not stutter indefinitely', () => {
+    // Fully simulate the two-tile loop: two max-strength cells (5,4) and
+    // (5,6); ant starts at (5,5). Without anti-backtrack the ant would
+    // alternate forever. With prev-tile tracking the ant either escapes
+    // laterally OR falls through to (0,0) (wander fallback). The broken
+    // behavior would be: sample always returns non-(0,0) and the ant keeps
+    // alternating between exactly two tiles.
+    const grid = createPheromoneGrid(12, 12);
+    phSet(grid, 5, 4, PHEROMONE_CAP);
+    phSet(grid, 5, 6, PHEROMONE_CAP);
+    const rng = new Rng(1);
+    let tileX = 5;
+    let tileY = 5;
+    let prevX = -1;
+    let prevY = -1;
+    const visited = new Set<string>();
+    visited.add(`${tileX},${tileY}`);
+    let brokeOutViaWander = false;
+    for (let step = 0; step < 20; step++) {
+      const dir = sampleForagingDirection(grid, tileX, tileY, rng, prevX, prevY);
+      if (dir.dx === 0 && dir.dy === 0) {
+        brokeOutViaWander = true;
+        break;
+      }
+      prevX = tileX;
+      prevY = tileY;
+      tileX += dir.dx;
+      tileY += dir.dy;
+      visited.add(`${tileX},${tileY}`);
+    }
+    // Success = escaped (>2 tiles) OR broke out to wander. Failure = 20
+    // iterations of pure alternation between 2 tiles without any (0,0).
+    expect(brokeOutViaWander || visited.size > 2).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PHER-07 iteration-count regression guard
 // ---------------------------------------------------------------------------
 

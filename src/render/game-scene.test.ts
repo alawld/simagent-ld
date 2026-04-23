@@ -22,6 +22,7 @@ import {
   createViewState,
   resetViewState,
   toggleView,
+  UNDERGROUND_INITIAL_CAMERA_Y,
 } from './camera.js';
 import {
   resetSurfaceInputState,
@@ -41,7 +42,7 @@ import {
   contextMenuState,
   hideContextMenu,
 } from './context-menu-state.js';
-import { UNDERGROUND_GRID_HEIGHT, PLAYER_START_X, PLAYER_START_Y } from '../sim/constants.js';
+import { PLAYER_START_X, PLAYER_START_Y } from '../sim/constants.js';
 import type { WorldState } from '../sim/types.js';
 import type { ColonyId } from '../sim/colony/colony-store.js';
 import type { SimCommand } from '../sim/commands.js';
@@ -337,7 +338,7 @@ describe('session reset orchestration (bootFresh / bootFromSave precondition)', 
     expect(s.viewState.surfaceCamera.x).toBe(PLAYER_START_X);
     expect(s.viewState.surfaceCamera.y).toBe(PLAYER_START_Y);
     expect(s.viewState.undergroundCamera.x).toBe(PLAYER_START_X);
-    expect(s.viewState.undergroundCamera.y).toBe(UNDERGROUND_GRID_HEIGHT / 2);
+    expect(s.viewState.undergroundCamera.y).toBe(UNDERGROUND_INITIAL_CAMERA_Y);
     expect(s.viewState.undergroundVisited).toBe(false);
     expect(s.surfaceInputState.pendingEntranceTileX).toBeNull();
     expect(s.surfaceInputState.pendingEntranceTileY).toBeNull();

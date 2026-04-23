@@ -153,9 +153,19 @@ export function handleUndergroundLeftClick(
 /**
  * Handles pointer-move-while-down (drag) on the underground view.
  *
- * Emits MarkDigTileCommand only when the pointer enters a NEW tile
- * (debounce: compare against lastMarkedTileX/Y). Ignores tiles that are
- * already Marked or BeingDug.
+ * Emits MarkDigTileCommand for every tile along a 4-connected (supercover)
+ * integer line from (lastMarkedTileX, lastMarkedTileY) to the current tile.
+ * Any Bresenham step that would advance both axes at once is split into two
+ * emissions — a horizontal bridge tile followed by the vertical step — so
+ * successive emitted tiles are always Manhattan-adjacent (|Δx|+|Δy| === 1).
+ * Underground movement and dig-task connectivity are 4-connected, so an
+ * 8-connected (corner-touching) path would leave broken tunnels. The
+ * starting tile is skipped (the prior click/drag emission already marked it).
+ *
+ * Non-markable path tiles (already Marked or BeingDug, out of bounds) are
+ * skipped silently; the stroke continues past them. After processing,
+ * lastMarkedTileX/Y tracks the final tile of the stroke so subsequent drags
+ * interpolate from there.
  *
  * Flips isDragging to false and returns if the active view has changed
  * since drag started (prevents ghost tile marks on view-toggle mid-drag).
@@ -175,23 +185,108 @@ export function handleUndergroundDrag(
   // through the pan handler exclusively.
   if (panInputState.spaceHeld || panInputState.isPanning) { state.isDragging = false; return; }
   const { tileX, tileY } = screenToTile(screenX, screenY, viewState.undergroundCamera);
-  // Debounce: emit only when entering a new tile.
+  // Debounce: same tile as last emission → no work.
   if (tileX === state.lastMarkedTileX && tileY === state.lastMarkedTileY) return;
   const grid = world.undergroundGrids[PLAYER_COLONY_ID];
   if (!grid) return;
-  if (tileX < 0 || tileY < 0 || tileX >= grid.width || tileY >= grid.height) return;
-  const tileState = ugGet(grid, tileX, tileY);
-  if (tileState !== UndergroundTileState.Solid && tileState !== UndergroundTileState.Open) return;
-  const cmd: MarkDigTileCommand = {
-    type: 'MarkDigTile',
-    colonyId: PLAYER_COLONY_ID,
-    tileX,
-    tileY,
-    issuedAtTick: world.tick,
+
+  // Bresenham integer line from (lastMarkedTileX/Y) to (tileX, tileY).
+  // Skip the starting tile (already handled by the prior click/drag emission).
+  // If lastMarked is the sentinel (-1,-1), fall back to single-tile emission.
+  const x0 = state.lastMarkedTileX;
+  const y0 = state.lastMarkedTileY;
+  const x1 = tileX;
+  const y1 = tileY;
+
+  let finalX = x0;
+  let finalY = y0;
+
+  if (x0 === -1 && y0 === -1) {
+    if (x1 < 0 || y1 < 0 || x1 >= grid.width || y1 >= grid.height) return;
+    const tileStateSingle = ugGet(grid, x1, y1);
+    if (tileStateSingle === UndergroundTileState.Solid || tileStateSingle === UndergroundTileState.Open) {
+      const cmd: MarkDigTileCommand = {
+        type: 'MarkDigTile',
+        colonyId: PLAYER_COLONY_ID,
+        tileX: x1,
+        tileY: y1,
+        issuedAtTick: world.tick,
+      };
+      world.commandQueue.push(cmd);
+    }
+    state.lastMarkedTileX = x1;
+    state.lastMarkedTileY = y1;
+    return;
+  }
+
+  const dx = x1 > x0 ? x1 - x0 : x0 - x1;
+  const dy = y1 > y0 ? y1 - y0 : y0 - y1;
+  const sx = x0 < x1 ? 1 : -1;
+  const sy = y0 < y1 ? 1 : -1;
+  let err = dx - dy;
+  let cx = x0;
+  let cy = y0;
+
+  // Emit one tile — advances finalX/Y (always, even for out-of-bounds or
+  // non-markable tiles — matches the stroke-cursor semantics the drag tests
+  // exercise). Pushes a MarkDigTileCommand only when the tile is Solid/Open
+  // and in bounds; returns silently otherwise so the stroke continues.
+  const emitTile = (tx: number, ty: number): void => {
+    finalX = tx;
+    finalY = ty;
+    if (tx < 0 || ty < 0 || tx >= grid.width || ty >= grid.height) return;
+    const ts = ugGet(grid, tx, ty);
+    if (ts !== UndergroundTileState.Solid && ts !== UndergroundTileState.Open) return;
+    const cmd: MarkDigTileCommand = {
+      type: 'MarkDigTile',
+      colonyId: PLAYER_COLONY_ID,
+      tileX: tx,
+      tileY: ty,
+      issuedAtTick: world.tick,
+    };
+    world.commandQueue.push(cmd);
   };
-  world.commandQueue.push(cmd);
-  state.lastMarkedTileX = tileX;
-  state.lastMarkedTileY = tileY;
+
+  // Supercover / 4-connected Bresenham. Each iteration inspects the classic
+  // Bresenham "advance X" and "advance Y" flags. When BOTH fire on the same
+  // step we deterministically insert an orthogonal bridge tile before the
+  // diagonal completes: horizontal step first (emit the (cx+sx, cy) bridge),
+  // then the vertical step (emit (cx+sx, cy+sy)). This keeps successive
+  // emissions Manhattan-adjacent, which is what the 4-connected underground
+  // grid requires for a continuous tunnel. When only one axis advances the
+  // behavior is identical to plain Bresenham.
+  while (cx !== x1 || cy !== y1) {
+    const e2 = err * 2;
+    const advanceX = e2 > -dy;
+    const advanceY = e2 < dx;
+    if (advanceX && advanceY) {
+      err -= dy;
+      cx += sx;
+      emitTile(cx, cy); // orthogonal bridge tile
+      err += dx;
+      cy += sy;
+      emitTile(cx, cy); // diagonal destination
+    } else if (advanceX) {
+      err -= dy;
+      cx += sx;
+      emitTile(cx, cy);
+    } else if (advanceY) {
+      err += dx;
+      cy += sy;
+      emitTile(cx, cy);
+    } else {
+      // Degenerate state (both axes already at target) — break defensively
+      // so a malformed input can never spin. In practice the loop guard
+      // (cx !== x1 || cy !== y1) prevents entry when both are at target.
+      break;
+    }
+  }
+  // Update debounce cursor to the last tile we actually visited (may be
+  // outside bounds only if the entire stroke was clipped; in that case
+  // finalX/Y stay at the start, which is fine — the next drag call will
+  // re-run the debounce check).
+  state.lastMarkedTileX = finalX;
+  state.lastMarkedTileY = finalY;
 }
 
 // ---------------------------------------------------------------------------

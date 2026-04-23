@@ -1,10 +1,13 @@
 // draw-underground.ts — Phase 8 underground cross-section drawing module.
 //
-// Pure functions: take a GfxLike + WorldState snapshots, issue Graphics API calls.
-// Renders ONLY the player colony's underground grid (PRD §7b — enemy grids are not drawn).
+// Pure functions: take a GfxLike + AntSpriteLayer + WorldState snapshots,
+// issue Graphics API calls and AntSpriteLayer.drawAnt calls. Renders ONLY
+// the player colony's underground grid (PRD §7b — enemy grids are not drawn).
 //
-// Uses ONLY Graphics primitives: fillRect, fillCircle, strokeCircle, fillTriangle,
-// lineStyle, fillStyle — NO Image, NO Sprite, NO texture loading (HUD-05).
+// Non-ant primitives use ONLY Graphics: fillRect, fillCircle, strokeCircle,
+// fillTriangle, lineStyle, fillStyle. Ants go through the AntSpriteLayer —
+// GameScene plugs in a Phaser-backed sprite pool; tests plug in a recording
+// mock. draw-underground.ts itself remains Phaser-free.
 //
 // Draw order: drawUnderground calls drawUndergroundTerrain then drawUndergroundEntities.
 // Pheromone overlay is called externally by GameScene between terrain and entities.
@@ -12,13 +15,15 @@
 export type { GfxLike } from './draw-surface.js';
 
 import type { GfxLike } from './draw-surface.js';
+import type { AntSpriteLayer } from './ant-sprite-layer.js';
 import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import { isAlive } from '../sim/ant/ant-store.js';
 import { FP_SHIFT, FP_ONE } from '../sim/fixed.js';
-import { PLAYER_COLONY_ID } from '../sim/constants.js';
+import { PLAYER_COLONY_ID, FOOD_CHAMBER_CAPACITY } from '../sim/constants.js';
 import { ChamberType } from '../sim/enums.js';
 import { CHAMBER_DIMENSIONS } from '../sim/colony/chamber.js';
 import type { WorldState } from '../sim/types.js';
+import type { ColonyRecord } from '../sim/colony/colony-store.js';
 import {
   TILE_SIZE_PX,
   COLOR_UNDERGROUND_SOLID,
@@ -29,10 +34,9 @@ import {
   COLOR_CHAMBER_QUEEN,
   COLOR_CHAMBER_NURSERY,
   COLOR_CHAMBER_FOOD_STORAGE,
+  COLOR_CHAMBER_FOOD_STORAGE_FILL,
   COLOR_PLAYER_COLONY,
   COLOR_QUEEN_OUTLINE,
-  COLOR_ANT_EGG,
-  COLOR_ANT_LARVAE,
 } from './sprites.js';
 import type { CameraState } from './camera.js';
 
@@ -45,6 +49,40 @@ const CHAMBER_COLORS: Record<number, number> = {
   [ChamberType.Nursery]:     COLOR_CHAMBER_NURSERY,
   [ChamberType.FoodStorage]: COLOR_CHAMBER_FOOD_STORAGE,
 };
+
+// ---------------------------------------------------------------------------
+// projectFoodStorageFill — responsive per-chamber fill (09 render polish)
+//
+// colony.foodStored is the authoritative pooled total (PRD §2 reconcile
+// contract). ChamberRecord.foodStored is *derived* state refreshed only on
+// tickReconcile (every RECONCILE_INTERVAL_TICKS), so reading it for the
+// per-chamber visual lags real deposits by up to one reconcile interval.
+//
+// This projection mirrors tickReconcile's distribution logic exactly: walk
+// completed FoodStorage chambers in colony.chambers order and hand each one
+// up to FOOD_CHAMBER_CAPACITY units from the pool. Pure — never mutates
+// colony, chamber, or any sim state. Render-only view.
+// ---------------------------------------------------------------------------
+
+/**
+ * Projected fill (0..FOOD_CHAMBER_CAPACITY) for the named FoodStorage chamber,
+ * derived live from colony.foodStored rather than the lagging
+ * ChamberRecord.foodStored field. Returns 0 if chamberId isn't a FoodStorage
+ * chamber in this colony.
+ */
+export function projectFoodStorageFill(colony: ColonyRecord, chamberId: number): number {
+  let distributed = 0;
+  for (const ch of colony.chambers) {
+    if (ch.chamberType !== ChamberType.FoodStorage) continue;
+    const available = colony.foodStored - distributed;
+    const fill = available <= 0
+      ? 0
+      : available < FOOD_CHAMBER_CAPACITY ? available : FOOD_CHAMBER_CAPACITY;
+    if (ch.chamberId === chamberId) return fill;
+    distributed += fill;
+  }
+  return 0;
+}
 
 // ---------------------------------------------------------------------------
 // drawUndergroundTerrain
@@ -140,6 +178,7 @@ export function drawUndergroundTerrain(gfx: GfxLike, world: WorldState, cam: Cam
  */
 export function drawUndergroundEntities(
   gfx: GfxLike,
+  sprites: AntSpriteLayer,
   prev: WorldState,
   curr: WorldState,
   alpha: number,
@@ -177,14 +216,57 @@ export function drawUndergroundEntities(
       gfx.fillRect(screenX,         screenY,         2, h);     // left
       gfx.fillRect(screenX + w - 2, screenY,         2, h);     // right
     }
+    // FoodStorage fill visualization — per-tile amber food-cache sprites
+    // stacked from the chamber floor upward. Fill count is driven by the
+    // *projected* per-chamber share of colony.foodStored (NOT the lagging
+    // ChamberRecord.foodStored), so deposits show the instant the forager
+    // returns instead of snapping into place at the next reconcile tick.
+    //
+    // Each tile in the chamber footprint can hold one food-cache SVG; the
+    // ratio `projected / FOOD_CHAMBER_CAPACITY` maps to the number of filled
+    // tiles, bottom-row first. Tiles are sprite-layer draws (drawStatic)
+    // rather than Graphics primitives — draw-underground.ts stays Phaser-free
+    // and GameScene's AntSpritePool handles the actual image objects.
+    if (chamber.chamberType === ChamberType.FoodStorage) {
+      const projected = projectFoodStorageFill(colony, chamber.chamberId);
+      if (projected > 0) {
+        const totalTiles = dims.width * dims.height;
+        const frac = Math.min(1, projected / FOOD_CHAMBER_CAPACITY);
+        const filledTiles = Math.min(totalTiles, Math.max(1, Math.round(frac * totalTiles)));
+        // Fill bottom-row first so the pile appears to stack upward. Walk
+        // rows from the chamber floor (bottom) toward the ceiling; within
+        // each row, walk left→right. Stop once `filledTiles` are placed.
+        let placed = 0;
+        for (let row = dims.height - 1; row >= 0 && placed < filledTiles; row--) {
+          for (let col = 0; col < dims.width && placed < filledTiles; col++) {
+            const cx = screenX + col * TILE_SIZE_PX + TILE_SIZE_PX / 2;
+            const cy = screenY + row * TILE_SIZE_PX + TILE_SIZE_PX / 2;
+            sprites.drawStatic({
+              kind: 'food-cache',
+              x: cx,
+              y: cy,
+              tint: COLOR_CHAMBER_FOOD_STORAGE_FILL,
+            });
+            placed++;
+          }
+        }
+      }
+    }
   }
 
   // --- Underground ants (zone === 1, player colony only per PRD §7b) ---
+  // Wrong-plane flicker guard (09 render polish): mirror draw-surface. When
+  // prev.zone !== curr.zone (queen descending/ascending through an entrance)
+  // or the slot wasn't alive in prev (freshly-spawned ant whose prev.posX/Y
+  // is a stale default), interpolating prev→curr briefly renders the ant on
+  // the wrong plane or at the origin. Snap to curr in those cases.
   const maxId = curr.ants.alive.length;
   for (let id = 0; id < maxId; id++) {
     if (!isAlive(curr.ants, id)) continue;
     if (curr.ants.zone[id] !== 1) continue; // underground only
     if (curr.ants.colonyId[id] !== PLAYER_COLONY_ID) continue; // no enemy leak
+
+    const useInterp = isAlive(prev.ants, id) && prev.ants.zone[id] === curr.ants.zone[id];
 
     // Interpolate: posX = surface X, posY = depth (Pitfall 6). Multiply BEFORE
     // dividing so sub-tile precision survives — truncating with `>> FP_SHIFT`
@@ -195,49 +277,66 @@ export function drawUndergroundEntities(
     const prevPxY = (prev.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
     const currPxY = (curr.ants.posY[id]! * TILE_SIZE_PX) / FP_ONE;
 
-    const screenX = prevPxX + (currPxX - prevPxX) * alpha - left * TILE_SIZE_PX;
-    const screenY = prevPxY + (currPxY - prevPxY) * alpha - top  * TILE_SIZE_PX;
+    const baseX = useInterp ? prevPxX + (currPxX - prevPxX) * alpha : currPxX;
+    const baseY = useInterp ? prevPxY + (currPxY - prevPxY) * alpha : currPxY;
+    const screenX = baseX - left * TILE_SIZE_PX;
+    const screenY = baseY - top  * TILE_SIZE_PX;
 
     // Trivial viewport cull
     if (screenX < -TILE_SIZE_PX || screenX > canvasW || screenY < -TILE_SIZE_PX || screenY > canvasH) continue;
 
+    // Facing: rotate the SVG (head on -x natively) toward the interpolated
+    // motion vector. Stationary ants (dx=dy=0) hold a stable default pose via
+    // rotation=0 rather than snapping to an arbitrary direction. When we
+    // skipped interpolation (zone flip / spawn frame), the prev→curr delta
+    // doesn't represent motion, so use rotation=0 as well. See
+    // AntSpriteDrawOptions.rotation for the math.
+    const dx = currPxX - prevPxX;
+    const dy = currPxY - prevPxY;
+    const rotation = (!useInterp || Math.abs(dx) + Math.abs(dy) < 0.01) ? 0 : Math.atan2(-dy, -dx);
+
     const isQueen = id === colony.queenEntityId;
-
-    if (isQueen) {
-      // Phase 8.5 readability: larger body + thicker gold ring so the queen
-      // is immediately distinguishable from a worker cluster.
-      gfx.fillStyle(COLOR_PLAYER_COLONY, 1);
-      gfx.fillRect(screenX - 6, screenY - 6, 12, 12);
-      gfx.lineStyle(2, COLOR_QUEEN_OUTLINE, 1);
-      gfx.strokeCircle(screenX, screenY, 9);
-    } else {
-      gfx.fillStyle(COLOR_PLAYER_COLONY, 1);
-      gfx.fillRect(screenX - 3, screenY - 3, 6, 6);
-    }
+    sprites.drawAnt({
+      kind: isQueen ? 'queen' : 'worker',
+      x: screenX,
+      y: screenY,
+      tint: COLOR_PLAYER_COLONY,
+      rotation,
+    });
   }
 
-  // Eggs (entity IDs in colony.eggs, positions read from world.ants)
-  for (const eggId of colony.eggs) {
-    if (!isAlive(curr.ants, eggId)) continue;
-    const tileX = curr.ants.posX[eggId]! >> FP_SHIFT;
-    const tileY = curr.ants.posY[eggId]! >> FP_SHIFT;
+  // Eggs + larvae (nursery brood). Route through the sprite layer so both
+  // stages use the repo-owned SVGs in code/public/assets/sprites/. Drawn
+  // from the brood entity positions exactly — the sim's nurses have already
+  // moved them into the nursery footprint, so rendering at the entity's
+  // current tile is what places them inside the chamber visually.
+  drawBrood(sprites, curr, colony.eggs, 'egg', left, top, canvasW, canvasH);
+  drawBrood(sprites, curr, colony.larvae, 'larva', left, top, canvasW, canvasH);
+}
+
+/** Shared loop for rendering a list of brood entity IDs as static sprites. */
+function drawBrood(
+  sprites: AntSpriteLayer,
+  curr: WorldState,
+  entityIds: readonly number[],
+  kind: 'egg' | 'larva',
+  left: number,
+  top: number,
+  canvasW: number,
+  canvasH: number,
+): void {
+  for (const id of entityIds) {
+    if (!isAlive(curr.ants, id)) continue;
+    const tileX = curr.ants.posX[id]! >> FP_SHIFT;
+    const tileY = curr.ants.posY[id]! >> FP_SHIFT;
     const screenX = (tileX - left) * TILE_SIZE_PX;
     const screenY = (tileY - top)  * TILE_SIZE_PX;
     if (screenX < -TILE_SIZE_PX || screenX > canvasW || screenY < -TILE_SIZE_PX || screenY > canvasH) continue;
-    gfx.fillStyle(COLOR_ANT_EGG, 1);
-    gfx.fillCircle(screenX + TILE_SIZE_PX / 2, screenY + TILE_SIZE_PX / 2, 3);
-  }
-
-  // Larvae (entity IDs in colony.larvae, positions read from world.ants)
-  for (const larvaId of colony.larvae) {
-    if (!isAlive(curr.ants, larvaId)) continue;
-    const tileX = curr.ants.posX[larvaId]! >> FP_SHIFT;
-    const tileY = curr.ants.posY[larvaId]! >> FP_SHIFT;
-    const screenX = (tileX - left) * TILE_SIZE_PX;
-    const screenY = (tileY - top)  * TILE_SIZE_PX;
-    if (screenX < -TILE_SIZE_PX || screenX > canvasW || screenY < -TILE_SIZE_PX || screenY > canvasH) continue;
-    gfx.fillStyle(COLOR_ANT_LARVAE, 1);
-    gfx.fillCircle(screenX + TILE_SIZE_PX / 2, screenY + TILE_SIZE_PX / 2, 4);
+    sprites.drawStatic({
+      kind,
+      x: screenX + TILE_SIZE_PX / 2,
+      y: screenY + TILE_SIZE_PX / 2,
+    });
   }
 }
 
@@ -253,11 +352,12 @@ export function drawUndergroundEntities(
  */
 export function drawUnderground(
   gfx: GfxLike,
+  sprites: AntSpriteLayer,
   prev: WorldState,
   curr: WorldState,
   alpha: number,
   cam: CameraState,
 ): void {
   drawUndergroundTerrain(gfx, curr, cam);
-  drawUndergroundEntities(gfx, prev, curr, alpha, cam);
+  drawUndergroundEntities(gfx, sprites, prev, curr, alpha, cam);
 }

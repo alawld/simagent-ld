@@ -340,6 +340,92 @@ describe('handleSurfaceLeftClick — ant-activity popup dismissal must not fall 
     }
   });
 
+  // World-input-first dispatch order: UIScene hasn't called
+  // requestHideAntActivityPanel() yet, so pendingHide is still false while
+  // the surface-input pointerdown runs. The click must still be consumed.
+  // This is the race `isPointerOverHUD` now closes by masking on `visible`
+  // alone (not just pendingHide).
+  it('does NOT push MarkFoodPile when panel is visible and pendingHide=false (world-input-first race)', async () => {
+    const { showAntActivityPanel, hideAntActivityPanel, antActivityPanelState } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({
+      tick: 5,
+      foodPiles: [{ foodPileId: 7, tileX: 10, tileY: 20 }],
+    });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+
+    showAntActivityPanel();
+    try {
+      expect(antActivityPanelState.visible).toBe(true);
+      expect(antActivityPanelState.pendingHide).toBe(false);
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('does NOT push SetRallyPoint when panel is visible and pendingHide=false (world-input-first race)', async () => {
+    const { showAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({ tick: 1, foodPiles: [] });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+
+    showAntActivityPanel();
+    try {
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('does NOT push DesignateEntrance confirmation when panel is visible and pendingHide=false (world-input-first race)', async () => {
+    const { showAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const world = makeWorld({ tick: 3 });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState(15, 30);
+    const { x, y } = tileToScreen(15, 30, 64, 64);
+
+    showAntActivityPanel();
+    try {
+      handleSurfaceLeftClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+      // Preview preserved — dismissal must not eat pending entrance state.
+      expect(state.pendingEntranceTileX).toBe(15);
+      expect(state.pendingEntranceTileY).toBe(30);
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
+  it('right-click ALSO no-ops when panel is visible and pendingHide=false (entrance preview guard)', async () => {
+    // A right-click that would normally stage an entrance preview must be
+    // suppressed while the panel is up, regardless of listener order.
+    const { showAntActivityPanel, hideAntActivityPanel } =
+      await import('../render/ant-activity-panel-state.js');
+    const { handleSurfaceRightClick } = await import('./surface-input.js');
+    const world = makeWorld({ tick: 4, foodPiles: [] });
+    const vs = makeViewState('surface', 64, 64);
+    const state = makeState();
+    const { x, y } = tileToScreen(10, 20, 64, 64);
+
+    showAntActivityPanel();
+    try {
+      handleSurfaceRightClick(world, vs, x, y, state);
+      expect(world.commandQueue).toHaveLength(0);
+      expect(state.pendingEntranceTileX).toBeNull();
+      expect(state.pendingEntranceTileY).toBeNull();
+    } finally {
+      hideAntActivityPanel();
+    }
+  });
+
   it('processes clicks normally after pendingHide is cleared (state cleanup)', async () => {
     const { showAntActivityPanel, hideAntActivityPanel } =
       await import('../render/ant-activity-panel-state.js');

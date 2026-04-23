@@ -17,10 +17,12 @@
 // Worker bucket mapping:
 //   - Foraging.SearchingFood          -> foraging.searching
 //   - Foraging.CarryingFood           -> foraging.carrying
-//   - Foraging.ReturningToNest        -> foraging.carrying
-//       (folded with CarryingFood because both read as "got food, going home";
-//        splitting them would expose a transitional sim micro-state the
-//        player has no control over)
+//   - Foraging.ReturningToNest        -> foraging.returning
+//       (the 09 excursion-foraging memo made ReturningToNest a real, visible
+//        sim state — ants that ran past their search leash without finding
+//        food now explicitly walk home to reset. Surfacing this lets the
+//        player see "my foragers are empty-handed on the way back" vs.
+//        "my foragers are delivering", which are meaningfully different.)
 //   - Digging.MovingToTile            -> digging.movingToSite
 //   - Digging.Excavating              -> digging.excavating
 //   - Fighting (any sub)              -> fighting
@@ -37,6 +39,7 @@ import { HUD } from './sprites.js';
 
 export interface ForagingBreakdown {
   searching: number;
+  returning: number;
   carrying:  number;
   total:     number;
 }
@@ -65,6 +68,7 @@ export function computeAntActivity(world: WorldState, colony: ColonyRecord): Ant
   const queenAlive = isAlive(ants, colony.queenEntityId);
 
   let searching    = 0;
+  let returning    = 0;
   let carrying     = 0;
   let movingToSite = 0;
   let excavating   = 0;
@@ -82,8 +86,10 @@ export function computeAntActivity(world: WorldState, colony: ColonyRecord): Ant
     const sub  = ants.subTask[id]!;
 
     if (task === AntTask.Foraging) {
-      if (sub === ForagingSubState.CarryingFood || sub === ForagingSubState.ReturningToNest) {
+      if (sub === ForagingSubState.CarryingFood) {
         carrying += 1;
+      } else if (sub === ForagingSubState.ReturningToNest) {
+        returning += 1;
       } else {
         searching += 1;
       }
@@ -107,7 +113,12 @@ export function computeAntActivity(world: WorldState, colony: ColonyRecord): Ant
     queenAlive,
     eggs:         colony.eggCount,
     larvae:       colony.larvaeCount,
-    foraging:     { searching, carrying, total: searching + carrying },
+    foraging:     {
+      searching,
+      returning,
+      carrying,
+      total: searching + returning + carrying,
+    },
     digging:      { movingToSite, excavating, total: movingToSite + excavating },
     fighting,
     nursing,
@@ -136,6 +147,7 @@ export function formatAntActivityLines(a: AntActivity): string[] {
     `Worker activity:`,
     `  Foraging: ${a.foraging.total}`,
     `    searching: ${a.foraging.searching}`,
+    `    returning: ${a.foraging.returning}`,
     `    carrying:  ${a.foraging.carrying}`,
     `  Digging:  ${a.digging.total}`,
     `    moving:    ${a.digging.movingToSite}`,
@@ -153,7 +165,7 @@ export function formatAntActivityLines(a: AntActivity): string[] {
 /**
  * Fixed screen rect the popup renders into. Anchored just below HUD.STATS
  * (top-left), wide enough to hold the longest formatted line without clipping
- * (`  carrying:  NN` at 10px monospace), tall enough for the 18 lines in
+ * (`  carrying:  NN` at 10px monospace), tall enough for the 19 lines in
  * `formatAntActivityLines` plus padding.
  *
  * Exported so `isPointerOverHUD` (camera-input) can include this rect when
@@ -164,7 +176,7 @@ export const ANT_ACTIVITY_PANEL = {
   x: HUD.STATS.x,
   y: HUD.STATS.y + HUD.STATS.h + 4,
   w: 220,
-  h: 250,
+  h: 264,
 } as const;
 
 export const ANT_ACTIVITY_PANEL_COLORS = {

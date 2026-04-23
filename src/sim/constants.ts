@@ -68,6 +68,22 @@ export const FOOD_PICKUP_AMOUNT = 512; // 2 × FP_ONE
 /** PRD §9c — Maximum food units (fp) in the colony food chamber. 5120 = 20 × FP_ONE. */
 export const FOOD_CHAMBER_CAPACITY = 5120; // 20 × FP_ONE
 
+/**
+ * 09 backlog memo — BASE colony storage capacity (fp) before any FoodStorage
+ * chamber is built. Small enough that a player must build storage to grow
+ * beyond the early colony: sized to roughly cover STARTING_FOOD plus a little
+ * foraging headroom. Effective capacity = BASE + N × FOOD_CHAMBER_CAPACITY
+ * where N is the count of COMPLETED FoodStorage chambers (pending chambers do
+ * not contribute). Tuning intent:
+ *   - BASE alone supports queen + a couple larvae during the initial dig.
+ *   - 1 FoodStorage chamber supports early growth but not indefinitely.
+ *   - 2 FoodStorage chambers are needed to support ~30 ants comfortably.
+ * 2048 fp = 8 × FP_ONE. With QUEEN_FOOD_PER_TICK=2, LARVA_FOOD_PER_TICK=1 this
+ * is roughly 1024 tick-seconds of buffer for the queen alone — enough to feel
+ * survivable without being unlimited.
+ */
+export const BASE_FOOD_STORAGE_CAPACITY = 2048; // 8 × FP_ONE
+
 /** PRD §9c — Base movement speed of a worker in fixed-point units per tick. 128 = 0.5 × FP_ONE. */
 export const WORKER_BASE_SPEED = 128; // 0.5 × FP_ONE
 
@@ -242,9 +258,79 @@ export const CHAMBER_FOOD_HEIGHT = 3;
  * entrance exceeds its wave's radius, it is demoted to Idle (step 10a re-entry)
  * and its wave index increments (capped at SEARCH_LEASH_MAX_WAVE). On a successful
  * food pickup the wave resets to 0. Values per the memo's acceptable design:
- * base 25 → 30 → 35 → 40. Kept per-ant, not colony-memory.
+ * base 25 → 40 → 55 → 70. Kept per-ant, not colony-memory.
+ *
+ * 09 excursion-foraging memo tuning (2026-04-20): the initial baseline radii
+ * [25, 30, 35, 40] yielded 93% queen survival across 200 seeds × 2000 ticks —
+ * 2pp below the ≥95% acceptance target. Widening the late-wave radii (base
+ * wave 0 unchanged at 25 — same first-leash behaviour — while later waves
+ * reach further) lets foragers who exhausted nearby search cones reach more
+ * distant food piles before starvation. Base wave preserved because the
+ * 09 digger-reassignment memo balances digger↔forager reassignment around it.
  */
-export const SEARCH_LEASH_RADII: readonly number[] = [25, 30, 35, 40];
+export const SEARCH_LEASH_RADII: readonly number[] = [25, 40, 55, 70];
 
 /** Highest valid index into SEARCH_LEASH_RADII. */
 export const SEARCH_LEASH_MAX_WAVE = SEARCH_LEASH_RADII.length - 1;
+
+// ---------------------------------------------------------------------------
+// Phase 9 excursion foraging memo — correlated outward walk constants
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimum ticks a SearchingFood forager commits to its current heading before
+ * a turn check is rolled. With WORKER_BASE_SPEED = 128 (0.5 tile/tick), this
+ * is roughly 4 tiles of motion — enough to feel like a coherent outbound arc
+ * while still varying over a 25-tile excursion leash.
+ */
+export const EXCURSION_HEADING_MIN_TICKS = 8;
+
+/**
+ * Extra ticks (plus the minimum above) the forager may hold the same heading
+ * before the next turn check. The full run length is
+ * EXCURSION_HEADING_MIN_TICKS + rng.nextInt(EXCURSION_HEADING_JITTER_TICKS).
+ */
+export const EXCURSION_HEADING_JITTER_TICKS = 8;
+
+/**
+ * Probability (percentage) that a scheduled turn-check actually rotates the
+ * heading by 90°. The remaining probability keeps the current heading — the
+ * memo's "mostly maintain a heading, occasionally turn left or right".
+ */
+export const EXCURSION_TURN_PERCENT = 25;
+
+/**
+ * 09 excursion-foraging follow-up — subtle lateral wobble percent.
+ *
+ * At a scheduled turn-check, this is the chance that the ant emits a single
+ * perpendicular (lateral) step while KEEPING its internal heading unchanged.
+ * The next tick resumes along the committed heading, so the net effect is a
+ * small sideways jog rather than a new direction — breaking up the visibly
+ * "cardinal straight-line" feel without regressing into random walk.
+ *
+ * Non-overlapping with EXCURSION_TURN_PERCENT: at a turn-check, the turnRoll
+ * in [0, EXCURSION_TURN_PERCENT) triggers a hard 90° turn; the turnRoll in
+ * [100 - EXCURSION_WOBBLE_PERCENT, 100) triggers a one-tick wobble step.
+ * These ranges must not overlap — enforcement is in chooseExcursionDirection.
+ */
+export const EXCURSION_WOBBLE_PERCENT = 20;
+
+// ---------------------------------------------------------------------------
+// Phase 9 excursion-foraging follow-up — entrance-side pheromone suppression
+// ---------------------------------------------------------------------------
+
+/**
+ * 09 excursion-foraging follow-up — radius (Manhattan tiles) within which a
+ * food-carrying ant's own entrance prevents a food-trail deposit.
+ *
+ * Observed issue: carrying ants repeatedly passing the same few tiles near
+ * an entrance create a scalar local-peak that greedy gradient-following turns
+ * into a two-tile oscillation — an outbound searching ant sees the highest
+ * neighbor "behind" them near the nest and reverses into it. Suppressing
+ * deposits within a small radius of the entrance keeps the trail's peak out
+ * past the search-bootstrap zone, so outbound foragers aren't yanked back.
+ *
+ * Radius 3 eliminates the local peak at the entrance mouth while leaving the
+ * meaningful outbound trail (4+ tiles out, along the path toward food) intact.
+ */
+export const ENTRANCE_DEPOSIT_SUPPRESS_RADIUS = 3;

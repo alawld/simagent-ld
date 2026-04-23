@@ -26,11 +26,13 @@
 import * as Phaser from 'phaser';
 import { createScenario } from '../sim/scenario.js';
 import { copyWorldState, type WorldState } from '../sim/types.js';
-import { tick } from '../sim/tick.js';
+import { tick, resetFlowFieldCaches } from '../sim/tick.js';
 import { createGameLoop, type GameLoop, MS_PER_TICK } from '../platform/game-loop.js';
 import { hasSave, loadSave, deleteSave, tickAutosave } from '../platform/save.js';
 import { deserializeWorldState } from '../platform/save.js';
 import { runAIController } from './ai-controller.js';
+import { buildDebugSnapshot } from '../platform/debug-snapshot.js';
+import { downloadDebugSnapshot } from './debug-snapshot-download.js';
 import {
   GamePhase,
   deriveAIColonyIds,
@@ -56,6 +58,41 @@ import { GameOutcome } from '../sim/game-over.js';
 import { drawSurface, type GfxLike } from './draw-surface.js';
 import { drawUnderground } from './draw-underground.js';
 import { drawPheromoneOverlay } from './draw-pheromone.js';
+import {
+  ANT_TEXTURE_QUEEN,
+  ANT_TEXTURE_WORKER,
+  EGG_SPRITE_HEIGHT,
+  EGG_SPRITE_WIDTH,
+  EGG_TEXTURE,
+  FOOD_CACHE_SPRITE_HEIGHT,
+  FOOD_CACHE_SPRITE_WIDTH,
+  FOOD_CACHE_TEXTURE,
+  LARVA_SPRITE_HEIGHT,
+  LARVA_SPRITE_WIDTH,
+  LARVA_TEXTURE,
+  QUEEN_SPRITE_HEIGHT,
+  QUEEN_SPRITE_WIDTH,
+  WORKER_SPRITE_HEIGHT,
+  WORKER_SPRITE_WIDTH,
+} from './ant-sprite-layer.js';
+import { AntSpritePool } from './ant-sprite-pool.js';
+
+// Served from code/public/ as real files. Vite's `new URL(..., import.meta.url)`
+// pattern inlines SVGs under ~4KB as `data:image/svg+xml;base64,...` URIs in
+// dev mode. Phaser's load.svg assumes a file URL and routes through its XHR
+// loader — when handed an inlined data URI it feeds the full `data:...`
+// string to atob(), which throws on the URL-safe encoded prefix and black-
+// screens preload. Keep the SVGs in code/public/assets/sprites/ so they are
+// served as real HTTP resources; stable paths survive `npm run build`.
+const WORKER_ANT_SVG_URL = '/assets/sprites/worker-ant.svg';
+const QUEEN_ANT_SVG_URL  = '/assets/sprites/queen-ant.svg';
+// 09 render-polish follow-up: repo-owned SVGs for brood + food storage. Served
+// from /assets/sprites/ (stable paths — the `new URL(..., import.meta.url)`
+// pattern inlines <4 KB SVGs as base64 data URIs in dev, which crashed
+// Phaser's load.svg atob() decode; see worker/queen notes above).
+const EGG_SVG_URL        = '/assets/sprites/egg.svg';
+const LARVA_SVG_URL      = '/assets/sprites/larva.svg';
+const FOOD_CACHE_SVG_URL = '/assets/sprites/food-cache.svg';
 import {
   processCameraInput,
   registerDragPan,
@@ -93,6 +130,7 @@ export class GameScene extends Phaser.Scene {
   private viewState!: ViewState;
   private gameLoop!: GameLoop;
   private gfx!: Phaser.GameObjects.Graphics;
+  private antSprites!: AntSpritePool;
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
   private tabKey!: Phaser.Input.Keyboard.Key;
@@ -112,9 +150,31 @@ export class GameScene extends Phaser.Scene {
 
   constructor() { super({ key: 'GameScene' }); }
 
+  preload() {
+    // Load ant SVG sprites. Phaser rasterizes at the given width/height; the
+    // texture is then reused for every pooled ant image. Tinting in the pool
+    // multiplies the white SVG fill by the colony color.
+    this.load.svg(ANT_TEXTURE_WORKER, WORKER_ANT_SVG_URL, {
+      width: WORKER_SPRITE_WIDTH, height: WORKER_SPRITE_HEIGHT,
+    });
+    this.load.svg(ANT_TEXTURE_QUEEN, QUEEN_ANT_SVG_URL, {
+      width: QUEEN_SPRITE_WIDTH, height: QUEEN_SPRITE_HEIGHT,
+    });
+    this.load.svg(EGG_TEXTURE, EGG_SVG_URL, {
+      width: EGG_SPRITE_WIDTH, height: EGG_SPRITE_HEIGHT,
+    });
+    this.load.svg(LARVA_TEXTURE, LARVA_SVG_URL, {
+      width: LARVA_SPRITE_WIDTH, height: LARVA_SPRITE_HEIGHT,
+    });
+    this.load.svg(FOOD_CACHE_TEXTURE, FOOD_CACHE_SVG_URL, {
+      width: FOOD_CACHE_SPRITE_WIDTH, height: FOOD_CACHE_SPRITE_HEIGHT,
+    });
+  }
+
   create() {
     this.viewState = createViewState(PLAYER_START_X, PLAYER_START_Y);
     this.gfx = this.add.graphics();
+    this.antSprites = new AntSpritePool(this);
 
     // Input registration — keyboard is GameScene-only (Pitfall 2).
     this.cursors = this.input.keyboard!.createCursorKeys();
@@ -141,6 +201,17 @@ export class GameScene extends Phaser.Scene {
     this.input.keyboard!.on('keydown-ONE', () => { this.speedMultiplier = 1; });
     this.input.keyboard!.on('keydown-TWO', () => { this.speedMultiplier = 2; });
     this.input.keyboard!.on('keydown-FOUR', () => { this.speedMultiplier = 4; });
+
+    // 09 excursion-foraging follow-up — F9 exports a debug snapshot JSON
+    // (seed, tick, inputLog, world snapshot, enriched per-ant trace) so QA
+    // can attach the full repro state to a bug report. No sim mutation, no
+    // wall-clock in src/sim — the payload builder lives in src/platform and
+    // the DOM download sits in src/render.
+    this.input.keyboard!.on('keydown-F9', () => {
+      if (this.world === undefined) return; // pre-boot guard
+      const snap = buildDebugSnapshot(this.world, this.currentSeed, this.inputLog);
+      downloadDebugSnapshot(snap);
+    });
 
     // UIScene + input handlers take a LAZY world accessor — `this.world` is
     // assigned by bootFresh/bootFromSave below, and may be replaced again on
@@ -212,6 +283,12 @@ export class GameScene extends Phaser.Scene {
     this.lastActiveView = null;
     this.currentOutcome = GameOutcome.None;
     this.speedMultiplier = 1;
+    // tick.ts caches entrance/dig/chamber flow-fields at module scope keyed by
+    // colonyId. bootFresh/bootFromSave replace `world` but those singletons
+    // survive, so a new session with the same colony IDs would otherwise route
+    // ants against the previous world's topology. Clear them here, before the
+    // new world first ticks.
+    resetFlowFieldCaches();
   }
 
   private bootFresh(): void {
@@ -334,6 +411,7 @@ export class GameScene extends Phaser.Scene {
     const alpha = this.gameLoop.accumulatorMs / MS_PER_TICK;
     const gfx = this.gfx as unknown as GfxLike;
     gfx.clear();
+    this.antSprites.beginFrame();
     drawPheromoneOverlay(gfx, this.world, cam, this.viewState.activeView);
     if (this.viewState.activeView === 'surface') {
       const pending =
@@ -344,10 +422,11 @@ export class GameScene extends Phaser.Scene {
               tileY: this.surfaceInputState.pendingEntranceTileY,
             }
           : null;
-      drawSurface(gfx, this.prevState, this.world, alpha, cam, pending);
+      drawSurface(gfx, this.antSprites, this.prevState, this.world, alpha, cam, pending);
     } else {
-      drawUnderground(gfx, this.prevState, this.world, alpha, cam);
+      drawUnderground(gfx, this.antSprites, this.prevState, this.world, alpha, cam);
     }
+    this.antSprites.endFrame();
 
     // Autosave — only while actively Playing
     if (this.gamePhase === GamePhase.Playing) {

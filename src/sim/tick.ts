@@ -12,6 +12,7 @@ import {
   NursingSubState,
   FightingSubState,
   PheromoneType,
+  ChamberType,
 } from './enums.js';
 import {
   PHEROMONE_DECAY_FP,
@@ -33,6 +34,7 @@ import {
   tickDeadDiggerCleanup,
   checkPendingChambers,
   checkEntranceCompletion,
+  hasCompletedChamber,
 } from './colony/colony-system.js';
 import {
   tickQueenEggProduction,
@@ -43,7 +45,9 @@ import {
   tickAntMovement,
   tickDigExecution,
   tickForagerActions,
+  tickNurseActions,
   tickSearchLeash,
+  tickExcursionBoundary,
   routeForagerPriority,
   updateFightAntTargets,
 } from './ant/ant-system.js';
@@ -54,6 +58,21 @@ import {
   createDigFlowFields,
 } from './dig-system.js';
 import type { DigFlowFields } from './dig-system.js';
+import {
+  computeEntranceFlowField,
+  ensureEntranceFlowField,
+  createEntranceFlowFields,
+} from './entrance-flow.js';
+import type { EntranceFlowFields } from './entrance-flow.js';
+import {
+  computeChamberFlowField,
+  ensureChamberFlowFields,
+  createChamberFlowFields,
+  FOOD_CHAMBER_TYPES,
+  NURSING_CHAMBER_TYPES,
+  QUEEN_CHAMBER_TYPES,
+} from './chamber-flow.js';
+import type { ChamberFlowFields } from './chamber-flow.js';
 import { ugGet, ugSet, UndergroundTileState } from './terrain.js';
 import { CHAMBER_DIMENSIONS } from './colony/chamber.js';
 import type { PendingChamber } from './colony/chamber.js';
@@ -66,6 +85,39 @@ import type { FoodPileId } from './food.js';
 // Plan 08 replaces the Phase 06 _stubDigFlowFields with this properly-populated instance.
 // ---------------------------------------------------------------------------
 const digFlowFields: DigFlowFields = createDigFlowFields();
+// Shared entrance-return flow-field cache. Seeded from open entrance
+// underground tiles; used by underground empty foragers to find a tunnel
+// path back to the surface instead of steering straight-line into dirt.
+const entranceFlowFields: EntranceFlowFields = createEntranceFlowFields();
+// Shared chamber flow-field cache. Two fields per colony: `food` (seeded from
+// FoodStorage chamber Open tiles, read by underground carrying foragers) and
+// `nursing` (seeded from Queen+Nursery chamber Open tiles, read by Nursing
+// ants). Prevents straight-line chamber steering into Solid dirt on bent
+// tunnels (see chamber-flow.ts).
+const chamberFlowFields: ChamberFlowFields = createChamberFlowFields();
+
+/**
+ * Clear every module-level flow-field cache keyed by colonyId.
+ *
+ * MUST be called between distinct sessions/worlds that may share colony IDs —
+ * bootFresh() and bootFromSave() both replace `world` but the singletons above
+ * survive across those transitions. Without this reset, a colony in the new
+ * world whose `digFlowFieldDirty` is false on the first tick would keep the
+ * previous session's entrance/chamber topology in its cache and route ants
+ * against the old tunnel layout.
+ *
+ * In-place deletion preserves the const-bound record identities held by step 9.
+ */
+export function resetFlowFieldCaches(): void {
+  for (const k in digFlowFields.fields)       delete digFlowFields.fields[k as unknown as ColonyId];
+  for (const k in digFlowFields.queues)       delete digFlowFields.queues[k as unknown as ColonyId];
+  for (const k in entranceFlowFields.fields)  delete entranceFlowFields.fields[k as unknown as ColonyId];
+  for (const k in entranceFlowFields.queues)  delete entranceFlowFields.queues[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.food)     delete chamberFlowFields.food[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.nursing)  delete chamberFlowFields.nursing[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.queen)    delete chamberFlowFields.queen[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.queues)   delete chamberFlowFields.queues[k as unknown as ColonyId];
+}
 
 // Suppress unused-import TS error for PendingChamber (used in PlaceChamber case shape)
 void (undefined as unknown as PendingChamber);
@@ -87,6 +139,7 @@ void (undefined as unknown as PendingChamber);
  *  8.  Behavior allocation (re-run per colony after lifecycle changes)
  *  9.  Recompute dig flow-fields for colonies with dirty flag (NEW in Phase 7)
  *  9b. tickSearchLeash — release over-leashed SearchingFood ants (NEW in Phase 9, 09 memo)
+ *  9c. tickExcursionBoundary — flip over-leash SearchingFood → ReturningToNest (Phase 9 09 memo)
  * 10.  Task assignment:
  *       10a. existing Phase 6 idle-reassignment
  *       10b. tickDigExecution — dig-worker state machine (Marked→BeingDug→Open) (NEW in Phase 7)
@@ -98,6 +151,7 @@ void (undefined as unknown as PendingChamber);
  * 15.  Pheromone decay
  * 16.  Movement (zone-aware, extended in Phase 7 with DigFlowFields for pure direction reads)
  * 16b. tickForagerActions — forager pickup (surface) + deposit (underground) (Phase 9 playability fix)
+ * 16c. tickNurseActions — nurse arrival→Feeding→Idle state machine (09 reproduction-gate memo: finite nursing)
  * 17.  detectAndResolveCombat (NEW in Phase 9 / CMBT-04)
  * 18.  checkQueenDeath — game-over detection (NEW in Phase 9 / CMBT-06/07)
  * 19.  rngState writeback + world.tick increment
@@ -138,7 +192,8 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         colony.targetRatio.fight  = cmd.ratio.fight;
         // CTRL-04: run allocateWorkers immediately in the same tick the command is issued.
         const brood0 = colony.eggCount + colony.larvaeCount;
-        const alloc0 = allocateWorkers(colony.workerCount, brood0, colony.targetRatio);
+        const hasNursery0 = hasCompletedChamber(colony, ChamberType.Nursery);
+        const alloc0 = allocateWorkers(colony.workerCount, brood0, colony.targetRatio, hasNursery0);
         colony.computedAllocation.nurse  = alloc0.nurse;
         colony.computedAllocation.forage = alloc0.forage;
         colony.computedAllocation.dig    = alloc0.dig;
@@ -201,6 +256,26 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         if (cmd.anchorTileY < 0 || cmd.anchorTileY + dims.height > UNDERGROUND_GRID_HEIGHT) break;
         const colony3 = world.colonies[cmd.colonyId];
         if (!colony3) break;
+        // Queen-uniqueness (09 backlog memo): reject if colony already has a
+        // Queen chamber, either completed or pending. Nursery is intentionally
+        // left multi-place-capable here; FoodStorage is multi-place by design.
+        if (cmd.chamberType === ChamberType.Queen) {
+          let hasQueen = false;
+          for (let qi = 0; qi < colony3.chambers.length; qi++) {
+            if (colony3.chambers[qi]!.chamberType === ChamberType.Queen) { hasQueen = true; break; }
+          }
+          if (!hasQueen) {
+            for (const pcKey in world.pendingChambers) {
+              if (!Object.hasOwn(world.pendingChambers, pcKey)) continue;
+              const pc = world.pendingChambers[pcKey]!;
+              if (pc.colonyId === cmd.colonyId && pc.chamberType === ChamberType.Queen) {
+                hasQueen = true;
+                break;
+              }
+            }
+          }
+          if (hasQueen) break;
+        }
         // (c) Anchor tile must be Open (tunnel-end check, UNDR-04)
         if (ugGet(underground, cmd.anchorTileX, cmd.anchorTileY) !== UndergroundTileState.Open) break;
         // (d) At least one 4-connected neighbor of the anchor must be Solid (tunnel-end check)
@@ -397,7 +472,8 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
 
     // Step 8: Behavior allocation (re-run after lifecycle; handles new matures + deaths from step 7)
     const brood8 = colony.eggCount + colony.larvaeCount;
-    const alloc8 = allocateWorkers(colony.workerCount, brood8, colony.targetRatio);
+    const hasNursery8 = hasCompletedChamber(colony, ChamberType.Nursery);
+    const alloc8 = allocateWorkers(colony.workerCount, brood8, colony.targetRatio, hasNursery8);
     colony.computedAllocation.nurse  = alloc8.nurse;
     colony.computedAllocation.forage = alloc8.forage;
     colony.computedAllocation.dig    = alloc8.dig;
@@ -415,13 +491,65 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   for (const key in world.colonies) {
     if (!Object.hasOwn(world.colonies, key)) continue;
     const colony = world.colonies[key as unknown as ColonyId]!;
-    if (!colony.digFlowFieldDirty) continue;   // typed field (Plan 03 Task 1)
     const underground = world.undergroundGrids[colony.colonyId];
     if (!underground) continue;
     const gridSize = underground.width * underground.height;
-    const out = ensureDigFlowField(digFlowFields, colony.colonyId, gridSize);
-    const queue = digFlowFields.queues[colony.colonyId]!;
-    computeDigFlowField(underground, out, queue);
+
+    // Lazy first-time compute: if the entrance/dig flow-field has never been
+    // allocated for this colony, compute it unconditionally on first access.
+    // This closes the gap where a colony is created with a pre-excavated
+    // entrance (scenario seed) but never issues a dig command — without this,
+    // the field would remain all-zeros and empty foragers would "route" north
+    // forever. The chamber flow-fields piggy-back on the same gate — they
+    // share the underlying topology, so any signal that dirties dig/entrance
+    // fields dirties them too. `firstDigCompute` also fires after a cross-
+    // session reset via resetFlowFieldCaches(), guaranteeing a fresh/loaded
+    // world never reuses another world's cached topology.
+    const firstEntranceCompute = !(colony.colonyId in entranceFlowFields.fields);
+    const firstDigCompute = !(colony.colonyId in digFlowFields.fields);
+
+    if (!colony.digFlowFieldDirty && !firstEntranceCompute && !firstDigCompute) continue;
+
+    if (colony.digFlowFieldDirty || firstDigCompute) {
+      const out = ensureDigFlowField(digFlowFields, colony.colonyId, gridSize);
+      const queue = digFlowFields.queues[colony.colonyId]!;
+      computeDigFlowField(underground, out, queue);
+    }
+
+    // Recompute entrance flow-field on the same topology-changed signal that
+    // drives dig recompute: tile state flips (Solid↔Marked↔BeingDug↔Open) and
+    // entrance designation/completion all mutate reachability through tunnels.
+    const entOut = ensureEntranceFlowField(entranceFlowFields, colony.colonyId, gridSize);
+    const entQueue = entranceFlowFields.queues[colony.colonyId]!;
+    computeEntranceFlowField(underground, colony.entrances ?? [], entOut, entQueue);
+
+    // Recompute chamber flow-fields on the same cycle. Chamber completion
+    // (which flips tile states from Marked/BeingDug to Open) is one of the
+    // signals that sets digFlowFieldDirty upstream, so this cadence is
+    // sufficient to keep the fields fresh.
+    const chamberBufs = ensureChamberFlowFields(chamberFlowFields, colony.colonyId, gridSize);
+    computeChamberFlowField(
+      underground,
+      colony.chambers,
+      FOOD_CHAMBER_TYPES,
+      chamberBufs.food,
+      chamberBufs.queue,
+    );
+    computeChamberFlowField(
+      underground,
+      colony.chambers,
+      NURSING_CHAMBER_TYPES,
+      chamberBufs.nursing,
+      chamberBufs.queue,
+    );
+    computeChamberFlowField(
+      underground,
+      colony.chambers,
+      QUEEN_CHAMBER_TYPES,
+      chamberBufs.queen,
+      chamberBufs.queue,
+    );
+
     colony.digFlowFieldDirty = false;
   }
 
@@ -432,6 +560,14 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   // step 10a so demoted ants are re-evaluated the same tick under the current
   // computedAllocation (fast triangle responsiveness).
   tickSearchLeash(world);
+
+  // Step 9c: 09 excursion-foraging memo — ReturningToNest transition.
+  // Complements step 9b: rather than rebalancing to dig/fight (9b is gated on
+  // allocation demand), 9c implements the bounded-excursion loop — any over-
+  // leash SearchingFood ant flips to ReturningToNest and routes home via
+  // tickAntMovement. On entrance arrival, wave += 1 and subTask flips back to
+  // SearchingFood so the ant resumes with a larger leash on the next excursion.
+  tickExcursionBoundary(world);
 
   // Step 10: assignWorkerTasks
   //   10a: existing Phase 6 idle-reassignment (unchanged body from Phase 6 tick.ts step 9)
@@ -580,7 +716,7 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   // Step 16: Movement (zone-aware; DigFlowFields passed for pure direction reads only).
   //          Pure movement — no dig state transitions here (those ran at step 10b).
   // ---------------------------------------------------------------------------
-  tickAntMovement(world, rng, digFlowFields);
+  tickAntMovement(world, rng, digFlowFields, entranceFlowFields, chamberFlowFields);
 
   // ---------------------------------------------------------------------------
   // Step 16b: Forager arrival actions — pickup (surface) + deposit (underground).
@@ -589,6 +725,15 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
   //           Runs after movement so ants-that-just-arrived this tick act on arrival.
   // ---------------------------------------------------------------------------
   tickForagerActions(world);
+
+  // ---------------------------------------------------------------------------
+  // Step 16c: Nurse arrival actions — MovingToBrood → Feeding on chamber tile,
+  //           Feeding → Idle so step 10a next tick re-dispatches per allocation.
+  //           Without this step, Nursing is a terminal state (step 10a only
+  //           reassigns Idle ants), which produced the 09 reproduction-gate
+  //           memo's "3 nurses / 0 foragers" lock.
+  // ---------------------------------------------------------------------------
+  tickNurseActions(world);
 
   // ---------------------------------------------------------------------------
   // Step 17: combat detection + resolution (Phase 9 / CMBT-04) — runs after step 16 tickAntMovement.

@@ -229,24 +229,52 @@ const REACQUIRE_RADIUS = 3;
  * Returns {0, 0} when no pheromone is within REACQUIRE_RADIUS — callers fall
  * through to the wander-fallback branch.
  *
- * @param grid   Pheromone grid to read neighbor strengths from.
- * @param tileX  Tile X of the forager (integer).
- * @param tileY  Tile Y of the forager (integer).
- * @param rng    Deterministic world Rng.
+ * 09 excursion-foraging follow-up (issue 1): anti-backtrack. When
+ * prevTileX/Y identifies the tile the ant was on last tick, that tile and
+ * the REACQUIRE-radius pick that would step toward it are filtered out of
+ * the candidate set. If the only pheromone signal lives on the prev tile,
+ * the function returns {0,0} so the caller falls through to wander —
+ * breaking the ABAB scalar-gradient loop that otherwise forms once a few
+ * carriers pin two adjacent cells at PHEROMONE_CAP.
+ *
+ * Pass prevTileX = prevTileY = -1 when the ant has no prior tile (fresh
+ * promotion / post-pickup / entrance-return) to retain the original
+ * non-anti-backtracked behavior.
+ *
+ * @param grid        Pheromone grid to read neighbor strengths from.
+ * @param tileX       Tile X of the forager (integer).
+ * @param tileY       Tile Y of the forager (integer).
+ * @param rng         Deterministic world Rng.
+ * @param prevTileX   Tile X the ant occupied last tick (-1 = none).
+ * @param prevTileY   Tile Y the ant occupied last tick (-1 = none).
  */
 export function sampleForagingDirection(
   grid: PheromoneGrid,
   tileX: number,
   tileY: number,
   rng: Rng,
+  prevTileX: number = -1,
+  prevTileY: number = -1,
 ): { dx: number; dy: number } {
+  const hasPrev = prevTileX >= 0 && prevTileY >= 0;
+
   // Layer 1 / 2: immediate-neighbor scan (DIRS order: up, down, left, right).
+  // Track the best non-prev and best-prev candidates separately so we can
+  // prefer a non-prev direction whenever one has any pheromone, and fall
+  // back to prev only when there's literally nothing else.
   let bestStrength = 0;
   let bestDx = 0;
   let bestDy = 0;
+  let prevNeighborStrength = 0;
   for (let d = 0; d < 4; d++) {
     const dir = DIRS[d]!;
-    const s = phGet(grid, tileX + dir.dx, tileY + dir.dy);
+    const nx = tileX + dir.dx;
+    const ny = tileY + dir.dy;
+    const s = phGet(grid, nx, ny);
+    if (hasPrev && nx === prevTileX && ny === prevTileY) {
+      if (s > prevNeighborStrength) prevNeighborStrength = s;
+      continue;
+    }
     if (s > bestStrength) {
       bestStrength = s;
       bestDx = dir.dx;
@@ -254,12 +282,12 @@ export function sampleForagingDirection(
     }
   }
 
-  // Layer 1 — strong trail: exploit, no random roll.
+  // Layer 1 — strong non-prev trail: exploit, no random roll.
   if (bestStrength >= TRAIL_STRONG_THRESHOLD) {
     return { dx: bestDx, dy: bestDy };
   }
 
-  // Layer 2 — weak trail: sampleGradient's original 10% explore / 90% exploit.
+  // Layer 2 — weak non-prev trail: 10% explore / 90% exploit.
   if (bestStrength > 0) {
     if (rng.nextInt(100) < EXPLORE_RATE_PERCENT) {
       const idx = rng.nextInt(4);
@@ -269,8 +297,18 @@ export function sampleForagingDirection(
     return { dx: bestDx, dy: bestDy };
   }
 
+  // Immediate-neighbor set had nothing usable once prev was filtered. Fall
+  // through to Layer 3 — the widened reacquire scan (also with prev filter).
+  // `prevNeighborStrength` is read only for determinism audits and debug
+  // tools; no behavior depends on it past this point.
+  void prevNeighborStrength;
+
   // Layer 3 — no immediate trail: widen scan to REACQUIRE_RADIUS Manhattan.
   // Scan order: top-to-bottom, left-to-right for deterministic tie-break.
+  // Prev tile is skipped (by exact coord) AND cells whose major-axis step
+  // from the ant would land on prev are skipped — routing through the
+  // just-vacated tile would reintroduce the backtrack the scalar filter
+  // just prevented.
   let reStrength = 0;
   let reDist = REACQUIRE_RADIUS + 1;
   let reDx = 0;
@@ -282,7 +320,19 @@ export function sampleForagingDirection(
       const absX = dx < 0 ? -dx : dx;
       const dist = absX + absY;
       if (dist <= 1) continue; // immediate neighbors already handled.
-      const s = phGet(grid, tileX + dx, tileY + dy);
+      const sx = tileX + dx;
+      const sy = tileY + dy;
+      if (hasPrev && sx === prevTileX && sy === prevTileY) continue;
+      // Major-axis step from (tileX,tileY) toward (sx,sy). If that step
+      // lands on prev, the cell is effectively on the prev-side of the
+      // diamond and following it would reverse — skip and let the symmetric
+      // non-prev cell (or a lateral cell) win the tie-break.
+      if (hasPrev) {
+        const stepX = absX >= absY ? (dx > 0 ? 1 : dx < 0 ? -1 : 0) : 0;
+        const stepY = absX >= absY ? 0 : (dy > 0 ? 1 : dy < 0 ? -1 : 0);
+        if (tileX + stepX === prevTileX && tileY + stepY === prevTileY) continue;
+      }
+      const s = phGet(grid, sx, sy);
       if (s === 0) continue;
       if (s > reStrength || (s === reStrength && dist < reDist)) {
         reStrength = s;
