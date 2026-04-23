@@ -1,0 +1,226 @@
+// invasion-routing.test.ts — Phase 09.1 Chunk 3 (plan 09.1-03) VALIDATION tests.
+//
+// Validates the descent-intent gate that lets player Fighting ants cross
+// colony boundaries through open enemy entrances:
+//   - Positive: Fighting ant standing on an OPEN enemy entrance descends into
+//     the enemy underground grid and ants.currentGridColonyId switches to the
+//     enemy colony id (REQ-C3a).
+//   - Negative (closed entrance): Fighting ant over a CLOSED enemy entrance
+//     does NOT descend (REQ-C3b).
+//   - Negative (wrong task): Non-Fighting ant (Foraging) over an OPEN enemy
+//     entrance does NOT descend — descent-intent gate keys on AntTask.Fighting
+//     (REQ-C3c).
+//
+// Assertion discipline — MANDATORY for every test:
+//   - t=0 precondition assertions confirm the test harness actually staged
+//     the scenario correctly (ant zone, tile coords, task, entrance state).
+//     Without them a negative test could pass "accidentally" because setup
+//     broke, not because the descent gate correctly rejected the ant.
+//   - t=N outcome assertions confirm the descent gate produced the expected
+//     zone / currentGridColonyId / tile-position / task result.
+//
+// Scenario: uses createScenario(seed) as the world harness. createScenario
+// already seeds:
+//   - 2 colonies (PLAYER_COLONY_ID=1, ENEMY_COLONY_ID=2)
+//   - Each colony with exactly 1 pre-excavated open entrance at its start tile
+//     (ENEMY_START_X=104, ENEMY_START_Y=64 for the enemy colony)
+//   - Queen + STARTING_WORKERS workers at each colony's start tile
+//
+// Test setup places a single additional player ant at the enemy entrance tile
+// on the surface and ticks the world forward. The scenario's own workers
+// (player forage/enemy forage traffic) are still present but are filtered
+// by id when asserting the test-specific ant.
+
+import { describe, it, expect } from 'vitest';
+import { createScenario } from './scenario.js';
+import { tick } from './tick.js';
+import { allocateEntityId } from './types.js';
+import { initAnt } from './ant/ant-store.js';
+import { AntTask } from './enums.js';
+import { Zone } from './terrain.js';
+import { FP_SHIFT, FP_ONE } from './fixed.js';
+import {
+  PLAYER_COLONY_ID,
+  ENEMY_COLONY_ID,
+  ENEMY_START_X,
+  ENEMY_START_Y,
+  WORKER_BASE_SPEED,
+} from './constants.js';
+import type { WorldState } from './types.js';
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+interface InvasionWorld {
+  world:           WorldState;
+  playerAntId:     number;
+  enemyEntTileX:   number;
+  enemyEntTileY:   number;
+}
+
+/**
+ * Build an invasion-harness world.
+ *
+ * Starts from createScenario (2 colonies, each with one pre-excavated open
+ * entrance at its start tile — enemy entrance lives at (ENEMY_START_X,
+ * ENEMY_START_Y)). Spawns ONE extra player-colony ant sitting exactly on the
+ * enemy entrance tile on the surface. Caller chooses task and mutates
+ * entrance.isOpen as needed.
+ */
+function buildInvasionWorld(seed = 42): InvasionWorld {
+  const world = createScenario(seed);
+
+  const enemyEntTileX = ENEMY_START_X;
+  const enemyEntTileY = ENEMY_START_Y;
+
+  // Place one player-colony ant at the enemy entrance tile. Position uses
+  // tile-center fixed-point coords so the tile-lookup (posX >> FP_SHIFT)
+  // lands squarely on (enemyEntTileX, enemyEntTileY).
+  const playerAntId = allocateEntityId(world);
+  initAnt(world.ants, playerAntId, {
+    colonyId: PLAYER_COLONY_ID,
+    posX:     (enemyEntTileX << FP_SHIFT) + (FP_ONE >> 1),
+    posY:     (enemyEntTileY << FP_SHIFT) + (FP_ONE >> 1),
+    task:     AntTask.Idle,  // caller overrides to Fighting / Foraging per test
+    subTask:  0,
+    speed:    WORKER_BASE_SPEED,
+    zone:     Zone.Surface,
+  });
+  world.colonies[PLAYER_COLONY_ID]!.workers.push(playerAntId);
+  world.colonies[PLAYER_COLONY_ID]!.workerCount += 1;
+
+  return { world, playerAntId, enemyEntTileX, enemyEntTileY };
+}
+
+/**
+ * Tile-X of ant (fixed-point → tile coord).
+ */
+function tileXOf(world: WorldState, id: number): number {
+  return world.ants.posX[id]! >> FP_SHIFT;
+}
+function tileYOf(world: WorldState, id: number): number {
+  return world.ants.posY[id]! >> FP_SHIFT;
+}
+
+/**
+ * Fetch the enemy colony's (single) entrance. createScenario seeds exactly one
+ * per colony; if that changes, these tests must be updated.
+ */
+function enemyEntrance(world: WorldState) {
+  const entrances = world.colonies[ENEMY_COLONY_ID]!.entrances;
+  expect(entrances.length).toBe(1);
+  return entrances[0]!;
+}
+
+/**
+ * Advance the world N ticks. Drain the command queue each tick (no player
+ * commands in these tests).
+ */
+function tickN(world: WorldState, n: number): void {
+  for (let t = 0; t < n; t++) {
+    const cmds = world.commandQueue.splice(0);
+    tick(world, cmds);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('invasion-routing — Fighting ant descent-intent gate (REQ-C3)', () => {
+  // Number of ticks to allow descent. A single tick is enough for the
+  // zone-transition block (PRD §5d) to fire once the ant is on an open
+  // entrance tile with the right task; we give a few extra ticks so any
+  // minor intermediate steering has time to settle.
+  const DESCENT_TICKS = 5;
+
+  it('REQ-C3a: Fighting ant descends through OPEN enemy entrance', () => {
+    const { world, playerAntId, enemyEntTileX, enemyEntTileY } = buildInvasionWorld();
+    world.ants.task[playerAntId] = AntTask.Fighting;
+    const entrance = enemyEntrance(world);
+    entrance.isOpen = true; // scenario default — restated for clarity
+
+    // MANDATORY t=0 precondition assertions -----------------------------------
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Surface);
+    expect(tileXOf(world, playerAntId)).toBe(enemyEntTileX);
+    expect(tileYOf(world, playerAntId)).toBe(enemyEntTileY);
+    expect(world.ants.task[playerAntId]).toBe(AntTask.Fighting);
+    expect(entrance.isOpen).toBe(true);
+    // Ant's owning colony is PLAYER, but the grid-of-occupancy byte still
+    // matches colonyId at spawn time (descent-write invariant from 09.1-00).
+    expect(world.ants.colonyId[playerAntId]).toBe(PLAYER_COLONY_ID);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(PLAYER_COLONY_ID);
+
+    // Act --------------------------------------------------------------------
+    tickN(world, DESCENT_TICKS);
+
+    // MANDATORY t=N outcome assertions ---------------------------------------
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Underground);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(ENEMY_COLONY_ID);
+  });
+
+  it('REQ-C3b: Fighting ant does NOT descend through CLOSED enemy entrance', () => {
+    const { world, playerAntId, enemyEntTileX, enemyEntTileY } = buildInvasionWorld();
+    world.ants.task[playerAntId] = AntTask.Fighting;
+    const entrance = enemyEntrance(world);
+    entrance.isOpen = false; // KEY: closed entrance
+
+    // MANDATORY t=0 precondition assertions -----------------------------------
+    // Prevents a false green from wrong setup (ant not at tile, or entrance
+    // accidentally still open).
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Surface);
+    expect(tileXOf(world, playerAntId)).toBe(enemyEntTileX);
+    expect(tileYOf(world, playerAntId)).toBe(enemyEntTileY);
+    expect(world.ants.task[playerAntId]).toBe(AntTask.Fighting);
+    expect(entrance.isOpen).toBe(false);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(PLAYER_COLONY_ID);
+
+    // Act --------------------------------------------------------------------
+    tickN(world, DESCENT_TICKS);
+
+    // MANDATORY t=N outcome assertions ---------------------------------------
+    // Ant must be on Surface (descent was rejected because entrance is closed).
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Surface);
+    // Reach-decrease proxy: ant didn't wander off. A Fighting ant with no
+    // rally / no own-colony entrance fallback in target may not be perfectly
+    // stationary — but updateFightAntTargets writes targetPosX/Y to the
+    // player's own entrance when no rallyPoint is set, which is at
+    // (PLAYER_START_X, PLAYER_START_Y)=(24,64). Over 5 ticks at
+    // WORKER_BASE_SPEED=128 (0.5 tiles/tick) that is at most ~2 tiles of
+    // drift; we assert it did NOT descend rather than asserting stationary.
+    // Critical: currentGridColonyId never flipped to enemy (descent-write did
+    // not fire).
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(PLAYER_COLONY_ID);
+    // Task is still Fighting — no mid-test task flip confounding the result.
+    expect(world.ants.task[playerAntId]).toBe(AntTask.Fighting);
+  });
+
+  it('REQ-C3c: Foraging ant does NOT descend through OPEN enemy entrance', () => {
+    const { world, playerAntId, enemyEntTileX, enemyEntTileY } = buildInvasionWorld();
+    world.ants.task[playerAntId] = AntTask.Foraging; // KEY: wrong task
+    const entrance = enemyEntrance(world);
+    entrance.isOpen = true;
+
+    // MANDATORY t=0 precondition assertions -----------------------------------
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Surface);
+    expect(tileXOf(world, playerAntId)).toBe(enemyEntTileX);
+    expect(tileYOf(world, playerAntId)).toBe(enemyEntTileY);
+    // Confirms Foraging, not accidentally Fighting.
+    expect(world.ants.task[playerAntId]).toBe(AntTask.Foraging);
+    expect(entrance.isOpen).toBe(true);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(PLAYER_COLONY_ID);
+
+    // Act --------------------------------------------------------------------
+    tickN(world, DESCENT_TICKS);
+
+    // MANDATORY t=N outcome assertions ---------------------------------------
+    // Ant must be on Surface, task still Foraging, grid-of-occupancy byte
+    // still player (the descent-intent gate correctly rejected the descent
+    // because task !== AntTask.Fighting, and the existing own-entrance
+    // carrier path requires subTask===CarryingFood which this ant lacks).
+    expect(world.ants.zone[playerAntId]).toBe(Zone.Surface);
+    expect(world.ants.task[playerAntId]).toBe(AntTask.Foraging);
+    expect(world.ants.currentGridColonyId[playerAntId]).toBe(PLAYER_COLONY_ID);
+  });
+});
