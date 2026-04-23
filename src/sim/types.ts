@@ -81,7 +81,7 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   dst.nextEntityId = src.nextEntityId;
   dst.commandQueue = src.commandQueue.slice(); // small in practice (user-input rate) — PRD §3 accepts this as the only Phase 1 allocation
 
-  // --- AntComponents: 18 TypedArray.set calls (zero allocation) ---
+  // --- AntComponents: 19 TypedArray.set calls (zero allocation) ---
   dst.ants.posX.set(src.ants.posX);
   dst.ants.posY.set(src.ants.posY);
   dst.ants.colonyId.set(src.ants.colonyId);
@@ -113,6 +113,10 @@ export function copyWorldState(src: WorldState, dst: WorldState): void {
   // diagnostics / replay determinism boundary).
   dst.ants.searchPrevTileX.set(src.ants.searchPrevTileX);
   dst.ants.searchPrevTileY.set(src.ants.searchPrevTileY);
+  // Phase 09.1 Chunk 0 — grid-of-occupancy byte. MUST round-trip through the
+  // double-buffer so every prev-frame grid lookup sees the same value as the
+  // current frame. See 09.1-00-PLAN.md Task 2.
+  dst.ants.currentGridColonyId.set(src.ants.currentGridColonyId);
 
   // --- colonies: delete stale dst keys; upsert each src colony ---
   // Remove dst colonies that no longer exist in src

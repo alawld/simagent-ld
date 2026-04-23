@@ -2474,6 +2474,14 @@ export function tickAntMovement(
             const canDescend = entrance.isOpen || task === AntTask.Digging;
             if (canDescend && entrance.surfaceTileX === tileX && entrance.surfaceTileY === tileY) {
               ants.zone[id] = Zone.Underground;
+              // Phase 09.1 Chunk 0 — the entrance-owning colony dictates which
+              // undergroundGrids[...] this ant now occupies. Today always
+              // colony.colonyId === ants.colonyId[id] (own-colony entrance),
+              // so this is a byte-identical no-op. Chunks 3+4 expand the
+              // descent to cross-colony (Fighter invaders), and at that point
+              // currentGridColonyId will diverge from colonyId. This seam
+              // makes the divergence safe-by-construction.
+              ants.currentGridColonyId[id] = colony.colonyId;
               ants.posY[id] = 0; // enter at top of underground grid
               break;
             }

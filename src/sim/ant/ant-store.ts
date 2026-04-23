@@ -1,6 +1,8 @@
 // ant-store.ts — PRD §1 Structure-of-Arrays (SoA) ant component storage.
 //
-// 18 parallel Int32Array fields indexed by EntityId — one slot per entity.
+// 22 parallel TypedArray fields indexed by EntityId — one slot per entity.
+// Mostly Int32Array; Phase 09.1 Chunk 0 adds currentGridColonyId as Uint8Array
+// (grid-of-occupancy byte, see field JSDoc below).
 // All arrays are allocated once in createAntComponents and NEVER reallocated
 // during the simulation tick loop (zero per-tick allocation in the ant subsystem).
 //
@@ -105,17 +107,35 @@ export interface AntComponents {
   readonly searchPrevTileX: Int32Array;
   /** Companion Y component to searchPrevTileX. Sentinel: -1 = no previous tile. */
   readonly searchPrevTileY: Int32Array;
+  /**
+   * Phase 09.1 Chunk 0 — grid-of-occupancy byte.
+   *
+   * Single source of truth for "which undergroundGrids[...] does this ant
+   * occupy right now." Values are ColonyId (0=PLAYER, 1=ENEMY). Spawned via
+   * `initAnt` with `currentGridColonyId[id] = spec.colonyId` (same-colony
+   * invariant at spawn). Surface→Underground descent updates the field to
+   * the entrance-owning colony (today always the ant's own colony). Chunks
+   * 3+4 of 09.1 will break the `currentGridColonyId === colonyId` invariant
+   * for Fighter invaders — that is the sole design intent of this field.
+   *
+   * Uint8Array (not Int32Array) — ColonyId is 0..255 (PRD §2 PLAYER=0,
+   * ENEMY=1; one byte fits every foreseeable colony count). Keeps the
+   * per-ant SoA footprint to +1 byte instead of +4.
+   */
+  readonly currentGridColonyId: Uint8Array;
 }
 
 // ---------------------------------------------------------------------------
-// Factory — allocates all 18 arrays once; zero per-tick allocation guaranteed
+// Factory — allocates all 22 arrays once; zero per-tick allocation guaranteed
 // ---------------------------------------------------------------------------
 
 /**
- * Allocate 18 parallel Int32Arrays of length `maxEntities`.
+ * Allocate the SoA TypedArrays of length `maxEntities`. Mostly Int32Array,
+ * with a single Uint8Array for Phase 09.1 Chunk 0 `currentGridColonyId`.
  * All slots are zero-initialized by the TypedArray spec, with the exception of
- * digTileX, digTileY, targetPosX, and targetPosY which are filled with -1
- * (sentinel meaning "no claimed tile" / "no target").
+ * digTileX, digTileY, targetPosX, targetPosY, searchPrevTileX, searchPrevTileY
+ * which are filled with -1 (sentinel meaning "no claimed tile" / "no target" /
+ * "no previous tile").
  * Call once at world creation — do NOT call again per tick.
  *
  * @param maxEntities - Number of entity slots to allocate. Defaults to MAX_ENTITIES (8192).
@@ -162,6 +182,10 @@ export function createAntComponents(maxEntities: number = MAX_ENTITIES): AntComp
     // Phase 9 excursion-foraging follow-up — per-ant anti-backtrack prev tile:
     searchPrevTileX,
     searchPrevTileY,
+    // Phase 09.1 Chunk 0 — grid-of-occupancy byte (Uint8Array). Zero-init is
+    // correct: PLAYER_COLONY_ID is conventionally 0; initAnt overwrites with
+    // spec.colonyId at spawn.
+    currentGridColonyId: new Uint8Array(maxEntities),
   };
 }
 
@@ -204,6 +228,11 @@ export interface InitAntSpec {
  */
 export function initAnt(ants: AntComponents, id: EntityId, spec: InitAntSpec): void {
   ants.colonyId[id]        = spec.colonyId;
+  // Phase 09.1 Chunk 0 — grid-of-occupancy matches owning colony at spawn.
+  // Invariant: currentGridColonyId[id] === colonyId[id] for every ant,
+  // until Chunks 3+4 land Fighter cross-grid invasion. See
+  // 09.1-00-PLAN.md objective block.
+  ants.currentGridColonyId[id] = spec.colonyId;
   ants.posX[id]            = spec.posX;
   ants.posY[id]            = spec.posY;
   ants.task[id]            = spec.task     !== undefined ? spec.task     : AntTask.Idle;
