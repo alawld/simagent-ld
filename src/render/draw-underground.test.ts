@@ -44,6 +44,7 @@ import {
 } from './sprites.js';
 import { FOOD_CHAMBER_CAPACITY } from '../sim/constants.js';
 import type { CameraState } from './camera.js';
+import { AntFacingCache } from './ant-facing-cache.js';
 
 // ---------------------------------------------------------------------------
 // MockGfx — spy recorder implementing GfxLike
@@ -586,6 +587,110 @@ describe('drawUndergroundEntities — ant facing direction', () => {
     const cam = makeCamera(5, 5, 20, 20);
     drawUndergroundEntities(gfx, sprites, prev, curr, 1, cam);
     expect(sprites.calls[0]!.rotation).toBeCloseTo(-Math.PI / 2, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: facing-cache smoothing (render-polish follow-up)
+//
+// Mirrors the surface-path smoothing tests. Underground ants travel on the
+// same cardinal grid, so diagonal movement zig-zags between axis-aligned
+// deltas and without smoothing the sprite rotation flips axis every tick.
+// The AntFacingCache threaded through drawUnderground[Entities] low-pass-
+// filters the heading so the blended rotation settles into the diagonal.
+// ---------------------------------------------------------------------------
+
+describe('drawUndergroundEntities — facing cache smoothing', () => {
+  function makeUndergroundAntWorld(posX: number, posY: number): WorldState {
+    const w = makeWorldWithUnderground();
+    w.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999;
+    initAnt(w.ants, 0, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: posX << FP_SHIFT,
+      posY: posY << FP_SHIFT,
+      zone: 1,
+    });
+    return w;
+  }
+
+  it('alternating right/down movement settles toward a diagonal rotation (not axis-aligned)', () => {
+    const gfx = new MockGfx();
+    const sprites = new MockAntSprites();
+    const cam = makeCamera(5, 5, 30, 30);
+    const facing = new AntFacingCache();
+
+    let x = 3, y = 3;
+    const path: Array<[number, number]> = [];
+    for (let i = 0; i < 8; i++) {
+      if (i % 2 === 0) x += 1;
+      else             y += 1;
+      path.push([x, y]);
+    }
+
+    let prev = makeUndergroundAntWorld(3, 3);
+    let lastRotation = 0;
+    for (const [nx, ny] of path) {
+      sprites.reset();
+      const curr = makeUndergroundAntWorld(nx, ny);
+      drawUndergroundEntities(gfx, sprites, prev, curr, 1, cam, PLAYER_COLONY_ID, facing);
+      lastRotation = sprites.calls[0]!.rotation!;
+      prev = curr;
+    }
+
+    // SVG head native on -x → southeast motion lands rotation in (-π, -π/2).
+    expect(lastRotation).toBeGreaterThan(-Math.PI);
+    expect(lastRotation).toBeLessThan(-Math.PI / 2);
+    const diag = -3 * Math.PI / 4;
+    expect(Math.abs(lastRotation - diag)).toBeLessThan(Math.abs(lastRotation - -Math.PI));
+    expect(Math.abs(lastRotation - diag)).toBeLessThan(Math.abs(lastRotation - -Math.PI / 2));
+  });
+
+  it('stationary ant keeps its prior smoothed heading across idle frames', () => {
+    const gfx = new MockGfx();
+    const sprites = new MockAntSprites();
+    const cam = makeCamera(5, 5, 30, 30);
+    const facing = new AntFacingCache();
+
+    const prev1 = makeUndergroundAntWorld(3, 3);
+    const curr1 = makeUndergroundAntWorld(4, 3);
+    drawUndergroundEntities(gfx, sprites, prev1, curr1, 1, cam, PLAYER_COLONY_ID, facing);
+    const settledRotation = sprites.calls[0]!.rotation!;
+    expect(Math.abs(settledRotation)).toBeCloseTo(Math.PI, 5);
+
+    const still = makeUndergroundAntWorld(4, 3);
+    for (let i = 0; i < 4; i++) {
+      sprites.reset();
+      drawUndergroundEntities(gfx, sprites, still, still, 1, cam, PLAYER_COLONY_ID, facing);
+      expect(sprites.calls[0]!.rotation).toBe(settledRotation);
+    }
+  });
+
+  it('spawn frame does not inherit a stale heading from a recycled ant id', () => {
+    const gfx = new MockGfx();
+    const sprites = new MockAntSprites();
+    const cam = makeCamera(5, 5, 30, 30);
+    const facing = new AntFacingCache();
+
+    // Build up a heading for id=0.
+    let prev = makeUndergroundAntWorld(3, 3);
+    for (const [nx, ny] of [[4, 3], [5, 3]] as Array<[number, number]>) {
+      const curr = makeUndergroundAntWorld(nx, ny);
+      drawUndergroundEntities(gfx, sprites, prev, curr, 1, cam, PLAYER_COLONY_ID, facing);
+      prev = curr;
+    }
+
+    // Simulate death + respawn at same id: prev slot not alive, curr alive
+    // at a fresh tile. Rotation must reset to 0, not inherit prior heading.
+    const freshPrev = makeWorldWithUnderground();
+    freshPrev.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999;
+    // id=0 intentionally not initialized in freshPrev.
+
+    const freshCurr = makeUndergroundAntWorld(7, 7);
+
+    sprites.reset();
+    drawUndergroundEntities(gfx, sprites, freshPrev, freshCurr, 0.5, cam, PLAYER_COLONY_ID, facing);
+    expect(sprites.calls.length).toBe(1);
+    expect(sprites.calls[0]!.rotation).toBe(0);
   });
 });
 

@@ -26,6 +26,7 @@ import { initAnt } from '../sim/ant/ant-store.js';
 import { FP_SHIFT } from '../sim/fixed.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import { createColonyRecord } from '../sim/colony/colony-store.js';
+import { AntFacingCache } from './ant-facing-cache.js';
 import {
   TILE_SIZE_PX,
   COLOR_SURFACE_GRASS_PRIMARY,
@@ -474,6 +475,127 @@ describe('drawSurfaceEntities — ant facing direction', () => {
     drawSurfaceEntities(gfx, sprites, prev, curr, 1, cam);
     // Sprite's native head is at -x so zero rotation already points left.
     expect(sprites.calls[0]!.rotation).toBeCloseTo(0, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: facing-cache smoothing (render-polish follow-up)
+//
+// Sim movement is cardinal/4-connected, so diagonal travel zig-zags between
+// axis-aligned tile moves. Without smoothing the sprite rotation flips axis
+// every tick (east→south→east→south…), which reads as flicker. The
+// AntFacingCache low-pass-filters delta history so after a few frames the
+// blended heading points into the intended diagonal, and the sprite rotation
+// follows. These integration tests exercise the full draw-surface → cache
+// path rather than just the cache in isolation (see ant-facing-cache.test.ts
+// for the unit tests on blending math).
+// ---------------------------------------------------------------------------
+
+describe('drawSurfaceEntities — facing cache smoothing', () => {
+  function makeSurfaceAntWorld(posX: number, posY: number): WorldState {
+    const w = createWorldState(1);
+    const colony = createColonyRecord(PLAYER_COLONY_ID, 999);
+    colony.entrances = []; colony.rallyPoint = null; colony.digFlowFieldDirty = false;
+    w.colonies[PLAYER_COLONY_ID] = colony;
+    initAnt(w.ants, 0, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: posX << FP_SHIFT,
+      posY: posY << FP_SHIFT,
+      zone: 0,
+    });
+    return w;
+  }
+
+  it('alternating right/down movement settles toward a diagonal rotation (not axis-aligned)', () => {
+    const gfx = new MockGfx();
+    const sprites = new MockAntSprites();
+    const cam = makeCamera(10, 10, 30, 30);
+    const facing = new AntFacingCache();
+
+    // Walk an 8-step southeast zig-zag: (5,5)→(6,5)→(6,6)→(7,6)→(7,7)…
+    // Each adjacent pair is one frame's prev→curr. Shared cache accumulates
+    // the blended heading across frames.
+    let x = 5, y = 5;
+    let lastRotation = 0;
+    const path: Array<[number, number]> = [];
+    for (let i = 0; i < 8; i++) {
+      // Alternate axis: 0,2,4,6 move +x; 1,3,5,7 move +y.
+      if (i % 2 === 0) x += 1;
+      else             y += 1;
+      path.push([x, y]);
+    }
+
+    let prev = makeSurfaceAntWorld(5, 5);
+    for (const [nx, ny] of path) {
+      sprites.reset();
+      const curr = makeSurfaceAntWorld(nx, ny);
+      drawSurfaceEntities(gfx, sprites, prev, curr, 1, cam, null, facing);
+      lastRotation = sprites.calls[0]!.rotation!;
+      prev = curr;
+    }
+
+    // SVG head native on -x → southeast motion lands rotation in (-π, -π/2).
+    // A pure-right frame alone would be ≈ π (or -π); a pure-down frame alone
+    // would be -π/2. The blend must land strictly between them.
+    expect(lastRotation).toBeGreaterThan(-Math.PI);
+    expect(lastRotation).toBeLessThan(-Math.PI / 2);
+    // And closer to the diagonal (-3π/4) than to either axis.
+    const diag = -3 * Math.PI / 4;
+    expect(Math.abs(lastRotation - diag)).toBeLessThan(Math.abs(lastRotation - -Math.PI));
+    expect(Math.abs(lastRotation - diag)).toBeLessThan(Math.abs(lastRotation - -Math.PI / 2));
+  });
+
+  it('spawn frame does not inherit a stale heading from a recycled ant id', () => {
+    const gfx = new MockGfx();
+    const sprites = new MockAntSprites();
+    const cam = makeCamera(10, 10, 30, 30);
+    const facing = new AntFacingCache();
+
+    // First ant (id=0) builds up a rightward heading over a couple frames.
+    let prev = makeSurfaceAntWorld(5, 5);
+    for (const [nx, ny] of [[6, 5], [7, 5]] as Array<[number, number]>) {
+      const curr = makeSurfaceAntWorld(nx, ny);
+      drawSurfaceEntities(gfx, sprites, prev, curr, 1, cam, null, facing);
+      prev = curr;
+    }
+
+    // Simulate ant death + respawn at the same id: prev slot not alive,
+    // curr slot alive at a new position. Draw one frame and confirm the
+    // rotation is the stable default (0), not carried over from the old ant.
+    const freshPrev = createWorldState(1);
+    const freshColony = createColonyRecord(PLAYER_COLONY_ID, 999);
+    freshColony.entrances = []; freshColony.rallyPoint = null; freshColony.digFlowFieldDirty = false;
+    freshPrev.colonies[PLAYER_COLONY_ID] = freshColony;
+    // id=0 intentionally not initialized in freshPrev — isAlive=false.
+
+    const freshCurr = makeSurfaceAntWorld(20, 20);
+
+    sprites.reset();
+    drawSurfaceEntities(gfx, sprites, freshPrev, freshCurr, 0.5, cam, null, facing);
+    expect(sprites.calls.length).toBe(1);
+    expect(sprites.calls[0]!.rotation).toBe(0);
+  });
+
+  it('stationary ant keeps its prior smoothed heading across idle frames', () => {
+    const gfx = new MockGfx();
+    const sprites = new MockAntSprites();
+    const cam = makeCamera(10, 10, 30, 30);
+    const facing = new AntFacingCache();
+
+    // Frame 1: establish a rightward heading. (Cardinal move seeds raw atan2.)
+    const prev1 = makeSurfaceAntWorld(5, 5);
+    const curr1 = makeSurfaceAntWorld(6, 5);
+    drawSurfaceEntities(gfx, sprites, prev1, curr1, 1, cam, null, facing);
+    const settledRotation = sprites.calls[0]!.rotation!;
+    expect(Math.abs(settledRotation)).toBeCloseTo(Math.PI, 5); // moving +x
+
+    // Frames 2..N: prev == curr (ant stationary). Rotation must hold steady.
+    const still = makeSurfaceAntWorld(6, 5);
+    for (let i = 0; i < 4; i++) {
+      sprites.reset();
+      drawSurfaceEntities(gfx, sprites, still, still, 1, cam, null, facing);
+      expect(sprites.calls[0]!.rotation).toBe(settledRotation);
+    }
   });
 });
 
