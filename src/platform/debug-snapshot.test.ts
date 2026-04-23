@@ -53,6 +53,79 @@ function setupWorldWithColony(colonyId: number) {
   return { world, colony };
 }
 
+describe('buildAntTrace — currentGridColonyId (Phase 09.1-05)', () => {
+  it('default invariant: currentGridColonyId matches colonyId on spawn', () => {
+    // Plan 09.1-00 set currentGridColonyId = colonyId in initAnt. Asserting
+    // that the trace surfaces this invariant prevents a later initAnt
+    // regression (accidental missing write) from going undetected in the
+    // exported payload readers use to diagnose invasions.
+    const { world } = setupWorldWithColony(COLONY_ID);
+    setupSurfaceGrid(world, COLONY_ID);
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 10 << FP_SHIFT,
+      posY: 20 << FP_SHIFT,
+      task: AntTask.Foraging,
+      subTask: ForagingSubState.SearchingFood,
+    });
+
+    const row = buildAntTrace(world, antId);
+    expect(row.colonyId).toBe(COLONY_ID);
+    expect(row.currentGridColonyId).toBe(COLONY_ID);
+  });
+
+  it('divergent values: player ant inside enemy grid (colonyId=0, currentGridColonyId=1)', () => {
+    // During Phase 09.1 invasion a Fighting ant crosses into the enemy
+    // underground grid. colonyId never changes (ownership is permanent);
+    // currentGridColonyId tracks the grid-of-occupancy. The snapshot must
+    // expose BOTH so a reader can see at-a-glance which ants are inside a
+    // foreign grid.
+    const PLAYER = 0;
+    const ENEMY  = 1;
+    const world = createWorldState(42, MAX_TEST_ENTITIES);
+    for (const cid of [PLAYER, ENEMY]) {
+      const c = createColonyRecord(cid, -1);
+      c.entrances = [];
+      c.rallyPoint = null;
+      c.digFlowFieldDirty = false;
+      world.colonies[cid] = c;
+      setupSurfaceGrid(world, cid);
+    }
+    const invaderId = allocateEntityId(world);
+    initAnt(world.ants, invaderId, {
+      colonyId: PLAYER,
+      posX: 30 << FP_SHIFT,
+      posY: 30 << FP_SHIFT,
+      task: AntTask.Fighting,
+    });
+    // Simulate mid-invasion: the ant is inside the enemy underground grid.
+    world.ants.currentGridColonyId[invaderId] = ENEMY;
+
+    const row = buildAntTrace(world, invaderId);
+    expect(row.colonyId).toBe(PLAYER);
+    expect(row.currentGridColonyId).toBe(ENEMY);
+  });
+
+  it('buildDebugSnapshot payload includes currentGridColonyId per ant trace row', () => {
+    // End-to-end: the full snapshot payload (not just a single trace row)
+    // must carry the field so downstream JSON consumers can read it.
+    const { world } = setupWorldWithColony(COLONY_ID);
+    setupSurfaceGrid(world, COLONY_ID);
+    const antId = allocateEntityId(world);
+    initAnt(world.ants, antId, {
+      colonyId: COLONY_ID,
+      posX: 20 << FP_SHIFT,
+      posY: 20 << FP_SHIFT,
+      task: AntTask.Foraging,
+    });
+    const snap = buildDebugSnapshot(world, 1, []);
+    const row = snap.antTrace.find((r) => r.antId === antId);
+    expect(row).toBeDefined();
+    expect(row!.currentGridColonyId).toBe(COLONY_ID);
+  });
+});
+
 describe('buildAntTrace — field population', () => {
   it('emits tile coords derived from posX/posY >> FP_SHIFT and all SoA fields', () => {
     const { world } = setupWorldWithColony(COLONY_ID);
