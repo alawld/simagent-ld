@@ -47,6 +47,10 @@ const MINIMAL_SAVE_FIXTURE = {
       foodCarrying: [], starvationTimer: [], age: [], alive: [], lifespan: [],
       zone: [], digTileX: [], digTileY: [], digTicksRemaining: [],
       targetPosX: [], targetPosY: [],
+      // Phase 09.1 Chunk 0 — grid-of-occupancy byte (new SoA field). Empty
+      // array matches the empty ants fixture; deserializeWorldState must
+      // accept the field on round-trip.
+      currentGridColonyId: [],
     },
     colonies: {},
     pheromoneGrids: {},

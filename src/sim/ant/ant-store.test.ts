@@ -299,4 +299,44 @@ describe('ant-store', () => {
     a.digTileX[0] = 99;
     expect(b.digTileX[0]).toBe(-1); // b.digTileX not affected
   });
+
+  // ---------------------------------------------------------------------------
+  // 16. Phase 09.1 — currentGridColonyId (grid-of-occupancy byte, Chunk 0)
+  //
+  // currentGridColonyId: Uint8Array is the single source of truth for "which
+  // underground grid does this ant occupy right now." Today every ant's
+  // currentGridColonyId === colonyId (no invasion yet). Chunks 3+4 break that
+  // invariant for Fighter invaders in enemy grids.
+  //
+  // Invariant at spawn: currentGridColonyId[id] === spec.colonyId (initAnt).
+  // ---------------------------------------------------------------------------
+
+  it('createAntComponents allocates currentGridColonyId as a Uint8Array of the capacity length', () => {
+    const ants = createAntComponents(64);
+    expect(ants.currentGridColonyId).toBeInstanceOf(Uint8Array);
+    expect(ants.currentGridColonyId.length).toBe(64);
+  });
+
+  it('initAnt sets currentGridColonyId[id] = spec.colonyId (grid-of-occupancy matches owning colony at spawn)', () => {
+    const ants = createAntComponents(16);
+    const id = 4;
+    initAnt(ants, id, { colonyId: 1, posX: 0, posY: 0 });
+
+    expect(ants.currentGridColonyId[id]).toBe(1);
+  });
+
+  it('killAnt then initAnt on the same slot produces currentGridColonyId matching the new colonyId (slot recycle hygiene)', () => {
+    const ants = createAntComponents(16);
+    const id = 9;
+
+    // First life: colony 1 occupies the slot.
+    initAnt(ants, id, { colonyId: 1, posX: 0, posY: 0 });
+    expect(ants.currentGridColonyId[id]).toBe(1);
+
+    // Kill and recycle as colony 0.
+    killAnt(ants, id);
+    initAnt(ants, id, { colonyId: 0, posX: 0, posY: 0 });
+
+    expect(ants.currentGridColonyId[id]).toBe(0);
+  });
 });

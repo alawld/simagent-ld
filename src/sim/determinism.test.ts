@@ -55,6 +55,18 @@ function serializeWorldState(w: WorldState): string {
       digTicksRemaining:  Array.from(w.ants.digTicksRemaining),
       targetPosX:         Array.from(w.ants.targetPosX),
       targetPosY:         Array.from(w.ants.targetPosY),
+      // Phase 09.1 Chunk 0 — grid-of-occupancy byte (new SoA field).
+      currentGridColonyId: Array.from(w.ants.currentGridColonyId),
+      // Phase 9 — 6 previously-omitted SoA fields (pre-existing serializer
+      // gap closed here per 09.1-00-PLAN). If closure surfaces a latent
+      // non-deterministic divergence in one of these fields, revert ONLY the
+      // 6 search* lines and document in 09.1-MEMO.md §5 Deviations Log.
+      searchWave:         Array.from(w.ants.searchWave),
+      searchHeadingX:     Array.from(w.ants.searchHeadingX),
+      searchHeadingY:     Array.from(w.ants.searchHeadingY),
+      searchHeadingTicks: Array.from(w.ants.searchHeadingTicks),
+      searchPrevTileX:    Array.from(w.ants.searchPrevTileX),
+      searchPrevTileY:    Array.from(w.ants.searchPrevTileY),
     },
     colonies: Object.keys(w.colonies).sort().reduce((acc, k) => {
       const c = w.colonies[Number(k) as ColonyId]!;
