@@ -46,6 +46,7 @@ import {
   createViewState,
   resetViewState,
   toggleView,
+  toggleUndergroundColony,
   clampCamera,
 } from './camera.js';
 import {
@@ -201,6 +202,23 @@ export class GameScene extends Phaser.Scene {
     this.input.keyboard!.on('keydown-ONE', () => { this.speedMultiplier = 1; });
     this.input.keyboard!.on('keydown-TWO', () => { this.speedMultiplier = 2; });
     this.input.keyboard!.on('keydown-FOUR', () => { this.speedMultiplier = 4; });
+
+    // 09.1 Chunk 2 — X toggles the active underground colony view. Only
+    // flips when activeView === 'underground'; inert on the surface view
+    // (the HUD label is also hidden there). Event-based to match the
+    // P/F9/speed-multiplier pattern above — the keyboard-plugin event bus
+    // handles edge-trigger semantics for us (one keydown event per press),
+    // avoiding the key-repeat DoS that Phase 08-04 guarded against for
+    // Tab via JustDown. SavePrompt phase early-returns in update() but
+    // this listener fires from Phaser's keyboard plugin; the SavePrompt
+    // overlay is click-driven (no X binding) so a spurious X press during
+    // SavePrompt is harmless — it mutates a ViewState field the overlay
+    // does not render.
+    this.input.keyboard!.on('keydown-X', () => {
+      if (this.gamePhase === GamePhase.SavePrompt) return;
+      if (this.viewState.activeView !== 'underground') return;
+      toggleUndergroundColony(this.viewState);
+    });
 
     // 09 excursion-foraging follow-up — F9 exports a debug snapshot JSON
     // (seed, tick, inputLog, world snapshot, enriched per-ant trace) so QA

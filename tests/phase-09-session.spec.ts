@@ -194,11 +194,11 @@ test.describe('Phase 9 — SCEN-04 save-prompt flow', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('Phase 09.1 Chunk 2 — enemy underground toggle', () => {
-  test.skip('X keybind in underground view flips HUD label between Your Colony and Enemy Colony', async ({
+  test('X keybind in underground view flips HUD label between Your Colony and Enemy Colony', async ({
     page,
   }) => {
-    // SKIPPED until Plan 09.1-02 Task 3 wires the X keybind.
-    // When un-skipped, this exercises the full path:
+    // Un-skipped by Plan 09.1-02 Task 3 (X keybind wired in game-scene.ts).
+    // Exercises the full path:
     //   Tab (surface → underground) → HUD reads "Your Colony"
     //   X → flip → HUD reads "Enemy Colony"
     //   X → flip back → HUD reads "Your Colony"
@@ -211,13 +211,32 @@ test.describe('Phase 09.1 Chunk 2 — enemy underground toggle', () => {
     await page.reload();
     const canvas = page.locator('canvas').first();
     await canvas.waitFor({ state: 'attached', timeout: 10_000 });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(500);
+
+    // Focus the canvas so key events land on the window listener Phaser
+    // registered. Without this, Tab occasionally fails to fire JustDown
+    // when running the full e2e suite (cross-suite state from the preceding
+    // SavePrompt tests can leave focus outside the canvas subtree).
+    const box = await canvas.boundingBox();
+    if (!box) throw new Error('canvas has no bounding box');
+    await page.mouse.click(box.x + 10, box.y + 10);
+    await page.waitForTimeout(100);
 
     // Enter the underground view. Tab edge-triggers the view toggle per
-    // Phase 08-04 decision (JustDown). The X keybind is gated on
-    // viewState.activeView === 'underground' so it only fires from here.
+    // Phase 08-04 decision (JustDown). Poll the hook for the label going
+    // truthy as a proxy for "UIScene has run at least one update frame
+    // since boot", then press Tab.
+    await expect.poll(
+      async () => {
+        const v = await page.evaluate(() => (window as unknown as {
+          __phase9_ui?: { activeUndergroundLabel?: string };
+        }).__phase9_ui?.activeUndergroundLabel);
+        return v ?? 'unset';
+      },
+      { timeout: 5_000 },
+    ).toBe('Your Colony');
     await page.keyboard.press('Tab');
-    await page.waitForTimeout(200);
+    await page.waitForTimeout(300);
 
     // Read the HUD label via the __phase9_ui hook. Plan 09.1-02 Task 2
     // extends the hook with `activeUndergroundLabel: 'Your Colony' | 'Enemy Colony'`
