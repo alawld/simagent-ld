@@ -19,6 +19,7 @@ export type { GfxLike } from './draw-surface.js';
 
 import type { GfxLike } from './draw-surface.js';
 import type { AntSpriteLayer } from './ant-sprite-layer.js';
+import { computeAntRotation, type AntFacingCache } from './ant-facing-cache.js';
 import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import { isAlive } from '../sim/ant/ant-store.js';
 import { FP_SHIFT, FP_ONE } from '../sim/fixed.js';
@@ -212,6 +213,7 @@ export function drawUndergroundEntities(
   alpha: number,
   cam: CameraState,
   activeUndergroundColonyId: ColonyId = PLAYER_COLONY_ID,
+  facing?: AntFacingCache,
 ): void {
   const colony = curr.colonies[activeUndergroundColonyId];
   if (colony === undefined) return;
@@ -323,15 +325,19 @@ export function drawUndergroundEntities(
     // Trivial viewport cull
     if (screenX < -TILE_SIZE_PX || screenX > canvasW || screenY < -TILE_SIZE_PX || screenY > canvasH) continue;
 
-    // Facing: rotate the SVG (head on -x natively) toward the interpolated
-    // motion vector. Stationary ants (dx=dy=0) hold a stable default pose via
-    // rotation=0 rather than snapping to an arbitrary direction. When we
-    // skipped interpolation (zone flip / spawn frame), the prev→curr delta
-    // doesn't represent motion, so use rotation=0 as well. See
-    // AntSpriteDrawOptions.rotation for the math.
+    // Facing: rotate the SVG (head on -x natively) toward the motion vector.
+    // Smoothing is applied by the AntFacingCache when one is supplied — the
+    // sim moves ants on a cardinal/4-connected grid, so a diagonal trajectory
+    // zig-zags axis every tick. The cache low-pass-filters the per-frame
+    // delta so the blended heading settles into the intended diagonal
+    // instead of snapping between horizontal and vertical. Stationary ants
+    // reuse the prior smoothed rotation; zone flips / spawn frames evict the
+    // stale cache entry and fall back to the default pose (rotation=0). See
+    // AntSpriteDrawOptions.rotation for the math and ant-facing-cache.ts for
+    // the blending contract.
     const dx = currPxX - prevPxX;
     const dy = currPxY - prevPxY;
-    const rotation = (!useInterp || Math.abs(dx) + Math.abs(dy) < 0.01) ? 0 : Math.atan2(-dy, -dx);
+    const rotation = computeAntRotation(facing, id, curr.ants.zone[id]!, dx, dy, useInterp);
 
     // Queen identity: the only queen who legitimately occupies this grid is
     // the grid-owner's queen (queens never invade per 09.1 design). isQueen
@@ -414,7 +420,8 @@ export function drawUnderground(
   alpha: number,
   cam: CameraState,
   activeUndergroundColonyId: ColonyId = PLAYER_COLONY_ID,
+  facing?: AntFacingCache,
 ): void {
   drawUndergroundTerrain(gfx, curr, cam, activeUndergroundColonyId);
-  drawUndergroundEntities(gfx, sprites, prev, curr, alpha, cam, activeUndergroundColonyId);
+  drawUndergroundEntities(gfx, sprites, prev, curr, alpha, cam, activeUndergroundColonyId, facing);
 }

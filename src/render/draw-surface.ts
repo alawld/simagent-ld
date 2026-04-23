@@ -19,6 +19,7 @@ import { FP_ONE } from '../sim/fixed.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
 import type { WorldState } from '../sim/types.js';
 import type { AntSpriteLayer } from './ant-sprite-layer.js';
+import { computeAntRotation, type AntFacingCache } from './ant-facing-cache.js';
 import {
   TILE_SIZE_PX,
   COLOR_SURFACE_GRASS_PRIMARY,
@@ -120,6 +121,7 @@ export function drawSurfaceEntities(
   alpha: number,
   cam: CameraState,
   pendingEntrance: { tileX: number; tileY: number } | null = null,
+  facing?: AntFacingCache,
 ): void {
   const left = Math.floor(cam.x - cam.viewportWidth  / 2);
   const top  = Math.floor(cam.y - cam.viewportHeight / 2);
@@ -207,14 +209,19 @@ export function drawSurfaceEntities(
     const color = colonyId === PLAYER_COLONY_ID ? COLOR_PLAYER_COLONY : COLOR_ENEMY_COLONY;
 
     // Facing: rotate the SVG (head on -x natively) so the head points along
-    // the interpolated motion vector. When the ant is stationary (dx=dy=0)
-    // use rotation=0 so the sprite holds a stable default pose instead of
-    // jittering. When we skipped interpolation (zone flip / spawn frame), the
-    // prev→curr delta doesn't represent motion either — also fall back to 0.
-    // See AntSpriteDrawOptions.rotation for the math.
+    // the motion vector. Smoothing is applied by the AntFacingCache when one
+    // is supplied (GameScene owns the instance and hands it to every frame)
+    // — blends recent deltas so cardinal zig-zag movement reads as a diagonal
+    // facing instead of flipping axis every tick. Stationary ants reuse the
+    // prior smoothed rotation so the sprite holds its pose instead of
+    // snapping back to the default. When useInterp is false (zone flip or
+    // spawn frame) the delta is meaningless and the cache evicts stale state;
+    // rotation falls back to the sprite's default pose. See
+    // AntSpriteDrawOptions.rotation for the math and ant-facing-cache.ts for
+    // the blending contract.
     const dx = currPxX - prevPxX;
     const dy = currPxY - prevPxY;
-    const rotation = (!useInterp || Math.abs(dx) + Math.abs(dy) < 0.01) ? 0 : Math.atan2(-dy, -dx);
+    const rotation = computeAntRotation(facing, id, curr.ants.zone[id]!, dx, dy, useInterp);
 
     sprites.drawAnt({
       kind: isQueen ? 'queen' : 'worker',
@@ -288,7 +295,8 @@ export function drawSurface(
   alpha: number,
   cam: CameraState,
   pendingEntrance: { tileX: number; tileY: number } | null = null,
+  facing?: AntFacingCache,
 ): void {
   drawSurfaceTerrain(gfx, curr, cam);
-  drawSurfaceEntities(gfx, sprites, prev, curr, alpha, cam, pendingEntrance);
+  drawSurfaceEntities(gfx, sprites, prev, curr, alpha, cam, pendingEntrance, facing);
 }

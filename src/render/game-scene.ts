@@ -59,6 +59,7 @@ import { GameOutcome } from '../sim/game-over.js';
 import { drawSurface, type GfxLike } from './draw-surface.js';
 import { drawUnderground } from './draw-underground.js';
 import { drawPheromoneOverlay } from './draw-pheromone.js';
+import { AntFacingCache } from './ant-facing-cache.js';
 import {
   ANT_TEXTURE_QUEEN,
   ANT_TEXTURE_WORKER,
@@ -132,6 +133,12 @@ export class GameScene extends Phaser.Scene {
   private gameLoop!: GameLoop;
   private gfx!: Phaser.GameObjects.Graphics;
   private antSprites!: AntSpritePool;
+  // Render-only ant-facing smoothing (see ant-facing-cache.ts). One instance
+  // per scene, threaded into drawSurface + drawUnderground each frame so
+  // cardinal zig-zag movement settles into a diagonal heading instead of
+  // flipping sprite rotation every tick. Reset on boot / restart / save-load
+  // so a recycled ant id never inherits a stale heading across sessions.
+  private readonly antFacingCache: AntFacingCache = new AntFacingCache();
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd!: { W: Phaser.Input.Keyboard.Key; A: Phaser.Input.Keyboard.Key; S: Phaser.Input.Keyboard.Key; D: Phaser.Input.Keyboard.Key };
   private tabKey!: Phaser.Input.Keyboard.Key;
@@ -307,6 +314,12 @@ export class GameScene extends Phaser.Scene {
     // ants against the previous world's topology. Clear them here, before the
     // new world first ticks.
     resetFlowFieldCaches();
+    // Render-only ant-facing smoothing: same rationale as the flow-field
+    // caches. The AntFacingCache is keyed by ant id, and the new session
+    // reuses ids 0..N from scratch — a stale heading from the prior session
+    // would lock a freshly-spawned ant into the prior ant's direction until
+    // the smoothing relaxes. Clearing here keeps boot visually clean.
+    this.antFacingCache.reset();
   }
 
   private bootFresh(): void {
@@ -440,7 +453,16 @@ export class GameScene extends Phaser.Scene {
               tileY: this.surfaceInputState.pendingEntranceTileY,
             }
           : null;
-      drawSurface(gfx, this.antSprites, this.prevState, this.world, alpha, cam, pending);
+      drawSurface(
+        gfx,
+        this.antSprites,
+        this.prevState,
+        this.world,
+        alpha,
+        cam,
+        pending,
+        this.antFacingCache,
+      );
     } else {
       drawUnderground(
         gfx,
@@ -450,6 +472,7 @@ export class GameScene extends Phaser.Scene {
         alpha,
         cam,
         this.viewState.activeUndergroundColonyId,
+        this.antFacingCache,
       );
     }
     this.antSprites.endFrame();
