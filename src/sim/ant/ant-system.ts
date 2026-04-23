@@ -484,6 +484,11 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
 
   // 2. Find the first Nursery Open tile (row-major within the first Nursery
   //    chamber). Requires the colony's underground grid to check state.
+  //
+  // Phase 09.1 Chunk 0 disposition: own-colony chamber membership — brood
+  // is transported into its own colony's Nursery chamber, never into an
+  // enemy grid. Keeping colony.colonyId here is safe-by-construction (brood
+  // never invades). Parallel to colony-system.ts:376/431 dispositions.
   const underground = world.undergroundGrids[colony.colonyId];
   if (!underground) return;
 
@@ -501,6 +506,11 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
         ants.posX[pickId] = (cx << FP_SHIFT) + (FP_ONE >> 1);
         ants.posY[pickId] = (cy << FP_SHIFT) + (FP_ONE >> 1);
         ants.zone[pickId] = Zone.Underground;
+        // Phase 09.1 Chunk 0 — descent invariant. Brood teleported into
+        // nursery now occupies that colony's grid. Today brood is in its
+        // OWN colony so colony.colonyId === ants.colonyId[pickId] and this
+        // is a byte-identical no-op.
+        ants.currentGridColonyId[pickId] = colony.colonyId;
         return;
       }
     }
@@ -571,12 +581,17 @@ export function getTaskDirection(
       return { dx: 0, dy: 0 };
     }
 
-    // MovingToTile: read flow-field direction
+    // MovingToTile: read flow-field direction.
+    // colonyId keys the dig flow-field (indexed by the digger's OWN colony —
+    // diggers never cross grids); gridColonyId keys the underground grid the
+    // ant currently occupies (Phase 09.1 Chunk 0). Today both values are
+    // identical for every ant; Chunks 3+4 break that for Fighter invaders.
     const colonyId = ants.colonyId[antId]!;
+    const gridColonyId = ants.currentGridColonyId[antId]!;
     const flowField = digFlowFields.fields[colonyId];
     if (!flowField) return { dx: 0, dy: 0 };
 
-    const underground = world.undergroundGrids[colonyId];
+    const underground = world.undergroundGrids[gridColonyId];
     if (!underground) return { dx: 0, dy: 0 };
 
     const tileX = ants.posX[antId]! >> FP_SHIFT;
@@ -593,7 +608,12 @@ export function getTaskDirection(
   }
 
   if (task === AntTask.Nursing) {
+    // colonyId keys the nursing chamber flow-field (indexed by the nurse's
+    // OWN colony — nurses never cross grids); gridColonyId keys the
+    // underground grid the ant currently occupies (Phase 09.1 Chunk 0).
+    // Today both values are identical for every ant.
     const colonyId = ants.colonyId[antId]!;
+    const gridColonyId = ants.currentGridColonyId[antId]!;
 
     // Prefer the nursing flow-field. Seeded from Open tiles inside every
     // Queen/Nursery chamber footprint, so the nurse routes through tunnels
@@ -602,7 +622,7 @@ export function getTaskDirection(
     // (13,9) and straight-line steering picked (14,15) = Solid every tick.
     if (chamberFlowFields !== undefined) {
       const flowField = chamberFlowFields.nursing[colonyId];
-      const underground = world.undergroundGrids[colonyId];
+      const underground = world.undergroundGrids[gridColonyId];
       if (flowField && underground) {
         const tileX = ants.posX[antId]! >> FP_SHIFT;
         const tileY = ants.posY[antId]! >> FP_SHIFT;
@@ -846,7 +866,12 @@ export function tickDigExecution(
     if (ants.alive[id] !== 1) continue;
     if (ants.task[id] !== AntTask.Digging) continue;
 
+    // colonyId keys the digger's OWN colony (digFlowFields, world.colonies);
+    // gridColonyId keys the underground grid the ant currently occupies
+    // (Phase 09.1 Chunk 0). Today both values are identical; diggers never
+    // invade so this decoupling is forward-compatibility.
     const colonyId = ants.colonyId[id]!;
+    const gridColonyId = ants.currentGridColonyId[id]!;
     const subTask = ants.subTask[id]!;
 
     // Phase 9 digger-reassignment fix (09-DIGGER-REASSIGNMENT-BUG.md):
@@ -858,7 +883,7 @@ export function tickDigExecution(
     // released: a claimed tile must finish to avoid dropping BeingDug state.
     if (subTask === DiggingSubState.MovingToTile) {
       const flowField = digFlowFields.fields[colonyId];
-      const underground = world.undergroundGrids[colonyId];
+      const underground = world.undergroundGrids[gridColonyId];
       if (!flowField || !underground) {
         // Colony has never marked dig work / no underground grid — release.
         ants.task[id] = AntTask.Idle;
@@ -886,7 +911,7 @@ export function tickDigExecution(
     const colony = world.colonies[colonyId];
     if (!colony) continue;
 
-    const underground = world.undergroundGrids[colonyId];
+    const underground = world.undergroundGrids[gridColonyId];
     if (!underground) continue;
 
     if (subTask === DiggingSubState.MovingToTile) {
@@ -1768,6 +1793,10 @@ function moveQueens(
         if (!entrance.isOpen) continue;
         if (entrance.surfaceTileX !== tileX || entrance.surfaceTileY !== tileY) continue;
         ants.zone[qId] = Zone.Underground;
+        // Phase 09.1 Chunk 0 — descent invariant: the entrance-owning colony
+        // dictates the queen's occupied grid. Queens never invade, so this
+        // is a byte-identical no-op today (colony.colonyId === own).
+        ants.currentGridColonyId[qId] = colony.colonyId;
         ants.posY[qId] = 0;
         // posX preserved (entrance shaft is the same column); next tick the
         // underground branch steers her toward the Queen chamber via the
@@ -1811,7 +1840,13 @@ function moveQueens(
       // chamber Open tiles). A Nursery-only chamber tile must NOT be a
       // resting target for the queen, so we never consume the nursing field
       // here.
-      const underground = world.undergroundGrids[colony.colonyId];
+      //
+      // Phase 09.1 Chunk 0: queens never invade, so ants.currentGridColonyId[qId]
+      // always equals colony.colonyId. Still, the grid lookup keys off the
+      // queen's occupancy byte to match the invariant "all ant grid lookups
+      // route through currentGridColonyId" (consistency with foragers/
+      // nurses/diggers refactored above).
+      const underground = world.undergroundGrids[ants.currentGridColonyId[qId]!];
       if (!underground) continue;
 
       let stepped = false;
@@ -1885,8 +1920,12 @@ function moveQueens(
     // Underground passability guard — queen uses AntTask.Idle rules, so
     // Solid and Marked are both blocked. She can only traverse Open and
     // BeingDug tiles, guaranteeing no dirt-cutting.
+    //
+    // Phase 09.1 Chunk 0: keys off currentGridColonyId for consistency with
+    // the invariant. Queens never invade, so same grid as colony.colonyId
+    // today.
     if (zone === Zone.Underground) {
-      const underground = world.undergroundGrids[colony.colonyId];
+      const underground = world.undergroundGrids[ants.currentGridColonyId[qId]!];
       if (underground) {
         const newTileX = posX >> FP_SHIFT;
         const newTileY = posY >> FP_SHIFT;
@@ -1920,6 +1959,11 @@ function moveQueens(
         const entrance = colony.entrances[e]!;
         if (entrance.isOpen && entrance.surfaceTileX === newTileX && entrance.surfaceTileY === newTileY) {
           ants.zone[qId] = Zone.Underground;
+          // Plan 09.1-00: every Surface→Underground transition must update
+          // currentGridColonyId so the descending queen resolves to its own
+          // colony's grid. Byte-identical today (queens never invade) but
+          // required by the invariant for uniform downstream lookups.
+          ants.currentGridColonyId[qId] = colony.colonyId;
           ants.posY[qId] = 0;
           break;
         }
@@ -2026,9 +2070,14 @@ export function tickAntMovement(
       task === AntTask.Foraging &&
       foodCarrying > 0
     ) {
+      // colonyId keys the OWN-colony record (carriers deposit into their own
+      // FoodStorage chambers — foragers never invade). gridColonyId keys the
+      // underground grid the ant currently occupies (Phase 09.1 Chunk 0);
+      // today both are identical.
       const colonyId = ants.colonyId[id]!;
+      const gridColonyId = ants.currentGridColonyId[id]!;
       const colony = world.colonies[colonyId];
-      const underground = world.undergroundGrids[colonyId];
+      const underground = world.undergroundGrids[gridColonyId];
       if (colony && underground) {
         const antTileX = ants.posX[id]! >> FP_SHIFT;
         const antTileY = ants.posY[id]! >> FP_SHIFT;
@@ -2132,9 +2181,12 @@ export function tickAntMovement(
     // selection can consume it as a guard.
     let chamberFoodUnreachable = false;
     if (chamberTargetX !== -1 && chamberFlowFields !== undefined) {
+      // colonyId keys the own-colony food flow-field; gridColonyId keys the
+      // occupied grid (Phase 09.1 Chunk 0). Today both identical.
       const colonyId = ants.colonyId[id]!;
+      const gridColonyId = ants.currentGridColonyId[id]!;
       const flowField = chamberFlowFields.food[colonyId];
-      const underground = world.undergroundGrids[colonyId];
+      const underground = world.undergroundGrids[gridColonyId];
       if (flowField && underground) {
         const tileX = ants.posX[id]! >> FP_SHIFT;
         const tileY = ants.posY[id]! >> FP_SHIFT;
@@ -2153,9 +2205,12 @@ export function tickAntMovement(
       const posY = ants.posY[id]!;
       let stepped = false;
       if (chamberFlowFields !== undefined) {
+        // colonyId keys own-colony food flow-field; gridColonyId keys the
+        // occupied grid (Phase 09.1 Chunk 0). Today both identical.
         const colonyId = ants.colonyId[id]!;
+        const gridColonyId = ants.currentGridColonyId[id]!;
         const flowField = chamberFlowFields.food[colonyId];
-        const underground = world.undergroundGrids[colonyId];
+        const underground = world.undergroundGrids[gridColonyId];
         if (flowField && underground) {
           const tileX = posX >> FP_SHIFT;
           const tileY = posY >> FP_SHIFT;
@@ -2200,9 +2255,14 @@ export function tickAntMovement(
       // missing (shouldn't happen at step 16 — step 9 seeds lazily).
       let stepped = false;
       if (zone === Zone.Underground && entranceFlowFields !== undefined) {
+        // colonyId keys the own-colony entrance flow-field (an ant always
+        // routes to its OWN colony's entrances — invaders exit via their own
+        // entrance, not the enemy's). gridColonyId keys the occupied grid
+        // (Phase 09.1 Chunk 0). Today both identical.
         const colonyId = ants.colonyId[id]!;
+        const gridColonyId = ants.currentGridColonyId[id]!;
         const flowField = entranceFlowFields.fields[colonyId];
-        const underground = world.undergroundGrids[colonyId];
+        const underground = world.undergroundGrids[gridColonyId];
         if (flowField && underground) {
           const tileX = posX >> FP_SHIFT;
           const tileY = posY >> FP_SHIFT;
@@ -2363,9 +2423,14 @@ export function tickAntMovement(
     // integer-tile comparison: if the tile under the prospective (posX, posY)
     // is impassable for this task, revert to the previous frame's position.
     // Partial-tile moves within the current tile are unaffected.
+    //
+    // Phase 09.1 Chunk 0: the passability check reads the grid the ant is
+    // currently IN (not the ant's owning colony). For Fighter invaders in
+    // enemy grids (Chunks 3+4), currentGridColonyId !== colonyId and the
+    // enemy grid's passability must apply.
     if (zone === Zone.Underground && (dx !== 0 || dy !== 0)) {
-      const colonyId = ants.colonyId[id]!;
-      const underground = world.undergroundGrids[colonyId];
+      const gridColonyId = ants.currentGridColonyId[id]!;
+      const underground = world.undergroundGrids[gridColonyId];
       if (underground) {
         const prevTileX = prevPosX >> FP_SHIFT;
         const prevTileY = prevPosY >> FP_SHIFT;
@@ -2565,9 +2630,15 @@ function resolveSameColonyOccupancy(world: WorldState): void {
 
     // Collision: a lower-id same-colony ant already claimed this tile.
     // Try to shift this ant to a passable, unclaimed adjacent tile.
+    //
+    // Phase 09.1 Chunk 0: passability reads the grid the ant is currently IN
+    // (currentGridColonyId), not the ant's owning colony. colonyId above still
+    // keys occupancy detection (same-colony ants compete for tiles regardless
+    // of where they are). Today both keys yield the same grid.
     const task = ants.task[id]! as AntTask;
+    const gridColonyId = ants.currentGridColonyId[id]!;
     const underground =
-      zone === Zone.Underground ? world.undergroundGrids[colonyId] : undefined;
+      zone === Zone.Underground ? world.undergroundGrids[gridColonyId] : undefined;
     let shifted = false;
     for (let d = 0; d < 4; d++) {
       const nx = tileX + DIR_DX[d]!;

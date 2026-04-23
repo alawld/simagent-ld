@@ -373,6 +373,10 @@ export function checkPendingChambers(world: WorldState): void {
   for (const key in world.pendingChambers) {
     if (!Object.hasOwn(world.pendingChambers, key)) continue;
     const pc = world.pendingChambers[key]!;
+    // Plan 09.1-00: `currentGridColonyId` not applicable here — a pending
+    // chamber record belongs to its own colony by construction (the record's
+    // `colonyId` IS the chamber's home grid). No ant-level grid-of-occupancy
+    // lookup required.
     const underground = world.undergroundGrids[pc.colonyId];
     if (!underground) continue;
 
@@ -428,6 +432,10 @@ export function checkEntranceCompletion(world: WorldState): void {
   for (const key in world.colonies) {
     if (!Object.hasOwn(world.colonies, key)) continue;
     const colony = world.colonies[key as unknown as ColonyId]!;
+    // Plan 09.1-00: `currentGridColonyId` not applicable here — entrances
+    // belong to the iterated colony by construction (we are checking THIS
+    // colony's entrances against THIS colony's grid). No ant-level
+    // grid-of-occupancy lookup required.
     const underground = world.undergroundGrids[colony.colonyId];
     if (!underground) continue;
 
@@ -467,6 +475,13 @@ export function tickDeadDiggerCleanup(world: WorldState): void {
     const dtx = world.ants.digTileX[id]!;
     const dty = world.ants.digTileY[id]!;
     if (dtx === -1 || dty === -1) continue; // no claimed tile
+    // Plan 09.1-00 — LATENT RISK (Research Risk E): this site uses the dead
+    // ant's owning colony (`ants.colonyId`) rather than its grid-of-occupancy
+    // (`ants.currentGridColonyId`). Byte-identical today because only diggers
+    // reach this path and diggers currently dig only inside their own colony's
+    // grid. IF FUTURE INVASION EXTENDS TO DIGGERS (cross-grid digging), switch
+    // this read to `ants.currentGridColonyId[id]` so the stale BeingDug tile
+    // is cleared in the grid where the dig was actually claimed.
     const cid = world.ants.colonyId[id]! as ColonyId;
     const ug = world.undergroundGrids[cid];
     if (!ug) continue;
