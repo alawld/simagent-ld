@@ -14,10 +14,12 @@ import {
   createViewState,
   resetViewState,
   toggleView,
+  toggleUndergroundColony,
   clampCamera,
   screenToTile,
 } from './camera.js';
 import { TILE_SIZE_PX } from './sprites.js';
+import { PLAYER_COLONY_ID, ENEMY_COLONY_ID } from '../sim/constants.js';
 
 // Convenience: default viewport camera
 function makeCamera(x: number, y: number) {
@@ -353,5 +355,103 @@ describe('screenToTile', () => {
       expect(r.tileX).toBe(tx);
       expect(r.tileY).toBe(ty);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// toggleUndergroundColony — Phase 09.1 Chunk 2 (enemy underground view)
+// ---------------------------------------------------------------------------
+//
+// Binary toggle that flips ViewState.activeUndergroundColonyId between
+// PLAYER_COLONY_ID and ENEMY_COLONY_ID so the player can inspect the enemy
+// nest before invasion (09.1 CONTEXT §Chunk 2). Mutates in place — same
+// in-place contract as toggleView and resetViewState so UIScene and input
+// handlers that hold a captured ViewState reference keep seeing the update.
+// The reducer is pure with respect to the toggle itself; the caller (the X
+// keybind handler in GameScene) is responsible for gating the dispatch on
+// activeView==='underground' so the surface view never flips colony id.
+
+describe('toggleUndergroundColony', () => {
+  it('initial createViewState sets activeUndergroundColonyId to PLAYER_COLONY_ID', () => {
+    // Fresh boot must start looking at the player's own underground — there
+    // is no session where we want the first underground Tab to surface the
+    // enemy grid. This also makes the `Your Colony` HUD label the default.
+    const vs = createViewState(24, 64);
+    expect(vs.activeUndergroundColonyId).toBe(PLAYER_COLONY_ID);
+  });
+
+  it('flips PLAYER_COLONY_ID → ENEMY_COLONY_ID on first call', () => {
+    const vs = createViewState(24, 64);
+    toggleUndergroundColony(vs);
+    expect(vs.activeUndergroundColonyId).toBe(ENEMY_COLONY_ID);
+  });
+
+  it('flips ENEMY_COLONY_ID → PLAYER_COLONY_ID on second call (idempotence)', () => {
+    const vs = createViewState(24, 64);
+    toggleUndergroundColony(vs); // → ENEMY
+    toggleUndergroundColony(vs); // → PLAYER
+    expect(vs.activeUndergroundColonyId).toBe(PLAYER_COLONY_ID);
+  });
+
+  it('double-toggle returns to the starting value (no drift)', () => {
+    const vs = createViewState(24, 64);
+    const start = vs.activeUndergroundColonyId;
+    toggleUndergroundColony(vs);
+    toggleUndergroundColony(vs);
+    expect(vs.activeUndergroundColonyId).toBe(start);
+  });
+
+  it('leaves activeView unchanged (reducer is pure w.r.t. other fields)', () => {
+    // Gating on activeView is the caller's responsibility. The reducer only
+    // touches activeUndergroundColonyId so a stray dispatch cannot silently
+    // flip the player out of the surface view.
+    const vs = createViewState(24, 64);
+    expect(vs.activeView).toBe('surface');
+    toggleUndergroundColony(vs);
+    expect(vs.activeView).toBe('surface');
+  });
+
+  it('leaves surfaceCamera and undergroundCamera positions unchanged', () => {
+    const vs = createViewState(24, 64);
+    const sx = vs.surfaceCamera.x;
+    const sy = vs.surfaceCamera.y;
+    const ux = vs.undergroundCamera.x;
+    const uy = vs.undergroundCamera.y;
+    toggleUndergroundColony(vs);
+    expect(vs.surfaceCamera.x).toBe(sx);
+    expect(vs.surfaceCamera.y).toBe(sy);
+    expect(vs.undergroundCamera.x).toBe(ux);
+    expect(vs.undergroundCamera.y).toBe(uy);
+  });
+
+  it('leaves undergroundVisited flag unchanged', () => {
+    const vs = createViewState(24, 64);
+    toggleView(vs); // → underground, visited=true
+    toggleView(vs); // → surface
+    expect(vs.undergroundVisited).toBe(true);
+    toggleUndergroundColony(vs);
+    expect(vs.undergroundVisited).toBe(true);
+  });
+
+  it('mutates the ViewState in place — preserves object identity for captured refs', () => {
+    // UIScene and input handlers capture a reference to the ViewState in
+    // create(). Reassigning a fresh object would strand those references
+    // (same failure class as the stale-world bug documented in camera.ts).
+    const vs = createViewState(24, 64);
+    const surfaceCamRef = vs.surfaceCamera;
+    const undergroundCamRef = vs.undergroundCamera;
+    toggleUndergroundColony(vs);
+    expect(vs.surfaceCamera).toBe(surfaceCamRef);
+    expect(vs.undergroundCamera).toBe(undergroundCamRef);
+  });
+
+  it('resetViewState restores activeUndergroundColonyId to PLAYER_COLONY_ID', () => {
+    // Session reset must clear the enemy-view state — a fresh game starts
+    // with `Your Colony` regardless of what the prior session was viewing.
+    const vs = createViewState(24, 64);
+    toggleUndergroundColony(vs);
+    expect(vs.activeUndergroundColonyId).toBe(ENEMY_COLONY_ID);
+    resetViewState(vs, 24, 64);
+    expect(vs.activeUndergroundColonyId).toBe(PLAYER_COLONY_ID);
   });
 });

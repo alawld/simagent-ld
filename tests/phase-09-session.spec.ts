@@ -182,3 +182,63 @@ test.describe('Phase 9 — SCEN-04 save-prompt flow', () => {
     await expect(page.locator('canvas').first()).toBeVisible();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 09.1 Chunk 2 — enemy underground toggle (X keybind + HUD label)
+//
+// Added SKIPPED in Plan 09.1-02 Task 1 to avoid RED-on-main while Task 2
+// lands the reducer + HUD label and Task 3 wires the X keybind. Task 3 flips
+// `test.skip(...)` → `test(...)` so the spec goes green the same commit the
+// keybind ships. The body is written up front so un-skipping is a one-line
+// diff, not a rewrite.
+// ---------------------------------------------------------------------------
+
+test.describe('Phase 09.1 Chunk 2 — enemy underground toggle', () => {
+  test.skip('X keybind in underground view flips HUD label between Your Colony and Enemy Colony', async ({
+    page,
+  }) => {
+    // SKIPPED until Plan 09.1-02 Task 3 wires the X keybind.
+    // When un-skipped, this exercises the full path:
+    //   Tab (surface → underground) → HUD reads "Your Colony"
+    //   X → flip → HUD reads "Enemy Colony"
+    //   X → flip back → HUD reads "Your Colony"
+    // and asserts no console errors fire during the sequence.
+    const consoleErrors: string[] = [];
+    page.on('console', (m) => { if (errorFilter(m)) consoleErrors.push(m.text()); });
+    page.on('pageerror', (e) => consoleErrors.push(e.message));
+
+    await clearSave(page);
+    await page.reload();
+    const canvas = page.locator('canvas').first();
+    await canvas.waitFor({ state: 'attached', timeout: 10_000 });
+    await page.waitForTimeout(300);
+
+    // Enter the underground view. Tab edge-triggers the view toggle per
+    // Phase 08-04 decision (JustDown). The X keybind is gated on
+    // viewState.activeView === 'underground' so it only fires from here.
+    await page.keyboard.press('Tab');
+    await page.waitForTimeout(200);
+
+    // Read the HUD label via the __phase9_ui hook. Plan 09.1-02 Task 2
+    // extends the hook with `activeUndergroundLabel: 'Your Colony' | 'Enemy Colony'`
+    // so Playwright doesn't need OCR against the canvas.
+    const readLabel = async (): Promise<string | undefined> => {
+      return page.evaluate(() => {
+        const w = window as unknown as { __phase9_ui?: { activeUndergroundLabel?: string } };
+        return w.__phase9_ui?.activeUndergroundLabel;
+      }) as Promise<string | undefined>;
+    };
+
+    await expect.poll(readLabel, { timeout: 5_000 }).toBe('Your Colony');
+
+    await page.keyboard.press('x');
+    await page.waitForTimeout(150);
+    await expect.poll(readLabel, { timeout: 5_000 }).toBe('Enemy Colony');
+
+    await page.keyboard.press('x');
+    await page.waitForTimeout(150);
+    await expect.poll(readLabel, { timeout: 5_000 }).toBe('Your Colony');
+
+    expect(consoleErrors, consoleErrors.join('\n')).toHaveLength(0);
+  });
+});
