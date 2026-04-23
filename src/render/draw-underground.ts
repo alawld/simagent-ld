@@ -1,8 +1,11 @@
 // draw-underground.ts — Phase 8 underground cross-section drawing module.
 //
 // Pure functions: take a GfxLike + AntSpriteLayer + WorldState snapshots,
-// issue Graphics API calls and AntSpriteLayer.drawAnt calls. Renders ONLY
-// the player colony's underground grid (PRD §7b — enemy grids are not drawn).
+// issue Graphics API calls and AntSpriteLayer.drawAnt calls. Renders the
+// currently-viewed colony's underground grid (09.1 Chunk 2 replaced the
+// Phase 8 "player only" contract from PRD §7b with a per-view contract,
+// driven by the `activeUndergroundColonyId` parameter defaulting to
+// PLAYER_COLONY_ID for backward compat).
 //
 // Non-ant primitives use ONLY Graphics: fillRect, fillCircle, strokeCircle,
 // fillTriangle, lineStyle, fillStyle. Ants go through the AntSpriteLayer —
@@ -20,6 +23,7 @@ import { ugGet, UndergroundTileState } from '../sim/terrain.js';
 import { isAlive } from '../sim/ant/ant-store.js';
 import { FP_SHIFT, FP_ONE } from '../sim/fixed.js';
 import { PLAYER_COLONY_ID, FOOD_CHAMBER_CAPACITY } from '../sim/constants.js';
+import type { ColonyId } from '../sim/colony/colony-store.js';
 import { ChamberType } from '../sim/enums.js';
 import { CHAMBER_DIMENSIONS } from '../sim/colony/chamber.js';
 import type { WorldState } from '../sim/types.js';
@@ -36,6 +40,7 @@ import {
   COLOR_CHAMBER_FOOD_STORAGE,
   COLOR_CHAMBER_FOOD_STORAGE_FILL,
   COLOR_PLAYER_COLONY,
+  COLOR_ENEMY_COLONY,
   COLOR_QUEEN_OUTLINE,
 } from './sprites.js';
 import type { CameraState } from './camera.js';
@@ -89,7 +94,7 @@ export function projectFoodStorageFill(colony: ColonyRecord, chamberId: number):
 // ---------------------------------------------------------------------------
 
 /**
- * Draw the underground terrain tiles for the player colony's grid.
+ * Draw the underground terrain tiles for the currently-viewed colony's grid.
  *
  * Ceiling strip (ty=0): drawn with COLOR_UNDERGROUND_CEILING_STRIP everywhere,
  * except at entrance surfaceTileX positions where COLOR_UNDERGROUND_OPEN is used.
@@ -97,11 +102,21 @@ export function projectFoodStorageFill(colony: ColonyRecord, chamberId: number):
  * Interior (ty≥1): Solid → solid color; Open → open color; Marked → open + overlay;
  * BeingDug → open + overlay (PRD §7e, UNDR-09).
  *
- * Returns immediately if the player colony's underground grid is undefined (safety
- * for early game states — T-08-06 mitigate).
+ * Returns immediately if the viewed colony's underground grid is undefined
+ * (safety for early game states — T-08-06 mitigate, and before createScenario
+ * completes for the enemy grid).
+ *
+ * @param activeUndergroundColonyId - 09.1 Chunk 2. Which colony's underground
+ *   grid to render (grid data + entrance positions). Defaults to
+ *   PLAYER_COLONY_ID so existing test fixtures keep their behavior.
  */
-export function drawUndergroundTerrain(gfx: GfxLike, world: WorldState, cam: CameraState): void {
-  const grid = world.undergroundGrids[PLAYER_COLONY_ID];
+export function drawUndergroundTerrain(
+  gfx: GfxLike,
+  world: WorldState,
+  cam: CameraState,
+  activeUndergroundColonyId: ColonyId = PLAYER_COLONY_ID,
+): void {
+  const grid = world.undergroundGrids[activeUndergroundColonyId];
   if (grid === undefined) return;
 
   const left   = Math.floor(cam.x - cam.viewportWidth  / 2);
@@ -109,8 +124,10 @@ export function drawUndergroundTerrain(gfx: GfxLike, world: WorldState, cam: Cam
   const right  = Math.min(left + cam.viewportWidth  + 1, grid.width);
   const bottom = Math.min(top  + cam.viewportHeight + 1, grid.height);
 
-  // Collect entrance X positions for ceiling gap rendering
-  const colony = world.colonies[PLAYER_COLONY_ID];
+  // Collect entrance X positions for ceiling gap rendering — uses the viewed
+  // colony's entrances so the player sees enemy entrances when inspecting the
+  // enemy underground.
+  const colony = world.colonies[activeUndergroundColonyId];
   const entranceXSet = new Set<number>();
   if (colony?.entrances) {
     for (const entrance of colony.entrances) {
@@ -172,9 +189,20 @@ export function drawUndergroundTerrain(gfx: GfxLike, world: WorldState, cam: Cam
 /**
  * Draw chambers, ants, queen, eggs, and larvae in the underground view.
  *
- * Renders ONLY the player colony (PRD §7b — no enemy entity rendering).
+ * Renders the currently-viewed colony's chambers + brood + queen (09.1 Chunk 2
+ * replaces the Phase 8 "player only" contract from PRD §7b with a per-view
+ * contract). Ants are filtered by `ants.currentGridColonyId` rather than
+ * `ants.colonyId` so player Fighters inside the enemy grid still render when
+ * the player is inspecting the enemy underground (Research Risk D — depends
+ * on Chunk 0's grid-of-occupancy byte).
+ *
  * Ant posX = surface X coordinate; posY = depth (PRD §7e / Pitfall 6).
  * Moving entities (ants) are interpolated between prev and curr at alpha.
+ *
+ * @param activeUndergroundColonyId - 09.1 Chunk 2. Which colony's underground
+ *   grid the player is viewing. Drives chamber / queen / brood rendering and
+ *   the ant grid-occupancy filter. Defaults to PLAYER_COLONY_ID for backward
+ *   compat with existing test fixtures.
  */
 export function drawUndergroundEntities(
   gfx: GfxLike,
@@ -183,8 +211,9 @@ export function drawUndergroundEntities(
   curr: WorldState,
   alpha: number,
   cam: CameraState,
+  activeUndergroundColonyId: ColonyId = PLAYER_COLONY_ID,
 ): void {
-  const colony = curr.colonies[PLAYER_COLONY_ID];
+  const colony = curr.colonies[activeUndergroundColonyId];
   if (colony === undefined) return;
 
   const left = Math.floor(cam.x - cam.viewportWidth  / 2);
@@ -254,7 +283,16 @@ export function drawUndergroundEntities(
     }
   }
 
-  // --- Underground ants (zone === 1, player colony only per PRD §7b) ---
+  // --- Underground ants (zone === 1, filtered by grid-of-occupancy) ---
+  //
+  // 09.1 Chunk 2 (Research Risk D): filter by `ants.currentGridColonyId` not
+  // `ants.colonyId`. The viewer should see every ant currently IN the viewed
+  // grid regardless of which colony owns them — so player Fighters that
+  // descended into the enemy nest (Chunk 3) render when we're looking at the
+  // enemy underground, and enemy ants that somehow end up in the player's
+  // grid would render too (symmetric). Per RESEARCH.md §draw-underground.ts
+  // hardcoded sites and 09.1-00-SUMMARY (Chunk 0 descent-write invariant).
+  //
   // Wrong-plane flicker guard (09 render polish): mirror draw-surface. When
   // prev.zone !== curr.zone (queen descending/ascending through an entrance)
   // or the slot wasn't alive in prev (freshly-spawned ant whose prev.posX/Y
@@ -264,7 +302,7 @@ export function drawUndergroundEntities(
   for (let id = 0; id < maxId; id++) {
     if (!isAlive(curr.ants, id)) continue;
     if (curr.ants.zone[id] !== 1) continue; // underground only
-    if (curr.ants.colonyId[id] !== PLAYER_COLONY_ID) continue; // no enemy leak
+    if (curr.ants.currentGridColonyId[id] !== activeUndergroundColonyId) continue; // grid-of-occupancy filter
 
     const useInterp = isAlive(prev.ants, id) && prev.ants.zone[id] === curr.ants.zone[id];
 
@@ -295,12 +333,26 @@ export function drawUndergroundEntities(
     const dy = currPxY - prevPxY;
     const rotation = (!useInterp || Math.abs(dx) + Math.abs(dy) < 0.01) ? 0 : Math.atan2(-dy, -dx);
 
+    // Queen identity: the only queen who legitimately occupies this grid is
+    // the grid-owner's queen (queens never invade per 09.1 design). isQueen
+    // by-id comparison against the VIEWED colony's queenEntityId is correct
+    // regardless of which colony we're viewing. A player Fighter wearing the
+    // enemy queen's id would be impossible — world-global nextEntityId.
     const isQueen = id === colony.queenEntityId;
+
+    // Tint by OWNING colony (colonyId) not by grid-of-occupancy. A player
+    // Fighter invading the enemy nest (Chunk 3) must still render in the
+    // player colour so the player can follow their own ant into the enemy
+    // grid visually. Symmetric for any enemy ant that ever occupies the
+    // player grid. Uses colonyId, NOT currentGridColonyId (09.1 Chunk 0
+    // distinction — grid-of-occupancy vs colony identity).
+    const owningColonyId = curr.ants.colonyId[id];
+    const tint = owningColonyId === PLAYER_COLONY_ID ? COLOR_PLAYER_COLONY : COLOR_ENEMY_COLONY;
     sprites.drawAnt({
       kind: isQueen ? 'queen' : 'worker',
       x: screenX,
       y: screenY,
-      tint: COLOR_PLAYER_COLONY,
+      tint,
       rotation,
     });
   }
@@ -349,6 +401,10 @@ function drawBrood(
  *
  * Note: pheromone overlay is drawn by GameScene between terrain and entities;
  * it is NOT called from here.
+ *
+ * @param activeUndergroundColonyId - 09.1 Chunk 2. Which colony's underground
+ *   grid to render. Threaded through terrain + entities. Defaults to
+ *   PLAYER_COLONY_ID for backward compat with existing test fixtures.
  */
 export function drawUnderground(
   gfx: GfxLike,
@@ -357,7 +413,8 @@ export function drawUnderground(
   curr: WorldState,
   alpha: number,
   cam: CameraState,
+  activeUndergroundColonyId: ColonyId = PLAYER_COLONY_ID,
 ): void {
-  drawUndergroundTerrain(gfx, curr, cam);
-  drawUndergroundEntities(gfx, sprites, prev, curr, alpha, cam);
+  drawUndergroundTerrain(gfx, curr, cam, activeUndergroundColonyId);
+  drawUndergroundEntities(gfx, sprites, prev, curr, alpha, cam, activeUndergroundColonyId);
 }

@@ -35,6 +35,7 @@ import {
   UNDERGROUND_GRID_WIDTH,
   SURFACE_GRID_WIDTH,
   SURFACE_GRID_HEIGHT,
+  PLAYER_COLONY_ID,
 } from '../sim/constants.js';
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ function makeViewState(
       viewportHeight: VIEWPORT_HEIGHT_TILES,
     },
     undergroundVisited: false,
+    activeUndergroundColonyId: PLAYER_COLONY_ID,
   };
 }
 

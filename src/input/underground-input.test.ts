@@ -52,6 +52,7 @@ function makeViewState(
     surfaceCamera: { x: camX, y: camY, viewportWidth: VIEWPORT_WIDTH_TILES, viewportHeight: VIEWPORT_HEIGHT_TILES },
     undergroundCamera: { x: camX, y: camY, viewportWidth: VIEWPORT_WIDTH_TILES, viewportHeight: VIEWPORT_HEIGHT_TILES },
     undergroundVisited: true,
+    activeUndergroundColonyId: PLAYER_COLONY_ID,
   };
 }
 

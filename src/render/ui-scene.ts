@@ -26,7 +26,7 @@ import type { WorldState } from '../sim/types.js';
 import { HUD } from './sprites.js';
 import { GameOutcome } from '../sim/game-over.js';
 import { formatOutcomeTitle, formatKillStatsSubtitle } from './ui-scene-logic.js';
-import { PLAYER_COLONY_ID as _PLAYER_COLONY_ID } from '../sim/constants.js';
+import { PLAYER_COLONY_ID as _PLAYER_COLONY_ID, ENEMY_COLONY_ID } from '../sim/constants.js';
 
 // Re-export pure helpers for Plan 07 and external consumers
 export { formatOutcomeTitle, formatKillStatsSubtitle };
@@ -37,17 +37,44 @@ export { formatOutcomeTitle, formatKillStatsSubtitle };
 
 export type ActiveOverlay = 'none' | 'save-prompt' | 'game-over';
 
+// Phase 09.1 Chunk 2 — enemy underground observability. Exposed via the same
+// __phase9_ui global so Playwright can read which colony the underground view
+// is currently scoped to without OCR against the canvas-drawn HUD.
+export type ActiveUndergroundLabel = 'Your Colony' | 'Enemy Colony';
+
 declare global {
   interface Window {
-    __phase9_ui?: { activeOverlay: ActiveOverlay };
+    __phase9_ui?: {
+      activeOverlay: ActiveOverlay;
+      activeUndergroundLabel?: ActiveUndergroundLabel;
+    };
   }
 }
 
 /** Publishes current overlay state to window.__phase9_ui for Playwright observability.
- *  Guarded by typeof window check so Vitest (Node) contexts don't crash. */
+ *  Guarded by typeof window check so Vitest (Node) contexts don't crash.
+ *  Preserves activeUndergroundLabel if already set by setActiveUndergroundLabel. */
 function setActiveOverlay(next: ActiveOverlay): void {
   if (typeof window !== 'undefined') {
-    window.__phase9_ui = { activeOverlay: next };
+    const prev = window.__phase9_ui;
+    window.__phase9_ui = {
+      activeOverlay: next,
+      ...(prev?.activeUndergroundLabel !== undefined
+        ? { activeUndergroundLabel: prev.activeUndergroundLabel }
+        : {}),
+    };
+  }
+}
+
+/** Publishes the current underground colony label for Playwright observability.
+ *  Preserves activeOverlay if already set. Called every UIScene.update() frame. */
+function setActiveUndergroundLabel(next: ActiveUndergroundLabel): void {
+  if (typeof window !== 'undefined') {
+    const prev = window.__phase9_ui;
+    window.__phase9_ui = {
+      activeOverlay: prev?.activeOverlay ?? 'none',
+      activeUndergroundLabel: next,
+    };
   }
 }
 
@@ -143,6 +170,10 @@ export class UIScene extends Phaser.Scene {
   private queenLabelText!: Phaser.GameObjects.Text;
   private triangleLabels!: Phaser.GameObjects.Text[];
   private viewToggleText!: Phaser.GameObjects.Text;
+  // Phase 09.1 Chunk 2 — underground colony label. Visible only when
+  // viewState.activeView === 'underground'. Reads 'Your Colony' vs
+  // 'Enemy Colony' from viewState.activeUndergroundColonyId each frame.
+  private undergroundLabelText!: Phaser.GameObjects.Text;
   private contextMenuLabels!: Phaser.GameObjects.Text[];
   // Snapshot of the items last rendered so pointerdown hit-testing (which fires
   // BEFORE the next update frame) uses the same filtered list the player saw.
@@ -236,6 +267,21 @@ export class UIScene extends Phaser.Scene {
     );
     this.viewToggleText.setPadding(4);
     this.viewToggleText.setScrollFactor(0);
+
+    // Phase 09.1 Chunk 2 — underground colony label. Placed above the
+    // view-toggle button (HUD.VIEW_TOGGLE at y=396) so both pieces of
+    // underground chrome live in the same corner. Visibility is bound to
+    // activeView === 'underground' in update(); text follows
+    // activeUndergroundColonyId (binary toggle via X keybind).
+    this.undergroundLabelText = this.add.text(
+      HUD.VIEW_TOGGLE.x,
+      HUD.VIEW_TOGGLE.y - 18,
+      'Your Colony',
+      { color: '#ffffff', fontSize: '12px', backgroundColor: '#000000' },
+    );
+    this.undergroundLabelText.setPadding(4);
+    this.undergroundLabelText.setScrollFactor(0);
+    this.undergroundLabelText.setVisible(false);
 
     // Context menu item labels — created once, positioned/shown per frame.
     // One Phaser.Text per ChamberType (Queen / Nursery / Food Storage) so the
@@ -495,6 +541,22 @@ export class UIScene extends Phaser.Scene {
     this.viewToggleText.setText(
       this.viewState.activeView === 'surface' ? 'Underground >' : '< Surface',
     );
+
+    // Phase 09.1 Chunk 2 — underground colony label. Only visible in the
+    // underground view; driven by the binary toggle reducer in camera.ts.
+    // Published to window.__phase9_ui.activeUndergroundLabel every frame the
+    // label is visible so Playwright can poll it without OCR.
+    const undergroundLabel: ActiveUndergroundLabel =
+      this.viewState.activeUndergroundColonyId === ENEMY_COLONY_ID
+        ? 'Enemy Colony'
+        : 'Your Colony';
+    this.undergroundLabelText.setText(undergroundLabel);
+    this.undergroundLabelText.setVisible(
+      this.viewState.activeView === 'underground',
+    );
+    // Expose regardless of visibility so tests can assert the underlying
+    // toggle state even if the surface view is active. Cheap string write.
+    setActiveUndergroundLabel(undergroundLabel);
 
     // Ant-activity popup — live refresh when visible. Drawn before the
     // context menu so a visible chamber menu stays on top (the underground

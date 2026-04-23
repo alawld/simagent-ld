@@ -7,6 +7,8 @@
 // Pure TypeScript functions, fully testable under Node + Vitest.
 
 import { TILE_SIZE_PX } from './sprites.js';
+import { PLAYER_COLONY_ID, ENEMY_COLONY_ID } from '../sim/constants.js';
+import type { ColonyId } from '../sim/colony/colony-store.js';
 
 // Suppress unused import warning — TILE_SIZE_PX is used in screenToTile below.
 void TILE_SIZE_PX;
@@ -96,6 +98,20 @@ export interface ViewState {
    * toggle to underground only.
    */
   undergroundVisited: boolean;
+  /**
+   * 09.1 Chunk 2 — which colony's underground grid the player is currently
+   * viewing. Defaults to PLAYER_COLONY_ID on fresh boot and after
+   * resetViewState. Toggled between PLAYER and ENEMY by the X keybind (via
+   * toggleUndergroundColony) while activeView === 'underground'. 09.1 has
+   * exactly two colonies, so a binary flip is sufficient; future N-colony
+   * expansion is out of scope per 09.1-CONTEXT.
+   *
+   * draw-underground.ts reads this field for all four grid-keyed lookups
+   * (grid, entrances, chambers, ant filter). Ant filter also consults
+   * ants.currentGridColonyId so player Fighters inside the enemy grid
+   * still render (Research Risk D, Chunk 0 dependency).
+   */
+  activeUndergroundColonyId: ColonyId;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +148,9 @@ export function createViewState(startTileX: number, startTileY: number): ViewSta
       viewportHeight: VIEWPORT_HEIGHT_TILES,
     },
     undergroundVisited: false,
+    // 09.1 Chunk 2 — fresh boot always starts looking at the player's own
+    // underground so the first Tab to underground shows "Your Colony".
+    activeUndergroundColonyId: PLAYER_COLONY_ID,
   };
 }
 
@@ -165,6 +184,10 @@ export function resetViewState(
   viewState.undergroundCamera.viewportWidth = VIEWPORT_WIDTH_TILES;
   viewState.undergroundCamera.viewportHeight = VIEWPORT_HEIGHT_TILES;
   viewState.undergroundVisited = false;
+  // 09.1 Chunk 2 — restart always re-anchors the underground view on the
+  // player's own grid. Save files do not persist which enemy nest was being
+  // inspected, so continue-from-save also defaults to "Your Colony".
+  viewState.activeUndergroundColonyId = PLAYER_COLONY_ID;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +224,36 @@ export function toggleView(viewState: ViewState): void {
     viewState.surfaceCamera.x = viewState.undergroundCamera.x;
     viewState.activeView = 'surface';
   }
+}
+
+// ---------------------------------------------------------------------------
+// toggleUndergroundColony — 09.1 Chunk 2
+// ---------------------------------------------------------------------------
+
+/**
+ * toggleUndergroundColony — flip `activeUndergroundColonyId` between the
+ * player's colony and the enemy's colony.
+ *
+ * Binary toggle: 09.1 has exactly 2 colonies, so flipping between
+ * PLAYER_COLONY_ID and ENEMY_COLONY_ID is sufficient. Any future N-colony
+ * expansion should replace this helper with a parameterized version (cycle
+ * forward / set explicit).
+ *
+ * The caller (game-scene.ts X-keybind handler) must gate dispatch on
+ * `activeView === 'underground'`. The reducer itself is pure with respect
+ * to other fields — it only touches `activeUndergroundColonyId`, so a stray
+ * dispatch while on the surface view cannot flip the player out of surface
+ * mode. Mutates in place so UIScene and input handlers that captured a
+ * reference to the ViewState in create() keep seeing the update (same
+ * in-place contract as toggleView / resetViewState).
+ *
+ * @param viewState - The current ViewState to toggle
+ */
+export function toggleUndergroundColony(viewState: ViewState): void {
+  viewState.activeUndergroundColonyId =
+    viewState.activeUndergroundColonyId === PLAYER_COLONY_ID
+      ? ENEMY_COLONY_ID
+      : PLAYER_COLONY_ID;
 }
 
 // ---------------------------------------------------------------------------

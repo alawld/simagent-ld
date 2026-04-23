@@ -424,7 +424,15 @@ export class GameScene extends Phaser.Scene {
           : null;
       drawSurface(gfx, this.antSprites, this.prevState, this.world, alpha, cam, pending);
     } else {
-      drawUnderground(gfx, this.antSprites, this.prevState, this.world, alpha, cam);
+      drawUnderground(
+        gfx,
+        this.antSprites,
+        this.prevState,
+        this.world,
+        alpha,
+        cam,
+        this.viewState.activeUndergroundColonyId,
+      );
     }
     this.antSprites.endFrame();
 
