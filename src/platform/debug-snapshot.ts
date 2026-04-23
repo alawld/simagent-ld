@@ -53,6 +53,12 @@ export type MovementSource =
 export interface AntTraceRow {
   antId: number;
   colonyId: number;
+  /** Grid-of-occupancy byte from ants.currentGridColonyId (Phase 09.1-00).
+   *  Equals colonyId for all non-invasion scenarios; diverges during Phase
+   *  09.1 invasion when a Fighting ant enters a foreign underground grid.
+   *  Exposing it in the snapshot lets readers see at a glance which ants are
+   *  inside a foreign grid without re-deriving from tile coordinates. */
+  currentGridColonyId: number;
   task: number;
   subTask: number;
   zone: number;
@@ -273,6 +279,7 @@ export function buildAntTrace(world: WorldState, antId: number): AntTraceRow {
   return {
     antId,
     colonyId,
+    currentGridColonyId: a.currentGridColonyId[antId]!,
     task: a.task[antId]!,
     subTask: a.subTask[antId]!,
     zone: a.zone[antId]!,
