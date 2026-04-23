@@ -19,8 +19,11 @@ import {
   STARVATION_GRACE_TICKS,
   PLAYER_COLONY_ID,
   ENEMY_COLONY_ID,
+  ENEMY_START_X,
+  ENEMY_START_Y,
 } from './constants.js';
-import { FP_SHIFT } from './fixed.js';
+import { FP_SHIFT, FP_ONE } from './fixed.js';
+import { Zone, UndergroundTileState, ugSet } from './terrain.js';
 import type { WorldState } from './types.js';
 import type { SimCommand } from './commands.js';
 import type { ColonyId } from './colony/colony-store.js';
@@ -552,4 +555,148 @@ describe('Phase 9 determinism (SC 5) — two-colony parity', () => {
     }
     expect(worldA.rngState).toBe(worldB.rngState);
   }, 15_000);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 09.1 Chunk 4 (plan 09.1-04) — cross-grid combat parity (REQ-C4c)
+// ---------------------------------------------------------------------------
+//
+// The generic two-colony parity cases above do NOT exercise the Chunk-4
+// tile-key extension (makeTileKey's new gridColonyId byte) because their
+// scenarios never produce an ant with `ants.currentGridColonyId[id] !==
+// ants.colonyId[id]` — i.e., no ant descends into a FOREIGN underground grid.
+// Without that divergence, the new gridByte in the bucket key is always 0 for
+// underground ants and the cross-grid bucketing path goes untested.
+//
+// This describe block stages an explicit cross-grid scenario: a player Fighting
+// ant standing on the enemy entrance tile descends (Chunk 3 descent-intent
+// gate) and the `currentGridColonyId` byte flips to ENEMY_COLONY_ID. Inside
+// the foreign grid it engages combat with a pre-placed enemy hostile (Chunk 4
+// tile-key extension buckets them together correctly).
+//
+// MANDATORY divergence guard at midTick: at least one underground ant must
+// have `currentGridColonyId !== colonyId`. If that guard ever fails, the
+// scenario is no longer exercising cross-grid bucketing and the parity check
+// is no longer proving REQ-C4c — fail loudly rather than silently pass.
+
+/**
+ * Stage a cross-grid combat scenario on top of `createScenario`. Returns the
+ * world. The invader is placed on the enemy entrance tile (Surface) with
+ * task=Fighting; a hostile is pinned inside the enemy grid's foreign
+ * corridor; an open rectangle is carved from the enemy entrance column to
+ * the hostile so the invader's greedy-Manhattan stepper can reach it.
+ *
+ * Same pattern as invasion-routing.test.ts's distance-decrease scenario — we
+ * reuse it here specifically to exercise Chunk-4 cross-grid combat bucketing.
+ */
+function buildCrossGridCombatWorld(seed: number): WorldState {
+  const world = createScenario(seed);
+
+  // Spawn 1 player Fighter on the enemy entrance tile (Surface).
+  const playerAntId = allocateEntityId(world);
+  initAnt(world.ants, playerAntId, {
+    colonyId: PLAYER_COLONY_ID,
+    posX:     (ENEMY_START_X << FP_SHIFT) + (FP_ONE >> 1),
+    posY:     (ENEMY_START_Y << FP_SHIFT) + (FP_ONE >> 1),
+    task:     AntTask.Fighting,
+    subTask:  0,
+    speed:    WORKER_BASE_SPEED,
+    lifespan: WORKER_LIFESPAN_TICKS,
+    zone:     Zone.Surface,
+  });
+  world.colonies[PLAYER_COLONY_ID]!.workers.push(playerAntId);
+  world.colonies[PLAYER_COLONY_ID]!.workerCount += 1;
+
+  // Pin an enemy hostile a few tiles east + below the entrance shaft.
+  const hostileTileX = ENEMY_START_X + 3;
+  const hostileTileY = 5;
+  const hostileId = allocateEntityId(world);
+  initAnt(world.ants, hostileId, {
+    colonyId: ENEMY_COLONY_ID,
+    posX:     (hostileTileX << FP_SHIFT) + (FP_ONE >> 1),
+    posY:     (hostileTileY << FP_SHIFT) + (FP_ONE >> 1),
+    task:     AntTask.Idle,
+    subTask:  0,
+    speed:    0, // pinned — keeps the test scenario stable and combat-reachable
+    lifespan: WORKER_LIFESPAN_TICKS,
+    zone:     Zone.Underground,
+  });
+  world.ants.currentGridColonyId[hostileId] = ENEMY_COLONY_ID;
+  world.colonies[ENEMY_COLONY_ID]!.workers.push(hostileId);
+  world.colonies[ENEMY_COLONY_ID]!.workerCount += 1;
+
+  // Carve an open rectangle in the enemy grid from shaft column to hostile.
+  // createScenario pre-excavates the shaft (y=0..1); we widen it so
+  // greedy-Manhattan stepping doesn't pin at an elbow (same rationale as
+  // invasion-routing's distance-decrease test).
+  const enemyGrid = world.undergroundGrids[ENEMY_COLONY_ID]!;
+  for (let y = 0; y <= hostileTileY; y++) {
+    for (let x = ENEMY_START_X; x <= hostileTileX; x++) {
+      ugSet(enemyGrid, x, y, UndergroundTileState.Open);
+    }
+  }
+
+  return world;
+}
+
+describe('Phase 09.1 Chunk 4 — cross-grid combat parity (REQ-C4c)', () => {
+  // Seed and tick budget chosen so descent + combat + cleanup all occur
+  // inside the parity window AND the divergence guard at midTick finds an
+  // ant with currentGridColonyId != colonyId.
+  //
+  // Seed 31337 chosen empirically: produces a descent around t≈3-5 ticks
+  // (one pass through tickAntMovement's descent block with scenario's
+  // default PRNG rolls — not rng-dependent for the descent itself since
+  // the gate is deterministic on task+entrance state), keeps the invader
+  // alive long enough to reach the midTick check, and matches the cadence
+  // used by the neighbouring parity cases above.
+  const SEED = 31337;
+  const N = 500;
+  // MID_TICK chosen to be AFTER descent (zone flip is t=1 in this scenario)
+  // but BEFORE the invader is killed in combat (combat resolves around t=11 per
+  // debug trace). At t=10 the invader is alive, Underground, in the enemy grid
+  // — divergence guard has a live subject to find.
+  const MID_TICK = 10;
+
+  it('cross-grid parity: same seed produces identical serialization with divergence guard active', () => {
+    const worldA = buildCrossGridCombatWorld(SEED);
+    const worldB = buildCrossGridCombatWorld(SEED);
+
+    // Run to midTick, capture divergence guard state from worldA.
+    for (let i = 0; i < MID_TICK; i++) {
+      tick(worldA, []);
+      tick(worldB, []);
+    }
+
+    // MANDATORY divergence guard: at least one underground ant has
+    // currentGridColonyId != colonyId. If this fails, the scenario isn't
+    // actually exercising cross-grid bucketing — parity alone could then
+    // pass trivially without ever touching the Chunk-4 extension.
+    let anyDiverged = false;
+    let playerFighterInEnemyGrid = false;
+    for (let id = 0; id < worldA.ants.alive.length; id++) {
+      if (worldA.ants.alive[id] !== 1) continue;
+      if (worldA.ants.zone[id] !== Zone.Underground) continue;
+      const owner = worldA.ants.colonyId[id];
+      const grid  = worldA.ants.currentGridColonyId[id];
+      if (owner !== grid) {
+        anyDiverged = true;
+        if (owner === PLAYER_COLONY_ID && grid === ENEMY_COLONY_ID) {
+          playerFighterInEnemyGrid = true;
+        }
+      }
+    }
+    expect(anyDiverged).toBe(true);
+    expect(playerFighterInEnemyGrid).toBe(true);
+
+    // Parity check midrun — catches drift BEFORE the full run.
+    expect(serializeWorldState(worldA)).toBe(serializeWorldState(worldB));
+
+    // Run the rest of the budget, then re-check parity at t=N.
+    for (let i = MID_TICK; i < N; i++) {
+      tick(worldA, []);
+      tick(worldB, []);
+    }
+    expect(serializeWorldState(worldA)).toBe(serializeWorldState(worldB));
+  }, 30_000);
 });
