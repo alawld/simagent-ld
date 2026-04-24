@@ -3,7 +3,20 @@
   "version": "0.0.1",
   "private": true,
   "description": "A modern ant colony simulation game — spiritual successor to SimAnt (1991)",
+  "license": "AGPL-3.0-or-later",
+  "author": "Rob Ogilvie",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LightAxe/subterrans.git"
+  },
+  "homepage": "https://github.com/LightAxe/subterrans#readme",
+  "bugs": {
+    "url": "https://github.com/LightAxe/subterrans/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
