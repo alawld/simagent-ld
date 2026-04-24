@@ -25,13 +25,21 @@
 import { describe, it, expect } from 'vitest';
 import { tick } from './tick.js';
 import { updateFightAntTargets } from './ant/ant-system.js';
+import { createScenario } from './scenario.js';
 import { createWorldState, allocateEntityId } from './types.js';
 import { createColonyRecord } from './colony/colony-store.js';
 import { initAnt } from './ant/ant-store.js';
 import { AntTask, FightingSubState } from './enums.js';
 import { Zone } from './terrain.js';
 import { FP_SHIFT, FP_ONE } from './fixed.js';
-import { WORKER_BASE_SPEED, WORKER_LIFESPAN_TICKS } from './constants.js';
+import {
+  WORKER_BASE_SPEED,
+  WORKER_LIFESPAN_TICKS,
+  PLAYER_COLONY_ID,
+  ENEMY_COLONY_ID,
+  ENEMY_START_X,
+  ENEMY_START_Y,
+} from './constants.js';
 import type { WorldState } from './types.js';
 import type { ColonyId } from './colony/colony-store.js';
 
@@ -300,5 +308,201 @@ describe('fighter rally hold — anti-oscillation (snapshot-reproduction bug)', 
     // Outcome — outside radius → target is the rally tile center fp.
     expect(world.ants.targetPosX[id]).toBe((RALLY_X << FP_SHIFT) + (FP_ONE >> 1));
     expect(world.ants.targetPosY[id]).toBe((RALLY_Y << FP_SHIFT) + (FP_ONE >> 1));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: rally-on-entrance must NOT trigger hold-radius (invasion path)
+//
+// Bug: when a player places the rally marker directly on an enemy open
+// entrance, fighters approaching get within Manhattan radius 2 and the
+// hold-radius code above clears their target to -1, stranding them 1-2
+// tiles short of the entrance. The Surface→Underground descent block in
+// tickAntMovement only fires when the ant is PHYSICALLY ON the entrance
+// tile, so the fighters never descend and the invasion fails.
+//
+// Fix: updateFightAntTargets precomputes, once per call, a per-colony map
+// of "does this colony's rally point coincide with any colony's open
+// entrance tile?" If yes, the hold-radius suppression is skipped for that
+// colony's fighters — they must walk onto the exact tile to trigger
+// descent (or defensive descent, for rally-on-own-entrance).
+//
+// These tests exercise the 2-colony invasion case. Existing Tests 1-5
+// above use a single-colony world with entrances=[], so the carve-out
+// does NOT fire and the hold-radius still governs them.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a 2-colony world using createScenario (which pre-excavates each
+ * colony's shaft so entrance.isOpen=true). Set the player colony's rally
+ * point to the enemy entrance tile. Spawn N player Fighting ants at the
+ * provided surface tiles.
+ *
+ * Returns fighter ids plus the enemy entrance tile coords (which are also
+ * the rally tile coords — that's the whole point of the test).
+ */
+interface InvasionRallyWorld {
+  world:        WorldState;
+  fighterIds:   number[];
+  rallyTileX:   number;
+  rallyTileY:   number;
+}
+
+function buildInvasionRallyWorld(
+  startTiles: Array<readonly [number, number]>,
+  seed = 42,
+): InvasionRallyWorld {
+  const world = createScenario(seed);
+
+  const rallyTileX = ENEMY_START_X;
+  const rallyTileY = ENEMY_START_Y;
+
+  // Rally the PLAYER colony onto the enemy entrance tile.
+  world.colonies[PLAYER_COLONY_ID]!.rallyPoint = {
+    tileX: rallyTileX,
+    tileY: rallyTileY,
+  };
+
+  // Sanity: enemy entrance is already open by createScenario.
+  const enemyEntrances = world.colonies[ENEMY_COLONY_ID]!.entrances;
+  if (enemyEntrances.length !== 1) {
+    throw new Error(`expected exactly 1 enemy entrance, got ${enemyEntrances.length}`);
+  }
+  if (!enemyEntrances[0]!.isOpen) {
+    throw new Error('expected enemy entrance to be open');
+  }
+  if (enemyEntrances[0]!.surfaceTileX !== rallyTileX
+      || enemyEntrances[0]!.surfaceTileY !== rallyTileY) {
+    throw new Error('expected enemy entrance to be at (ENEMY_START_X, ENEMY_START_Y)');
+  }
+
+  // Spawn player Fighting ants at the given start tiles.
+  const fighterIds: number[] = [];
+  for (const [tx, ty] of startTiles) {
+    const id = allocateEntityId(world);
+    initAnt(world.ants, id, {
+      colonyId: PLAYER_COLONY_ID,
+      posX:     (tx << FP_SHIFT) + (FP_ONE >> 1),
+      posY:     (ty << FP_SHIFT) + (FP_ONE >> 1),
+      task:     AntTask.Fighting,
+      subTask:  FightingSubState.MovingToRally,
+      speed:    WORKER_BASE_SPEED,
+      lifespan: WORKER_LIFESPAN_TICKS,
+      zone:     Zone.Surface,
+    });
+    world.colonies[PLAYER_COLONY_ID]!.workers.push(id);
+    world.colonies[PLAYER_COLONY_ID]!.workerCount += 1;
+    fighterIds.push(id);
+  }
+
+  return { world, fighterIds, rallyTileX, rallyTileY };
+}
+
+describe('fighter rally hold — carve out rally-on-entrance (invasion regression)', () => {
+  it('Test 6: single fighter rallied on enemy entrance reaches the exact tile and descends', () => {
+    // Start the fighter 5 tiles west of the rally/entrance on surface. At
+    // WORKER_BASE_SPEED (~0.5 tiles/tick), 100 ticks is ample slack to
+    // walk 5 tiles AND descend.
+    const startX = ENEMY_START_X - 5;
+    const startY = ENEMY_START_Y;
+    const { world, fighterIds, rallyTileX, rallyTileY } = buildInvasionRallyWorld([
+      [startX, startY],
+    ]);
+    const id = fighterIds[0]!;
+
+    // MANDATORY t=0 preconditions — confirm harness staged the scenario.
+    expect(world.ants.alive[id]).toBe(1);
+    expect(world.ants.task[id]).toBe(AntTask.Fighting);
+    expect(world.ants.zone[id]).toBe(Zone.Surface);
+    expect(tileXOf(world, id)).toBe(startX);
+    expect(tileYOf(world, id)).toBe(startY);
+    expect(world.ants.colonyId[id]).toBe(PLAYER_COLONY_ID);
+    expect(world.ants.currentGridColonyId[id]).toBe(PLAYER_COLONY_ID);
+    expect(world.colonies[PLAYER_COLONY_ID]!.rallyPoint).toEqual({
+      tileX: rallyTileX, tileY: rallyTileY,
+    });
+
+    // Act — tick until the fighter descends, or bail after MAX ticks.
+    const MAX_TICKS = 100;
+    let descendTick = -1;
+    let prevTileX = startX;
+    let prevTileY = startY;
+    let tileBeforeDescend: [number, number] | null = null;
+    for (let t = 0; t < MAX_TICKS; t++) {
+      // Record tile at start of tick, BEFORE tick() runs — this is the
+      // position from which any descent this tick will fire. If descent
+      // fires during this tick, `tileBeforeDescend` captures the entry tile.
+      prevTileX = tileXOf(world, id);
+      prevTileY = tileYOf(world, id);
+
+      const cmds = world.commandQueue.splice(0);
+      tick(world, cmds);
+
+      if (world.ants.zone[id] === Zone.Underground) {
+        descendTick = t;
+        tileBeforeDescend = [prevTileX, prevTileY];
+        break;
+      }
+    }
+
+    // MANDATORY outcome assertions -------------------------------------------
+    // The fighter descended within the tick budget. WITHOUT the fix, this
+    // will fail — the fighter gets within radius 2 and holds at (rallyX-2,
+    // rallyY), never standing on the entrance tile.
+    expect(descendTick).toBeGreaterThanOrEqual(0);
+    // Entering tile (tile from which descent fired) is the entrance tile.
+    expect(tileBeforeDescend).toEqual([rallyTileX, rallyTileY]);
+    // Descent flipped the grid-of-occupancy to the enemy colony.
+    expect(world.ants.zone[id]).toBe(Zone.Underground);
+    expect(world.ants.currentGridColonyId[id]).toBe(ENEMY_COLONY_ID);
+    // Ant's owning colony is still PLAYER — she's an invader, not a defector.
+    expect(world.ants.colonyId[id]).toBe(PLAYER_COLONY_ID);
+  });
+
+  it('Test 7: four fighters rallied on enemy entrance all eventually descend', () => {
+    // Four player Fighting ants at nearby tiles (not colocated — the
+    // occupancy resolver would bump them apart on tick 1 anyway, but
+    // distinct start tiles avoid confounding). They must descend
+    // sequentially because only one ant can stand on the entrance tile
+    // at a time (occupancy resolver enforces same-colony tile uniqueness
+    // on the surface). Generous 300-tick budget covers all four.
+    const startTiles: Array<readonly [number, number]> = [
+      [ENEMY_START_X - 5, ENEMY_START_Y    ],
+      [ENEMY_START_X - 5, ENEMY_START_Y + 1],
+      [ENEMY_START_X - 4, ENEMY_START_Y    ],
+      [ENEMY_START_X - 4, ENEMY_START_Y + 1],
+    ];
+    const { world, fighterIds } = buildInvasionRallyWorld(startTiles);
+    expect(fighterIds.length).toBe(4);
+
+    // MANDATORY t=0 preconditions for each fighter.
+    for (const id of fighterIds) {
+      expect(world.ants.alive[id]).toBe(1);
+      expect(world.ants.task[id]).toBe(AntTask.Fighting);
+      expect(world.ants.zone[id]).toBe(Zone.Surface);
+      expect(world.ants.colonyId[id]).toBe(PLAYER_COLONY_ID);
+      expect(world.ants.currentGridColonyId[id]).toBe(PLAYER_COLONY_ID);
+    }
+
+    // Act — tick until ALL four have descended, or bail after MAX.
+    const MAX_TICKS = 300;
+    const descended = new Set<number>();
+    for (let t = 0; t < MAX_TICKS && descended.size < fighterIds.length; t++) {
+      const cmds = world.commandQueue.splice(0);
+      tick(world, cmds);
+      for (const id of fighterIds) {
+        if (world.ants.zone[id] === Zone.Underground) descended.add(id);
+      }
+    }
+
+    // MANDATORY outcome assertions — every fighter ended up underground in
+    // the enemy grid. WITHOUT the fix, ALL four get stranded within radius
+    // 2 and never descend; descended.size stays 0.
+    expect(descended.size).toBe(fighterIds.length);
+    for (const id of fighterIds) {
+      expect(world.ants.zone[id]).toBe(Zone.Underground);
+      expect(world.ants.currentGridColonyId[id]).toBe(ENEMY_COLONY_ID);
+      expect(world.ants.colonyId[id]).toBe(PLAYER_COLONY_ID);
+    }
   });
 });
