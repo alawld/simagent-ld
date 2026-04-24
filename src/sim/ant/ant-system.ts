@@ -1012,6 +1012,44 @@ export function tickDigExecution(
  */
 export function updateFightAntTargets(world: WorldState): void {
   const { ants } = world;
+
+  // Precompute: for each colony with a rally, does ANY colony have an OPEN
+  // entrance at that rally tile? If yes, the hold-radius anti-oscillation
+  // suppression MUST be skipped for that colony's fighters — they must walk
+  // onto the EXACT entrance tile so the Surface→Underground descent block
+  // in tickAntMovement can fire. This carve-out covers:
+  //   - Invasion: player rallies on an enemy open entrance → fighters
+  //     descend into the enemy grid (Plan 09.1-03 descent-intent gate).
+  //   - Defensive descent: a colony rallies on its OWN open entrance →
+  //     fighters enter their own grid. Colony-agnostic by design — the
+  //     invariant "rally on entrance → descend" holds regardless of owner.
+  // Complexity: O(N²·E) where N = colony count, E = entrances per colony.
+  // Realistic values are tiny (2-4 colonies, 1-3 entrances each). Simplicity
+  // over microperf — clarity wins for this rarely-hit guard.
+  const rallyOnEntrance: Record<number, boolean> = {};
+  for (const cidKey in world.colonies) {
+    const colony = world.colonies[cidKey as unknown as keyof typeof world.colonies];
+    if (!colony) continue;
+    const rp = colony.rallyPoint;
+    if (rp == null) continue;
+    let hit = false;
+    for (const otherKey in world.colonies) {
+      if (hit) break;
+      const other = world.colonies[otherKey as unknown as keyof typeof world.colonies];
+      if (!other || !other.entrances) continue;
+      for (let e = 0; e < other.entrances.length; e++) {
+        const ent = other.entrances[e]!;
+        if (ent.isOpen
+            && ent.surfaceTileX === rp.tileX
+            && ent.surfaceTileY === rp.tileY) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    rallyOnEntrance[colony.colonyId] = hit;
+  }
+
   for (let id = 0; id < ants.alive.length; id++) {
     if (ants.alive[id] !== 1) continue;
     if (ants.task[id] !== AntTask.Fighting) continue;
@@ -1055,13 +1093,19 @@ export function updateFightAntTargets(world: WorldState): void {
     // resolveSameColonyOccupancy bumps clustered ants one tile N/E/S/W and
     // the next tick re-writes the same rally center target → walk →
     // re-collide → re-bump → visible ABAB jitter at fp-resolution.
-    const antTileX = ants.posX[id]! >> FP_SHIFT;
-    const antTileY = ants.posY[id]! >> FP_SHIFT;
-    const d = Math.abs(antTileX - rp.tileX) + Math.abs(antTileY - rp.tileY);
-    if (d <= RALLY_HOLD_RADIUS_TILES) {
-      ants.targetPosX[id] = -1;
-      ants.targetPosY[id] = -1;
-      continue;
+    //
+    // Carve-out: if the rally tile IS an open entrance (any colony's), the
+    // hold-radius suppression is skipped — fighters must reach the EXACT
+    // entrance tile for the descent block in tickAntMovement to fire.
+    if (!rallyOnEntrance[colony.colonyId]) {
+      const antTileX = ants.posX[id]! >> FP_SHIFT;
+      const antTileY = ants.posY[id]! >> FP_SHIFT;
+      const d = Math.abs(antTileX - rp.tileX) + Math.abs(antTileY - rp.tileY);
+      if (d <= RALLY_HOLD_RADIUS_TILES) {
+        ants.targetPosX[id] = -1;
+        ants.targetPosY[id] = -1;
+        continue;
+      }
     }
     ants.targetPosX[id] = (rp.tileX << FP_SHIFT) + (FP_ONE >> 1);
     ants.targetPosY[id] = (rp.tileY << FP_SHIFT) + (FP_ONE >> 1);

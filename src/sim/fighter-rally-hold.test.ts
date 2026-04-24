@@ -450,8 +450,19 @@ describe('fighter rally hold — carve out rally-on-entrance (invasion regressio
     // will fail — the fighter gets within radius 2 and holds at (rallyX-2,
     // rallyY), never standing on the entrance tile.
     expect(descendTick).toBeGreaterThanOrEqual(0);
-    // Entering tile (tile from which descent fired) is the entrance tile.
-    expect(tileBeforeDescend).toEqual([rallyTileX, rallyTileY]);
+    // The tick before descent, the ant was one step from the entrance.
+    // tickAntMovement applies its single-axis step AND the descent block in
+    // the same tick, so the entrance tile itself is not observable at tick
+    // boundaries — but arrival on it IS observable as the zone flip.
+    // WITHOUT the fix, the ant gets within radius 2, the target is cleared,
+    // and it holds at Manhattan=2 forever (descendTick stays -1 and the
+    // assertion above fails first). WITH the fix, it marches to adjacent
+    // (Manhattan≤1), then descends the next tick.
+    expect(tileBeforeDescend).not.toBeNull();
+    const manhattanBeforeDescend =
+      Math.abs(tileBeforeDescend![0] - rallyTileX) +
+      Math.abs(tileBeforeDescend![1] - rallyTileY);
+    expect(manhattanBeforeDescend).toBeLessThanOrEqual(1);
     // Descent flipped the grid-of-occupancy to the enemy colony.
     expect(world.ants.zone[id]).toBe(Zone.Underground);
     expect(world.ants.currentGridColonyId[id]).toBe(ENEMY_COLONY_ID);
