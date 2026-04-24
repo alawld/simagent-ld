@@ -67,6 +67,25 @@ const DIR_DX = [0, 1, 0, -1] as const;  // N, E, S, W
 const DIR_DY = [-1, 0, 1, 0] as const;  // N, E, S, W
 
 // ---------------------------------------------------------------------------
+// Fighting ant rally hold radius (Manhattan tiles).
+//
+// Surface Fighters within this Manhattan tile distance of their colony's
+// rallyPoint have targetPosX/Y cleared to -1 in updateFightAntTargets, which
+// the Fighting branch in tickAntMovement interprets as "no target → hold in
+// place (dx=dy=0)". Prevents the ABAB occupancy-bump oscillation where
+// clustered fighters repeatedly walk back to the rally tile center only to
+// be bumped 1 tile by resolveSameColonyOccupancy and re-targeted next tick.
+//
+// Radius 2 yields a 13-tile hold zone (center + 12 Manhattan-2 tiles) which
+// comfortably absorbs the resolver's single-step bump footprint for any
+// realistic fighter group. Radius 1 would leave a 5-tile zone — a 6th
+// fighter would be bumped outside and re-oscillate. The value is a simple
+// integer compare (no fixed-point math) and still feels "at the rally"
+// visually to the player.
+// ---------------------------------------------------------------------------
+const RALLY_HOLD_RADIUS_TILES = 2;
+
+// ---------------------------------------------------------------------------
 // antPickupFood — PRD §4c L1093-1104
 //
 // Transfers min(capacity, pile.amount, FOOD_PICKUP_AMOUNT) from pile to ant.
@@ -1029,6 +1048,21 @@ export function updateFightAntTargets(world: WorldState): void {
     }
 
     // Surface fighter (or underground with no entrances yet): target rally tile center.
+    //
+    // Anti-oscillation: if the ant is already within RALLY_HOLD_RADIUS_TILES
+    // Manhattan of the rally tile, clear the target to -1 so the Fighting
+    // branch in tickAntMovement holds in place (dx=dy=0). Without this,
+    // resolveSameColonyOccupancy bumps clustered ants one tile N/E/S/W and
+    // the next tick re-writes the same rally center target → walk →
+    // re-collide → re-bump → visible ABAB jitter at fp-resolution.
+    const antTileX = ants.posX[id]! >> FP_SHIFT;
+    const antTileY = ants.posY[id]! >> FP_SHIFT;
+    const d = Math.abs(antTileX - rp.tileX) + Math.abs(antTileY - rp.tileY);
+    if (d <= RALLY_HOLD_RADIUS_TILES) {
+      ants.targetPosX[id] = -1;
+      ants.targetPosY[id] = -1;
+      continue;
+    }
     ants.targetPosX[id] = (rp.tileX << FP_SHIFT) + (FP_ONE >> 1);
     ants.targetPosY[id] = (rp.tileY << FP_SHIFT) + (FP_ONE >> 1);
   }
