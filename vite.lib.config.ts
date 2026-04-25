@@ -14,7 +14,9 @@
 // Output filename is content-hashed (index.[hash].js) so the website can
 // publish it under Cache-Control: immutable without invalidation churn.
 // A sibling manifest.json maps `entry → filename` so the deploy can inject
-// the correct <script src=…> URL into the host page.
+// the correct <script src=…> URL into the host page. A sibling index.d.ts
+// declares the public API surface (mount/MountOptions/MountedGame) for
+// type-only imports in the host project.
 
 import { defineConfig, type Plugin } from 'vite';
 import { writeFileSync } from 'node:fs';
@@ -47,12 +49,56 @@ const manifestPlugin = (): Plugin => ({
   },
 });
 
+/** Emit a hand-written dist-lib/index.d.ts describing only the public API
+ *  surface (mount, MountOptions, MountedGame). Hand-written rather than
+ *  generated via vite-plugin-dts so we don't pull in a tsc-on-rollup
+ *  dependency, and so the published types are exactly the embedder
+ *  contract — not every transitively re-exported render-internal type.
+ *
+ *  Filename is fixed (no hash) because TS module resolution looks up
+ *  `.d.ts` next to the source path, and consumers reference types via a
+ *  type-only import that is decoupled from the runtime entry name in
+ *  manifest.json. Keep this string in sync with src/main.ts. */
+const dtsPlugin = (): Plugin => ({
+  name: 'subterrans-lib-dts',
+  writeBundle(options) {
+    const dir = options.dir ?? 'dist-lib';
+    const dts = `// Public API surface for the Subterrans library bundle. Hand-maintained
+// in vite.lib.config.ts; regenerated on each build. Keep in sync with
+// src/main.ts.
+
+export interface MountOptions {
+  /**
+   * Override the base path under which runtime assets are resolved. When
+   * set, sprite URLs become \`\${assetsBase}sprites/*.svg\` instead of the
+   * build-baked default. Must end with a trailing slash.
+   */
+  assetsBase?: string;
+}
+
+export interface MountedGame {
+  /** Tear down the underlying Phaser.Game and remove its canvas. */
+  destroy(): void;
+  /**
+   * Resolves once GameScene.create() has finished — preload assets are
+   * loaded, the canvas is painted, and the boot path (fresh world or
+   * SavePrompt overlay) is visible. Never rejects.
+   */
+  ready: Promise<void>;
+}
+
+export function mount(target: HTMLElement, options?: MountOptions): MountedGame;
+`;
+    writeFileSync(join(dir, 'index.d.ts'), dts);
+  },
+});
+
 export default defineConfig({
   // Suppress copying public/* into dist-lib/. Sprite assets live in the
   // website's deploy at /demo/play/assets/sprites/* — the library bundle
   // doesn't need to ship duplicates.
   publicDir: false,
-  plugins: [manifestPlugin()],
+  plugins: [manifestPlugin(), dtsPlugin()],
   build: {
     target: 'es2022',
     outDir: 'dist-lib',

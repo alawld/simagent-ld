@@ -10,6 +10,7 @@
 import * as Phaser from 'phaser';
 import { GameScene } from './render/game-scene.js';
 import { UIScene } from './render/ui-scene.js';
+import { SUBTERRANS_READY_EVENT } from './render/lifecycle.js';
 import { CANVAS_W, CANVAS_H } from './render/sprites.js';
 
 export interface MountOptions {
@@ -30,7 +31,22 @@ export interface MountOptions {
 }
 
 export interface MountedGame {
+  /**
+   * Tear down the underlying Phaser.Game and remove its canvas from the
+   * mount target. Idempotent at the host level, but must not be called
+   * twice on the same instance.
+   */
   destroy(): void;
+
+  /**
+   * Resolves once `GameScene.create()` has finished — preload assets
+   * are loaded, the canvas is painted, and the boot path (fresh world
+   * or SavePrompt overlay) is visible. Use this to hide a loading
+   * spinner the moment the game is interactive. Never rejects; if the
+   * caller `destroy()`s before boot completes the promise simply
+   * stays pending.
+   */
+  ready: Promise<void>;
 }
 
 /**
@@ -78,9 +94,17 @@ export function mount(target: HTMLElement, options?: MountOptions): MountedGame 
 
   const game = new Phaser.Game(config);
 
+  // Convert the one-shot SUBTERRANS_READY_EVENT into a Promise the host
+  // page can await. `events.once` auto-unsubscribes after the first
+  // emit, so there is nothing to clean up on destroy().
+  const ready = new Promise<void>((resolve) => {
+    game.events.once(SUBTERRANS_READY_EVENT, () => resolve());
+  });
+
   return {
     destroy() {
       game.destroy(true);
     },
+    ready,
   };
 }
