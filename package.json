@@ -27,7 +27,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
-    "verify": "npm run lint && npm run typecheck && bash scripts/check-sim-boundary.sh && npm run test"
+    "verify": "npm run lint && npm run typecheck && bash scripts/check-sim-boundary.sh && bash scripts/check-asset-paths.sh && npm run test"
   },
   "dependencies": {
     "phaser": "^3.90.0"

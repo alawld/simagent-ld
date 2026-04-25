@@ -259,3 +259,22 @@ interface InputEntry {
 **Replay verification:** Given a save file, we can verify its integrity by replaying `inputLog` from tick 0 with `seed` and asserting the final state matches `world`. If it doesn't, either the save is corrupt or the simulation has a non-determinism bug.
 
 **Phase 1 scope:** JSON snapshots to `localStorage` with autosave. Input logging is implemented but replay verification is a testing tool, not a user feature. Binary format and cloud saves are deferred.
+
+---
+
+## Build-Path Hygiene: Use `BASE_URL` for Runtime Asset Paths
+
+**Rule:** Any runtime string that names a static asset (sprites, fonts, audio, JSON, wasm, workers) must be built from `import.meta.env.BASE_URL`, not hard-coded as a root-absolute path like `/assets/foo.svg`.
+
+```typescript
+// ✗ Wrong — bakes "/" into the bundle, 404s under any non-root deploy base.
+this.load.svg(KEY, '/assets/sprites/worker-ant.svg');
+
+// ✓ Right — picks up Vite's --base setting at build time.
+const SPRITE_BASE = `${import.meta.env.BASE_URL}assets/sprites/`;
+this.load.svg(KEY, `${SPRITE_BASE}worker-ant.svg`);
+```
+
+**Why:** Vite's `--base` flag rewrites paths that flow through the module graph (imports, HTML attributes, `new URL(..., import.meta.url)`). It cannot rewrite arbitrary string literals — those stay verbatim in the bundle. So `'/assets/foo'` works fine when the site is served from `/` but breaks the moment the build is overlaid at a sub-path (e.g. the Subterrans website demo at `/demo/play/`). `BASE_URL` is a build-time constant injected by Vite and always carries a trailing slash.
+
+**Enforcement:** `scripts/check-asset-paths.sh` greps `src/` for string literals matching `/assets/`, `/fonts/`, `/audio/`, or `/sprites/` and exits non-zero if any are found. It runs as part of `npm run verify`.
