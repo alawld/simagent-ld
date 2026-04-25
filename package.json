@@ -20,6 +20,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:lib": "vite build --config vite.lib.config.ts --base=/demo/play/",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
