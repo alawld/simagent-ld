@@ -79,24 +79,20 @@ import {
 } from './ant-sprite-layer.js';
 import { AntSpritePool } from './ant-sprite-pool.js';
 
-// Served from code/public/ as real files. Vite's `new URL(..., import.meta.url)`
-// pattern inlines SVGs under ~4KB as `data:image/svg+xml;base64,...` URIs in
-// dev mode. Phaser's load.svg assumes a file URL and routes through its XHR
-// loader — when handed an inlined data URI it feeds the full `data:...`
-// string to atob(), which throws on the URL-safe encoded prefix and black-
-// screens preload. Keep the SVGs in code/public/assets/sprites/ so they are
-// served as real HTTP resources; stable paths survive `npm run build`.
+// Sprite assets are served from code/public/ as real files. Vite's
+// `new URL(..., import.meta.url)` pattern inlines SVGs under ~4KB as
+// `data:image/svg+xml;base64,...` URIs in dev mode. Phaser's load.svg
+// assumes a file URL and routes through its XHR loader — when handed an
+// inlined data URI it feeds the full `data:...` string to atob(), which
+// throws on the URL-safe encoded prefix and black-screens preload. Keep
+// the SVGs in code/public/assets/sprites/ so they are served as real HTTP
+// resources; stable paths survive `npm run build`.
 //
-// `import.meta.env.BASE_URL` is the Vite `--base` setting at build time
-// (always trailing-slashed). Default build = '/', overlay build for the
-// website demo = '/demo/play/'. Runtime string literals are invisible to
-// Vite's path rewriter, so we must apply the base ourselves.
-const SPRITE_BASE = `${import.meta.env.BASE_URL}assets/sprites/`;
-const WORKER_ANT_SVG_URL = `${SPRITE_BASE}worker-ant.svg`;
-const QUEEN_ANT_SVG_URL  = `${SPRITE_BASE}queen-ant.svg`;
-const EGG_SVG_URL        = `${SPRITE_BASE}egg.svg`;
-const LARVA_SVG_URL      = `${SPRITE_BASE}larva.svg`;
-const FOOD_CACHE_SVG_URL = `${SPRITE_BASE}food-cache.svg`;
+// Sprite URLs are composed inside preload() from the `assetsBase` registry
+// value (set by main.ts in callbacks.preBoot). Default is
+// `${import.meta.env.BASE_URL}assets/` (Vite `--base`-aware). Embedders can
+// override at runtime via MountOptions.assetsBase so the same library bundle
+// can be reused under different deploy paths without rebuilding.
 import {
   processCameraInput,
   registerDragPan,
@@ -164,19 +160,21 @@ export class GameScene extends Phaser.Scene {
     // Load ant SVG sprites. Phaser rasterizes at the given width/height; the
     // texture is then reused for every pooled ant image. Tinting in the pool
     // multiplies the white SVG fill by the colony color.
-    this.load.svg(ANT_TEXTURE_WORKER, WORKER_ANT_SVG_URL, {
+    const assetsBase = this.registry.get('assetsBase') as string;
+    const spriteBase = `${assetsBase}sprites/`;
+    this.load.svg(ANT_TEXTURE_WORKER, `${spriteBase}worker-ant.svg`, {
       width: WORKER_SPRITE_WIDTH, height: WORKER_SPRITE_HEIGHT,
     });
-    this.load.svg(ANT_TEXTURE_QUEEN, QUEEN_ANT_SVG_URL, {
+    this.load.svg(ANT_TEXTURE_QUEEN, `${spriteBase}queen-ant.svg`, {
       width: QUEEN_SPRITE_WIDTH, height: QUEEN_SPRITE_HEIGHT,
     });
-    this.load.svg(EGG_TEXTURE, EGG_SVG_URL, {
+    this.load.svg(EGG_TEXTURE, `${spriteBase}egg.svg`, {
       width: EGG_SPRITE_WIDTH, height: EGG_SPRITE_HEIGHT,
     });
-    this.load.svg(LARVA_TEXTURE, LARVA_SVG_URL, {
+    this.load.svg(LARVA_TEXTURE, `${spriteBase}larva.svg`, {
       width: LARVA_SPRITE_WIDTH, height: LARVA_SPRITE_HEIGHT,
     });
-    this.load.svg(FOOD_CACHE_TEXTURE, FOOD_CACHE_SVG_URL, {
+    this.load.svg(FOOD_CACHE_TEXTURE, `${spriteBase}food-cache.svg`, {
       width: FOOD_CACHE_SPRITE_WIDTH, height: FOOD_CACHE_SPRITE_HEIGHT,
     });
   }

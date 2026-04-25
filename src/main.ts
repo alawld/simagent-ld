@@ -12,16 +12,27 @@ import { GameScene } from './render/game-scene.js';
 import { UIScene } from './render/ui-scene.js';
 import { CANVAS_W, CANVAS_H } from './render/sprites.js';
 
-// Reserved for future mount-time flags (muteAudio, initialScene, etc.).
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type
-export interface MountOptions {}
+export interface MountOptions {
+  /**
+   * Override the base path under which runtime assets are resolved. When set,
+   * sprite URLs become `${assetsBase}sprites/*.svg` instead of the build-baked
+   * default `${import.meta.env.BASE_URL}assets/*`.
+   *
+   * Use this when the bundle is served from a deploy path that differs from
+   * the one passed to `vite build --base=…`, so the same bundle can be reused
+   * (e.g. at `/play/assets/` or under a CDN prefix) without a rebuild.
+   *
+   * Must end with a trailing slash. Default: `${import.meta.env.BASE_URL}assets/`.
+   */
+  assetsBase?: string;
+}
 
 export interface MountedGame {
   destroy(): void;
 }
 
 export function mount(target: HTMLElement, options?: MountOptions): MountedGame {
-  void options;
+  const assetsBase = options?.assetsBase ?? `${import.meta.env.BASE_URL}assets/`;
 
   const config: Phaser.Types.Core.GameConfig = {
     type: Phaser.AUTO,
@@ -39,6 +50,14 @@ export function mount(target: HTMLElement, options?: MountOptions): MountedGame 
       height: CANVAS_H,
     },
     scene: [GameScene, UIScene],
+    callbacks: {
+      // preBoot fires before any scene is added or starts preload(), so the
+      // registry value is available to GameScene.preload() when it builds
+      // its sprite URLs.
+      preBoot: (game) => {
+        game.registry.set('assetsBase', assetsBase);
+      },
+    },
   };
 
   const game = new Phaser.Game(config);
