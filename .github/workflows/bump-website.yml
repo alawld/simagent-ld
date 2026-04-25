@@ -1,0 +1,47 @@
+name: Bump website submodule
+
+# When main moves here, push a matching submodule bump to the website repo.
+# The website's deploy workflow then picks it up and ships the new game build.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: bump-website
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH for website repo
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.WEBSITE_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone website repo
+        run: git clone git@github.com:LightAxe/subterrans-web.git website
+
+      - name: Bump submodule SHA
+        working-directory: website
+        env:
+          GAME_SHA: ${{ github.sha }}
+        run: |
+          git submodule update --init vendor/game
+          git -C vendor/game fetch origin "$GAME_SHA"
+          git -C vendor/game checkout "$GAME_SHA"
+
+          if git diff --quiet vendor/game; then
+            echo "Submodule already at $GAME_SHA — nothing to do."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vendor/game
+          git commit -m "chore(game): bump submodule to ${GAME_SHA:0:7}"
+          git push origin main
