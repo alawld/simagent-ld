@@ -16,7 +16,7 @@
     "outDir": "dist",
     "rootDir": "src",
     "lib": ["ES2022", "DOM"],
-    "types": ["phaser", "node"]
+    "types": ["phaser", "node", "vite/client"]
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist"]

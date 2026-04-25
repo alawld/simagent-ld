@@ -86,15 +86,17 @@ import { AntSpritePool } from './ant-sprite-pool.js';
 // string to atob(), which throws on the URL-safe encoded prefix and black-
 // screens preload. Keep the SVGs in code/public/assets/sprites/ so they are
 // served as real HTTP resources; stable paths survive `npm run build`.
-const WORKER_ANT_SVG_URL = '/assets/sprites/worker-ant.svg';
-const QUEEN_ANT_SVG_URL  = '/assets/sprites/queen-ant.svg';
-// 09 render-polish follow-up: repo-owned SVGs for brood + food storage. Served
-// from /assets/sprites/ (stable paths — the `new URL(..., import.meta.url)`
-// pattern inlines <4 KB SVGs as base64 data URIs in dev, which crashed
-// Phaser's load.svg atob() decode; see worker/queen notes above).
-const EGG_SVG_URL        = '/assets/sprites/egg.svg';
-const LARVA_SVG_URL      = '/assets/sprites/larva.svg';
-const FOOD_CACHE_SVG_URL = '/assets/sprites/food-cache.svg';
+//
+// `import.meta.env.BASE_URL` is the Vite `--base` setting at build time
+// (always trailing-slashed). Default build = '/', overlay build for the
+// website demo = '/demo/play/'. Runtime string literals are invisible to
+// Vite's path rewriter, so we must apply the base ourselves.
+const SPRITE_BASE = `${import.meta.env.BASE_URL}assets/sprites/`;
+const WORKER_ANT_SVG_URL = `${SPRITE_BASE}worker-ant.svg`;
+const QUEEN_ANT_SVG_URL  = `${SPRITE_BASE}queen-ant.svg`;
+const EGG_SVG_URL        = `${SPRITE_BASE}egg.svg`;
+const LARVA_SVG_URL      = `${SPRITE_BASE}larva.svg`;
+const FOOD_CACHE_SVG_URL = `${SPRITE_BASE}food-cache.svg`;
 import {
   processCameraInput,
   registerDragPan,
