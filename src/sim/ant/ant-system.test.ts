@@ -4607,10 +4607,12 @@ describe('tickAntMovement — P1 queen relocation', () => {
   });
 
   it('Q-2. queen inside Queen chamber footprint → wanders toward a chamber Open tile (Issue #16)', () => {
-    // Queen at (3,3). 2×2 chamber footprint = {(2,2),(3,2),(2,3),(3,3)}. At
-    // tick=0 the wander target is the first enumerated Open tile (2,2), so the
-    // Manhattan step picks westward (|dx|===|dy| → dx-branch wins). She moves
-    // one half-tile west into tile (2,3) and remains inside the chamber.
+    // Queen at (3,3). 2×2 chamber footprint = {(2,2),(3,2),(2,3),(3,3)}. The
+    // wander targets a non-self tile each cycle, so the queen must move and
+    // stay inside the footprint. We deliberately avoid pinning the exact
+    // direction here — Q-2c covers "visits every tile" and Q-2b pins the
+    // cadence; this case only asserts the bug fix's user-facing claim:
+    // "she does not sit motionless on her arrival corner."
     const { world, chamberFlowFields, queenId } = setupQueenWorld({
       queenTileX: 3, queenTileY: 3,            // inside chamber (2,2)-(3,3)
       addQueenChamber: true,
@@ -4656,6 +4658,15 @@ describe('tickAntMovement — P1 queen relocation', () => {
     // Cycle 0: she's already at target (2,2) → holds.
     const t0X = world.ants.posX[queenId]!;
     const t0Y = world.ants.posY[queenId]!;
+    tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
+    expect(world.ants.posX[queenId]).toBe(t0X);
+    expect(world.ants.posY[queenId]).toBe(t0Y);
+
+    // Mid-cycle: still inside cycle 0 — target must not have advanced. A
+    // regression that uses `world.tick % interval` instead of `floor(world.tick
+    // / interval)` would compute a different cycleIndex here (150 → a
+    // different tile) and the queen would step away from her current tile.
+    world.tick = 150; // half of QUEEN_EGG_INTERVAL_TICKS (300)
     tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
     expect(world.ants.posX[queenId]).toBe(t0X);
     expect(world.ants.posY[queenId]).toBe(t0Y);

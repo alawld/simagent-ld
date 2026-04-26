@@ -1958,9 +1958,12 @@ function moveQueens(
         }
       }
       if (openCount === 0) continue;
-      // `| 0` coerces to Int32; the cast wraps negative for tick > 2^31
-      // (≈3.4y at 20Hz). `((x % n) + n) % n` folds negatives back into
-      // [0, openCount) so the second-pass match never falls off the end.
+      // `| 0` performs ECMA-262 ToInt32 — bit-identical across V8/JSC/SpiderMonkey
+      // and integer-exact for any quotient that fits in Int32. The cast wraps
+      // negative once `tick / interval` exceeds 2^31, i.e. tick > 2^31 × 300
+      // ≈ 6.4×10^11 ticks (~1000 years at 20Hz). `((x % n) + n) % n` folds the
+      // wrap deterministically back into [0, openCount) so the indexed match
+      // below never falls off the end.
       // eslint-disable-next-line no-restricted-syntax -- integer division via `| 0`; tick / interval is integer arithmetic, not fixed-point math
       const cycleIndex = (world.tick / QUEEN_EGG_INTERVAL_TICKS) | 0;
       const targetIndex = ((cycleIndex % openCount) + openCount) % openCount;
