@@ -22,7 +22,9 @@ export interface MountOptions {
    * the one passed to `vite build --base=…`, so the same bundle can be reused
    * (e.g. at `/play/assets/` or under a CDN prefix) without a rebuild.
    *
-   * Must end with a trailing slash. Default: `${import.meta.env.BASE_URL}assets/`.
+   * A trailing slash is appended if missing. Empty string or whitespace-only
+   * is treated as unset and falls back to the default.
+   * Default: `${import.meta.env.BASE_URL}assets/`.
    */
   assetsBase?: string;
 }
@@ -31,8 +33,22 @@ export interface MountedGame {
   destroy(): void;
 }
 
+/**
+ * Normalize an assetsBase value to a guaranteed trailing-slash form. Treats
+ * empty string or whitespace-only as "use default" (defensive against an
+ * embedder passing `assetsBase: ''` or a templated value that resolved
+ * empty), and appends a trailing slash if missing so `${base}sprites/foo`
+ * never silently produces `/play/assetssprites/foo` and 404s.
+ */
+function normalizeAssetsBase(raw: string | undefined): string {
+  const fallback = `${import.meta.env.BASE_URL}assets/`;
+  const trimmed = raw?.trim();
+  if (trimmed === undefined || trimmed === '') return fallback;
+  return trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+}
+
 export function mount(target: HTMLElement, options?: MountOptions): MountedGame {
-  const assetsBase = options?.assetsBase ?? `${import.meta.env.BASE_URL}assets/`;
+  const assetsBase = normalizeAssetsBase(options?.assetsBase);
 
   const config: Phaser.Types.Core.GameConfig = {
     type: Phaser.AUTO,

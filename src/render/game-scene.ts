@@ -160,8 +160,19 @@ export class GameScene extends Phaser.Scene {
     // Load ant SVG sprites. Phaser rasterizes at the given width/height; the
     // texture is then reused for every pooled ant image. Tinting in the pool
     // multiplies the white SVG fill by the colony color.
-    const assetsBase = this.registry.get('assetsBase') as string;
-    const spriteBase = `${assetsBase}sprites/`;
+    //
+    // `assetsBase` is plumbed in by main.ts via callbacks.preBoot. A missing
+    // or non-string registry value means GameScene was instantiated outside
+    // mount() (e.g. ad-hoc test harness, hand-built Phaser.Game) — fail loud
+    // rather than letting `String(undefined)` produce 404s on every sprite.
+    const assetsBaseRaw = this.registry.get('assetsBase');
+    if (typeof assetsBaseRaw !== 'string' || assetsBaseRaw.length === 0) {
+      throw new Error(
+        'GameScene.preload: assetsBase registry value missing or invalid. ' +
+        'GameScene must be mounted via main.ts mount() (sets the registry in callbacks.preBoot).',
+      );
+    }
+    const spriteBase = `${assetsBaseRaw}sprites/`;
     this.load.svg(ANT_TEXTURE_WORKER, `${spriteBase}worker-ant.svg`, {
       width: WORKER_SPRITE_WIDTH, height: WORKER_SPRITE_HEIGHT,
     });

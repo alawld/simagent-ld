@@ -21,14 +21,24 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /** Emit dist-lib/manifest.json after the bundle is written, so the website
- *  deploy can read `entry` and inject the right hashed <script src=…>. */
+ *  deploy can read `entry` and inject the right hashed <script src=…>.
+ *
+ *  Asserts exactly one entry chunk — silent skip on multi-entry would
+ *  produce a stale or missing manifest, which the website's deploy then
+ *  reads and breaks production. Better to fail the build loudly. */
 const manifestPlugin = (): Plugin => ({
   name: 'subterrans-lib-manifest',
   writeBundle(options, bundle) {
-    const entry = Object.values(bundle).find(
+    const entries = Object.values(bundle).filter(
       (chunk) => 'isEntry' in chunk && chunk.isEntry === true,
     );
-    if (!entry) return;
+    if (entries.length !== 1) {
+      throw new Error(
+        `subterrans-lib-manifest: expected exactly 1 entry chunk, found ${entries.length}. ` +
+        `Library build assumes a single ESM entry — check vite.lib.config.ts lib.entry.`,
+      );
+    }
+    const entry = entries[0];
     const dir = options.dir ?? 'dist-lib';
     writeFileSync(
       join(dir, 'manifest.json'),
