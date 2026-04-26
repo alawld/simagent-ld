@@ -1,0 +1,89 @@
+name: Bug report
+description: Report something that is broken, crashes, or behaves unexpectedly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Before you submit:** please attach a debug log if at all possible.
+        While the game is running, press **F9** — Subterrans will drop a file
+        named `subterrans-debug-seed<seed>-tick<tick>.json` into your
+        browser's Downloads folder. Drag-and-drop that file into the **Debug
+        log** section below. The file contains the world seed, tick number,
+        full input history, world snapshot, and an enriched per-ant trace —
+        everything needed to deterministically reproduce what you saw, with
+        no guesswork.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-sentence description of the bug.
+      placeholder: e.g. "Marked dirt tiles aren't dug after restarting from a save."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: A numbered list of steps. Please be precise — "click around" is not reproducible; "click tile (5, 10), then drag to (8, 10)" is.
+      placeholder: |
+        1. Start a fresh game with seed 12345.
+        2. Switch to underground view (T).
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: Expected vs. actual behavior
+      description: What did you expect to happen, and what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: debug-log
+    attributes:
+      label: Debug log (F9)
+      description: |
+        Press **F9** in the game to download `subterrans-debug-seed<seed>-tick<tick>.json`
+        from your Downloads folder, then drag-and-drop it into this box.
+
+        If you can't reproduce the bug live (e.g. it's a hard-crash that prevents F9 from
+        firing), say so here and explain what you can — the more state we have, the faster
+        we can fix it.
+      placeholder: Drop the JSON file here, or paste its contents directly.
+    validations:
+      required: false
+
+  - type: input
+    id: env
+    attributes:
+      label: Browser and OS
+      description: Browser name + version, and operating system + version.
+      placeholder: e.g. "Chrome 137 on macOS 26.1, Firefox 139 on Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Screenshots, console errors, related issues, anything else that helps.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I attached the F9 debug log, or explained above why I couldn't.
+          required: true
