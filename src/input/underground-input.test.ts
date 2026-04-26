@@ -237,7 +237,11 @@ describe('handleUndergroundLeftClick', () => {
     expect(world.commandQueue).toHaveLength(0);
   });
 
-  it('is a no-op for a Marked tile (already claimed)', () => {
+  it('does not push a command for a Marked tile but still arms drag state', () => {
+    // Click on already-Marked tile must arm isDragging + lastMarkedTile so a
+    // continuation drag into adjacent Solid still marks dirt. Without the
+    // arming, the subsequent pointermove would observe isDragging=false and
+    // silently no-op for the rest of the gesture (the bug this fix addresses).
     const world = makeWorld();
     const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
     ugSet(grid, 5, 10, UndergroundTileState.Marked);
@@ -246,9 +250,15 @@ describe('handleUndergroundLeftClick', () => {
     const { x, y } = tileToScreen(5, 10, 64, 32);
     handleUndergroundLeftClick(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(true);
+    expect(state.lastMarkedTileX).toBe(5);
+    expect(state.lastMarkedTileY).toBe(10);
   });
 
-  it('is a no-op for a BeingDug tile (already claimed)', () => {
+  it('does not push a command for a BeingDug tile but still arms drag state', () => {
+    // Same arming contract as the Marked case — BeingDug tiles are also
+    // already-claimed, so no command is emitted, but a click that lands on
+    // one must arm the drag so the rest of the stroke can mark dirt.
     const world = makeWorld();
     const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
     ugSet(grid, 5, 10, UndergroundTileState.BeingDug);
@@ -257,15 +267,22 @@ describe('handleUndergroundLeftClick', () => {
     const { x, y } = tileToScreen(5, 10, 64, 32);
     handleUndergroundLeftClick(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(true);
+    expect(state.lastMarkedTileX).toBe(5);
+    expect(state.lastMarkedTileY).toBe(10);
   });
 
-  it('is a no-op for out-of-bounds tile coordinates', () => {
+  it('is a no-op for out-of-bounds tile coordinates and does not arm drag state', () => {
     const world = makeWorld();
     const vs = makeViewState('underground', 64, 32);
     const state = makeState();
     // screen coord that maps to tileX < 0
     handleUndergroundLeftClick(world, vs, -640, 0, state);
     expect(world.commandQueue).toHaveLength(0);
+    // Out-of-bounds is a rejection, not an accept-and-skip — drag must NOT arm.
+    expect(state.isDragging).toBe(false);
+    expect(state.lastMarkedTileX).toBe(-1);
+    expect(state.lastMarkedTileY).toBe(-1);
   });
 
   it('sets isDragging=true and records lastMarkedTile after a successful click', () => {
@@ -387,6 +404,54 @@ describe('handleUndergroundLeftClick', () => {
     handleUndergroundLeftClick(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
     expect(state.isDragging).toBe(false);
+  });
+
+  // The eager arm-on-click for already-claimed tiles must NOT bypass the
+  // rejection guards (HUD / pan / context menu). These are symmetric
+  // counterparts to the Solid-tile guard tests above — they pin the contract
+  // that arming only happens AFTER all guards have passed, regardless of
+  // tile state. A future refactor that moves arming above a guard would
+  // break these.
+  it('Marked-tile click does NOT arm drag when context menu is visible', () => {
+    const world = makeWorld();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 5, 10, UndergroundTileState.Marked);
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    contextMenuState.visible = true;
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, x, y, state);
+    expect(state.isDragging).toBe(false);
+    expect(state.lastMarkedTileX).toBe(-1);
+    expect(state.lastMarkedTileY).toBe(-1);
+    expect(world.commandQueue).toHaveLength(0);
+  });
+
+  it('Marked-tile click does NOT arm drag when panInputState.spaceHeld is true', () => {
+    const world = makeWorld();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 5, 10, UndergroundTileState.Marked);
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    panInputState.spaceHeld = true;
+    const { x, y } = tileToScreen(5, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, x, y, state);
+    expect(state.isDragging).toBe(false);
+    expect(state.lastMarkedTileX).toBe(-1);
+    expect(state.lastMarkedTileY).toBe(-1);
+  });
+
+  it('Marked-tile click does NOT arm drag when pointer is over HUD', () => {
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    // HUD-overlap rejection runs before screenToTile, so the underlying tile
+    // state at the world coord is irrelevant here — we just verify that the
+    // arm code never executes when HUD eats the click.
+    handleUndergroundLeftClick(world, vs, HUD.TRIANGLE.x + 5, HUD.TRIANGLE.y + 5, state);
+    expect(state.isDragging).toBe(false);
+    expect(state.lastMarkedTileX).toBe(-1);
+    expect(state.lastMarkedTileY).toBe(-1);
   });
 });
 
@@ -570,6 +635,96 @@ describe('handleUndergroundDrag', () => {
     const { x, y } = tileToScreen(10, 10, 64, 32);
     handleUndergroundDrag(world, vs, x, y, state);
     expect(world.commandQueue).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Click + drag handoff: starting on an already-claimed tile must still mark
+// newly-entered Solid tiles. Regression coverage for the "click on blue
+// to-be-dug tile then drag through dirt" bug.
+// ---------------------------------------------------------------------------
+
+describe('left-click + drag handoff', () => {
+  it('click on Marked then drag into adjacent Solid emits MarkDigTile on the Solid tile', () => {
+    const world = makeWorld({ tick: 3 });
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    // Player previously marked (5,10); now they click there and drag east
+    // through Solid dirt at (6,10). The dirt must end up marked.
+    ugSet(grid, 5, 10, UndergroundTileState.Marked);
+    // (6,10) stays Solid by default
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+
+    // 1. pointerdown on the Marked tile.
+    const start = tileToScreen(5, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, start.x, start.y, state);
+    expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(true);
+
+    // 2. pointermove into the adjacent Solid tile.
+    const dragTo = tileToScreen(6, 10, 64, 32);
+    handleUndergroundDrag(world, vs, dragTo.x, dragTo.y, state);
+
+    // The Solid tile must have been marked.
+    expect(world.commandQueue).toHaveLength(1);
+    const cmd = world.commandQueue[0] as { type: string; tileX: number; tileY: number };
+    expect(cmd.type).toBe('MarkDigTile');
+    expect(cmd.tileX).toBe(6);
+    expect(cmd.tileY).toBe(10);
+  });
+
+  it('click on BeingDug then drag into adjacent Solid emits MarkDigTile on the Solid tile', () => {
+    // Same contract for BeingDug — the click is on an already-claimed tile,
+    // but the drag must still mark dirt encountered after the start.
+    const world = makeWorld({ tick: 5 });
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 5, 10, UndergroundTileState.BeingDug);
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+
+    const start = tileToScreen(5, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, start.x, start.y, state);
+    expect(world.commandQueue).toHaveLength(0);
+    expect(state.isDragging).toBe(true);
+
+    const dragTo = tileToScreen(6, 10, 64, 32);
+    handleUndergroundDrag(world, vs, dragTo.x, dragTo.y, state);
+
+    expect(world.commandQueue).toHaveLength(1);
+    const cmd = world.commandQueue[0] as { type: string; tileX: number; tileY: number };
+    expect(cmd.type).toBe('MarkDigTile');
+    expect(cmd.tileX).toBe(6);
+    expect(cmd.tileY).toBe(10);
+  });
+
+  it('click on Marked then drag across multiple Solid tiles produces a continuous 4-connected mark sequence', () => {
+    // Multi-tile stroke variant — exercises the Bresenham interpolation
+    // starting from a Marked tile. Covers the realistic gesture: player taps
+    // an already-marked tile and sweeps through dirt to mark a corridor.
+    const world = makeWorld();
+    const vs = makeViewState('underground', 64, 32);
+    const state = makeState();
+    const grid = world.undergroundGrids[PLAYER_COLONY_ID]!;
+    ugSet(grid, 10, 10, UndergroundTileState.Marked);
+    // (11,10) through (13,10) stay Solid by default
+
+    const start = tileToScreen(10, 10, 64, 32);
+    handleUndergroundLeftClick(world, vs, start.x, start.y, state);
+    expect(world.commandQueue).toHaveLength(0);
+
+    const dragTo = tileToScreen(13, 10, 64, 32);
+    handleUndergroundDrag(world, vs, dragTo.x, dragTo.y, state);
+
+    const marks = world.commandQueue.map((c) => {
+      const cc = c as { tileX: number; tileY: number };
+      return `${cc.tileX},${cc.tileY}`;
+    });
+    // Every dirt tile crossed during the drag must be in the queue. The
+    // starting (Marked) tile is not re-emitted.
+    expect(marks).toContain('11,10');
+    expect(marks).toContain('12,10');
+    expect(marks).toContain('13,10');
+    expect(marks).not.toContain('10,10');
   });
 });
 
