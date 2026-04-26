@@ -49,6 +49,7 @@ import {
   EXCURSION_TURN_PERCENT,
   EXCURSION_WOBBLE_PERCENT,
   ENTRANCE_DEPOSIT_SUPPRESS_RADIUS,
+  QUEEN_EGG_INTERVAL_TICKS,
 } from '../constants.js';
 import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import { Rng } from '../rng.js';
@@ -476,9 +477,15 @@ export function tickNurseActions(world: WorldState): void {
  * restricted to alive entities whose tile is NOT already inside any Nursery
  * footprint. If every brood is already in a Nursery, does nothing.
  *
- * Destination: first Nursery chamber in colony.chambers order; within it,
- * the first Open tile in row-major iteration over its footprint. Writes
- * posX/posY in fixed-point (tile-center) and zone=Underground.
+ * Destination: spread across every Open tile in every Nursery chamber the
+ * colony owns. The candidate tiles are enumerated row-major across all
+ * Nursery chambers in colony.chambers order; the chosen tile is index
+ * `pickId % openCount` (issue #21 fix — pre-fix this always wrote to the
+ * first Open tile, stacking every brood at one corner). Writes posX/posY
+ * in fixed-point (tile-center) and zone=Underground. With a single Open
+ * tile (e.g., a 1×1 Nursery, or a Nursery whose other tiles are still
+ * Solid) the modulo collapses to 0 and brood necessarily land on that
+ * one tile — there is no other valid Open tile to spread to.
  *
  * No allocations, no RNG, no wall-clock.
  */
@@ -502,8 +509,14 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
   }
   if (pickId < 0) return;
 
-  // 2. Find the first Nursery Open tile (row-major within the first Nursery
-  //    chamber). Requires the colony's underground grid to check state.
+  // 2. Distribute across all Nursery Open tiles (issue #21). Pre-fix the
+  //    transport always picked the first Open tile in row-major order across
+  //    the first Nursery chamber, so successive brood stacked at one corner.
+  //    Now: count Open tiles across every Nursery chamber the colony owns,
+  //    then deposit at index `pickId % openCount` in row-major order. Using
+  //    pickId (the brood's own entity ID) gives a deterministic, replay-safe
+  //    spread that fans out as new brood is transported — different IDs land
+  //    on different tiles. Same two-pass count/find pattern as moveQueens.
   //
   // Phase 09.1 Chunk 0 disposition: own-colony chamber membership — brood
   // is transported into its own colony's Nursery chamber, never into an
@@ -512,6 +525,24 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
   const underground = world.undergroundGrids[colony.colonyId];
   if (!underground) return;
 
+  let openCount = 0;
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const ch = colony.chambers[c]!;
+    if (ch.chamberType !== ChamberType.Nursery) continue;
+    const bx = ch.posX >> FP_SHIFT;
+    const by = ch.posY >> FP_SHIFT;
+    for (let ty = 0; ty < ch.height; ty++) {
+      for (let tx = 0; tx < ch.width; tx++) {
+        if (ugGet(underground, bx + tx, by + ty) === UndergroundTileState.Open) openCount++;
+      }
+    }
+  }
+  if (openCount === 0) return;
+
+  // pickId is a non-negative entity ID, so the modulo is always in
+  // [0, openCount) without the negative-fold guard moveQueens needs.
+  const targetIndex = pickId % openCount;
+  let cursor = 0;
   for (let c = 0; c < colony.chambers.length; c++) {
     const ch = colony.chambers[c]!;
     if (ch.chamberType !== ChamberType.Nursery) continue;
@@ -522,16 +553,19 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
         const cx = bx + tx;
         const cy = by + ty;
         if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
-        // Fixed-point tile-center position.
-        ants.posX[pickId] = (cx << FP_SHIFT) + (FP_ONE >> 1);
-        ants.posY[pickId] = (cy << FP_SHIFT) + (FP_ONE >> 1);
-        ants.zone[pickId] = Zone.Underground;
-        // Phase 09.1 Chunk 0 — descent invariant. Brood teleported into
-        // nursery now occupies that colony's grid. Today brood is in its
-        // OWN colony so colony.colonyId === ants.colonyId[pickId] and this
-        // is a byte-identical no-op.
-        ants.currentGridColonyId[pickId] = colony.colonyId;
-        return;
+        if (cursor === targetIndex) {
+          // Fixed-point tile-center position.
+          ants.posX[pickId] = (cx << FP_SHIFT) + (FP_ONE >> 1);
+          ants.posY[pickId] = (cy << FP_SHIFT) + (FP_ONE >> 1);
+          ants.zone[pickId] = Zone.Underground;
+          // Phase 09.1 Chunk 0 — descent invariant. Brood teleported into
+          // nursery now occupies that colony's grid. Today brood is in its
+          // OWN colony so colony.colonyId === ants.colonyId[pickId] and this
+          // is a byte-identical no-op.
+          ants.currentGridColonyId[pickId] = colony.colonyId;
+          return;
+        }
+        cursor++;
       }
     }
   }
@@ -1882,11 +1916,15 @@ function isInsideQueenChamber(colony: ColonyRecord, tileX: number, tileY: number
 }
 
 /**
- * Move every alive colony queen one step toward her Queen chamber.
+ * Move every alive colony queen one step toward (or around inside) her Queen chamber.
  *
  * No Queen chamber → queen holds (initial state — any starting position is
  * the "home" position for Phase 3 playability).
- * Queen already inside Queen chamber footprint → hold.
+ * Queen already inside Queen chamber footprint → wander deterministically
+ * between chamber Open tiles, advancing the target every QUEEN_EGG_INTERVAL_TICKS.
+ * (Issue #16: prevents her sticking in whichever corner the flow-field first
+ * delivered her to; also spreads brood across the chamber since eggs spawn
+ * at the queen's current tile.)
  * Surface → step toward nearest OPEN entrance; descend when on the entrance
  * tile (Surface → Underground, posY = 0).
  * Underground → consume the per-colony `queen` chamber flow-field; fall back
@@ -1927,17 +1965,80 @@ function moveQueens(
     const tileX = prevPosX >> FP_SHIFT;
     const tileY = prevPosY >> FP_SHIFT;
 
-    // Already home — no movement.
-    if (zone === Zone.Underground && isInsideQueenChamber(colony, tileX, tileY)) continue;
+    let dx = 0;
+    let dy = 0;
 
-    // Pre-move descent: if the queen is already standing on one of her
-    // colony's OPEN entrance tiles, descend immediately rather than computing
-    // a (0,0) Manhattan delta and bailing via the zero-delta early return.
-    // Debug case: starter colony spawns the queen on the entrance tile with a
-    // completed Queen chamber already in place — without this short-circuit
-    // she would sit on the entrance forever and Gate 6 would block egg
-    // production indefinitely.
-    if (zone === Zone.Surface) {
+    // Issue #16 — once the queen is inside her chamber, drift between Open
+    // tiles instead of holding wherever the flow-field first delivered her
+    // (always a corner). Cycles deterministically every QUEEN_EGG_INTERVAL_TICKS
+    // so the target advances each egg-laying interval. Eggs spawn at her
+    // current tile (lifecycle-system.ts), so the wander also distributes
+    // brood across the chamber footprint.
+    const isAlreadyHome = zone === Zone.Underground && isInsideQueenChamber(colony, tileX, tileY);
+    if (isAlreadyHome) {
+      const underground = world.undergroundGrids[ants.currentGridColonyId[qId]!];
+      if (!underground) continue;
+      let openCount = 0;
+      for (let c = 0; c < colony.chambers.length; c++) {
+        const ch = colony.chambers[c]!;
+        if (ch.chamberType !== ChamberType.Queen) continue;
+        const bx = ch.posX >> FP_SHIFT;
+        const by = ch.posY >> FP_SHIFT;
+        for (let ty = 0; ty < ch.height; ty++) {
+          for (let tx = 0; tx < ch.width; tx++) {
+            if (ugGet(underground, bx + tx, by + ty) === UndergroundTileState.Open) openCount++;
+          }
+        }
+      }
+      if (openCount === 0) continue;
+      // `| 0` performs ECMA-262 ToInt32 — bit-identical across V8/JSC/SpiderMonkey
+      // and integer-exact for any quotient that fits in Int32. The cast wraps
+      // negative once `tick / interval` exceeds 2^31, i.e. tick > 2^31 × 300
+      // ≈ 6.4×10^11 ticks (~1000 years at 20Hz). `((x % n) + n) % n` folds the
+      // wrap deterministically back into [0, openCount) so the indexed match
+      // below never falls off the end.
+      // eslint-disable-next-line no-restricted-syntax -- integer division via `| 0`; tick / interval is integer arithmetic, not fixed-point math
+      const cycleIndex = (world.tick / QUEEN_EGG_INTERVAL_TICKS) | 0;
+      const targetIndex = ((cycleIndex % openCount) + openCount) % openCount;
+      let i = 0;
+      let targetTileX = -1;
+      let targetTileY = -1;
+      for (let c = 0; c < colony.chambers.length && targetTileX < 0; c++) {
+        const ch = colony.chambers[c]!;
+        if (ch.chamberType !== ChamberType.Queen) continue;
+        const bx = ch.posX >> FP_SHIFT;
+        const by = ch.posY >> FP_SHIFT;
+        for (let ty = 0; ty < ch.height && targetTileX < 0; ty++) {
+          for (let tx = 0; tx < ch.width; tx++) {
+            const cx = bx + tx;
+            const cy = by + ty;
+            if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
+            if (i === targetIndex) {
+              targetTileX = cx;
+              targetTileY = cy;
+              break;
+            }
+            i++;
+          }
+        }
+      }
+      if (targetTileX < 0) continue;
+      if (targetTileX === tileX && targetTileY === tileY) continue;
+      const rawDx = targetTileX - tileX;
+      const rawDy = targetTileY - tileY;
+      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+      } else {
+        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+      }
+    } else if (zone === Zone.Surface) {
+      // Pre-move descent: if the queen is already standing on one of her
+      // colony's OPEN entrance tiles, descend immediately rather than computing
+      // a (0,0) Manhattan delta and bailing via the zero-delta early return.
+      // Debug case: starter colony spawns the queen on the entrance tile with a
+      // completed Queen chamber already in place — without this short-circuit
+      // she would sit on the entrance forever and Gate 6 would block egg
+      // production indefinitely.
       for (let e = 0; e < colony.entrances.length; e++) {
         const entrance = colony.entrances[e]!;
         if (!entrance.isOpen) continue;
@@ -1954,12 +2055,7 @@ function moveQueens(
         break;
       }
       if (ants.zone[qId] === Zone.Underground) continue;
-    }
 
-    let dx = 0;
-    let dy = 0;
-
-    if (zone === Zone.Surface) {
       // Route to the nearest OPEN entrance. Deterministic tie-break:
       // smallest entranceId wins (same rule tickAntMovement uses).
       let bestDist = -1;

@@ -341,6 +341,7 @@ describe('drawUndergroundEntities', () => {
 
   it('draws eggs via sprites.drawStatic (kind=egg) from brood entity position', () => {
     const eggId = 5;
+    world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999;
     initAnt(world.ants, eggId, {
       colonyId: PLAYER_COLONY_ID,
       posX: 4 << FP_SHIFT,
@@ -355,6 +356,10 @@ describe('drawUndergroundEntities', () => {
     // SVG-backed render path: egg goes through the sprite layer, NOT fillCircle.
     expect(sprites.staticOfKind('egg').length).toBe(1);
     expect(gfx.callsOf('fillCircle').length).toBe(0);
+    // Issue #22 regression guard — the egg entity must NOT also be drawn as
+    // a worker ant sprite. Pre-fix this test passed even with the bug because
+    // it only asserted the egg sprite was emitted, not that no ant sprite was.
+    expect(sprites.calls.length).toBe(0);
     // Sprite is positioned at the tile center.
     const left = Math.floor(cam.x - cam.viewportWidth  / 2);
     const top  = Math.floor(cam.y - cam.viewportHeight / 2);
@@ -520,6 +525,7 @@ describe('drawUndergroundEntities', () => {
 
   it('draws larvae via sprites.drawStatic (kind=larva) from brood entity position', () => {
     const larvaId = 6;
+    world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999;
     initAnt(world.ants, larvaId, {
       colonyId: PLAYER_COLONY_ID,
       posX: 4 << FP_SHIFT,
@@ -533,6 +539,82 @@ describe('drawUndergroundEntities', () => {
 
     expect(sprites.staticOfKind('larva').length).toBe(1);
     expect(gfx.callsOf('fillCircle').length).toBe(0);
+    // Issue #22 regression guard — see notes on the egg test above.
+    expect(sprites.calls.length).toBe(0);
+  });
+
+  it('issue #22 — eggs and larvae are NOT drawn as worker ant sprites', () => {
+    // Bug repro: eggs/larvae share the AntComponents SoA store and are alive
+    // in zone=Underground with currentGridColonyId set. Pre-fix the underground
+    // ant loop iterated all such entities and emitted a worker-ant sprite at
+    // depth 50 for every brood, which painted on top of the egg/larva sprite
+    // (depth 48) emitted by the brood loop. User-visible artifact: "eggs
+    // appear to have ants drawn on them".
+    const eggId   = 5;
+    const larvaId = 6;
+    world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999; // avoid id-collision with brood
+    initAnt(world.ants, eggId, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: 4 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      zone: 1,
+    });
+    initAnt(world.ants, larvaId, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: 6 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      zone: 1,
+    });
+    world.colonies[PLAYER_COLONY_ID]!.eggs   = [eggId];
+    world.colonies[PLAYER_COLONY_ID]!.larvae = [larvaId];
+
+    const cam = makeCamera(5, 5, 20, 20);
+    drawUndergroundEntities(gfx, sprites, world, world, 0, cam);
+
+    // Brood gets static sprites at the right kind…
+    expect(sprites.staticOfKind('egg').length).toBe(1);
+    expect(sprites.staticOfKind('larva').length).toBe(1);
+    // …and crucially, NO ant sprites at all (no worker, no queen) — the brood
+    // entities must not leak through the ant loop and overdraw the brood SVGs.
+    expect(sprites.calls.length).toBe(0);
+  });
+
+  it('issue #22 — workers + brood in same grid: only workers render as ants, brood as static sprites', () => {
+    // Mixed-occupancy regression: a real chamber has worker nurses tending
+    // brood. The fix must skip ONLY brood from the ant loop, not workers.
+    const workerId = 4;
+    const eggId    = 5;
+    const larvaId  = 6;
+    world.colonies[PLAYER_COLONY_ID]!.queenEntityId = 999;
+    initAnt(world.ants, workerId, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: 5 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      zone: 1,
+    });
+    initAnt(world.ants, eggId, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: 4 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      zone: 1,
+    });
+    initAnt(world.ants, larvaId, {
+      colonyId: PLAYER_COLONY_ID,
+      posX: 6 << FP_SHIFT,
+      posY: 5 << FP_SHIFT,
+      zone: 1,
+    });
+    world.colonies[PLAYER_COLONY_ID]!.eggs   = [eggId];
+    world.colonies[PLAYER_COLONY_ID]!.larvae = [larvaId];
+
+    const cam = makeCamera(5, 5, 20, 20);
+    drawUndergroundEntities(gfx, sprites, world, world, 0, cam);
+
+    // Exactly one worker ant sprite (the nurse), and the two brood static sprites.
+    expect(sprites.calls.length).toBe(1);
+    expect(sprites.calls[0]!.kind).toBe('worker');
+    expect(sprites.staticOfKind('egg').length).toBe(1);
+    expect(sprites.staticOfKind('larva').length).toBe(1);
   });
 });
 

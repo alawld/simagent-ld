@@ -22,8 +22,8 @@ import { initAnt } from '../ant/ant-store.js';
 import type { ColonyRecord } from './colony-store.js';
 import { AntTask, ChamberType } from '../enums.js';
 import { hasCompletedChamber } from './colony-system.js';
-import { Zone } from '../terrain.js';
-import { FP_SHIFT } from '../fixed.js';
+import { Zone, ugGet, UndergroundTileState } from '../terrain.js';
+import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import {
   QUEEN_EGG_INTERVAL_TICKS,
   QUEEN_EGG_FOOD_THRESHOLD,
@@ -46,9 +46,7 @@ import {
 //   6. Queen in chamber:  queen entity Underground and inside a Queen chamber
 //                         footprint — debug seed936214196-tick2401 fix. While
 //                         she is still routing (Surface / tunnel), no eggs lay
-//                         so brood never spawns on the surface. Once she
-//                         arrives, eggs naturally spawn at her Queen-chamber
-//                         tile (reused spawn at queen posX/posY).
+//                         so brood never spawns on the surface.
 //
 // The chamber gates turn reproduction into an explicit progression unlock: the
 // player must excavate both a Queen chamber and a Nursery before brood can
@@ -61,8 +59,14 @@ import {
 //
 // When all gates pass:
 //   - Allocate new entity via allocateEntityId(world)
-//   - initAnt with task=Idle, speed=0, lifespan=WORKER_LIFESPAN_TICKS, age=0
-//   - Spawn at queen position (posX/posY from queen entity)
+//   - Pick a "drop tile" inside a Queen chamber that is NOT the queen's tile
+//     (issue #22), spread across all non-queen Open tiles by `eggId %
+//     openCount`. Falls back to the queen's exact fixed-point coords if no
+//     non-queen Open tile exists (1×1 chamber, fully blocked) or if the
+//     colony has no underground grid (test harnesses).
+//   - initAnt at the chosen drop tile (tile-center fixed-point); zone =
+//     Underground (Gate 6 invariant), task=Idle, speed=0, age=0,
+//     lifespan=WORKER_LIFESPAN_TICKS.
 //   - Push to colony.eggs; increment colony.eggCount
 //
 // No RNG parameter — egg production is fully deterministic.
@@ -107,12 +111,76 @@ export function tickQueenEggProduction(world: WorldState, colony: ColonyRecord):
   }
   if (!queenHome) return;
 
-  // Allocate + init new egg entity
+  // Issue #22 — pick a "drop tile" inside a Queen chamber that is NOT the
+  // queen's current tile so her sprite (depth 50) does not visually cover
+  // the freshly-laid egg sprite (depth 48), AND spread successive eggs
+  // across all such tiles so they do not all stack on the same drop tile
+  // (which would re-create the same visual hide-under-each-other artifact
+  // one tile over). Two-pass count/find using `eggId % openCount` as the
+  // spread index, mirroring the issue-#21 fix in transportBroodToNursery.
+  //
+  // Falls back to the queen's exact fixed-point coords when the colony has
+  // no underground grid (test harnesses without grids) or when no non-queen
+  // Open tile exists (1×1 chamber, or chamber fully blocked) — the visual
+  // artifact is acceptable in those degenerate cases so reproduction still
+  // proceeds.
+  //
+  // eggId is allocated up-front so the spread index is the egg's own ID,
+  // matching the brood-transport pattern (deterministic, replay-safe, and
+  // independent of colony.eggCount which can be perturbed by death cleanup).
   const eggId = allocateEntityId(world);
+
+  let eggPosX = world.ants.posX[colony.queenEntityId]!;
+  let eggPosY = world.ants.posY[colony.queenEntityId]!;
+  const underground = world.undergroundGrids[colony.colonyId];
+  if (underground) {
+    let openCount = 0;
+    for (let c = 0; c < colony.chambers.length; c++) {
+      const ch = colony.chambers[c]!;
+      if (ch.chamberType !== ChamberType.Queen) continue;
+      const bx = ch.posX >> FP_SHIFT;
+      const by = ch.posY >> FP_SHIFT;
+      for (let ty = 0; ty < ch.height; ty++) {
+        for (let tx = 0; tx < ch.width; tx++) {
+          const cx = bx + tx;
+          const cy = by + ty;
+          if (cx === queenTileX && cy === queenTileY) continue;
+          if (ugGet(underground, cx, cy) === UndergroundTileState.Open) openCount++;
+        }
+      }
+    }
+    if (openCount > 0) {
+      // eggId is a non-negative entity ID, so the modulo is in [0, openCount).
+      const targetIndex = eggId % openCount;
+      let cursor = 0;
+      outer: for (let c = 0; c < colony.chambers.length; c++) {
+        const ch = colony.chambers[c]!;
+        if (ch.chamberType !== ChamberType.Queen) continue;
+        const bx = ch.posX >> FP_SHIFT;
+        const by = ch.posY >> FP_SHIFT;
+        for (let ty = 0; ty < ch.height; ty++) {
+          for (let tx = 0; tx < ch.width; tx++) {
+            const cx = bx + tx;
+            const cy = by + ty;
+            if (cx === queenTileX && cy === queenTileY) continue;
+            if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
+            if (cursor === targetIndex) {
+              eggPosX = (cx << FP_SHIFT) + (FP_ONE >> 1);
+              eggPosY = (cy << FP_SHIFT) + (FP_ONE >> 1);
+              break outer;
+            }
+            cursor++;
+          }
+        }
+      }
+    }
+  }
+
+  // Init the already-allocated egg entity.
   initAnt(world.ants, eggId, {
     colonyId: colony.colonyId,
-    posX:     world.ants.posX[colony.queenEntityId]!,
-    posY:     world.ants.posY[colony.queenEntityId]!,
+    posX:     eggPosX,
+    posY:     eggPosY,
     task:     AntTask.Idle,
     subTask:  0,
     speed:    0,                  // eggs don't move

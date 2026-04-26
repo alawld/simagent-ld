@@ -12,8 +12,8 @@ import { createWorldState } from '../types.js';
 import { createColonyRecord } from './colony-store.js';
 import { initAnt } from '../ant/ant-store.js';
 import { AntTask, ChamberType } from '../enums.js';
-import { Zone } from '../terrain.js';
-import { FP_SHIFT } from '../fixed.js';
+import { Zone, createUndergroundGrid, ugSet, UndergroundTileState } from '../terrain.js';
+import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import {
   QUEEN_EGG_INTERVAL_TICKS,
   QUEEN_EGG_FOOD_THRESHOLD,
@@ -273,9 +273,123 @@ describe('tickQueenEggProduction — Gate 6 queen-in-chamber', () => {
 
     expect(colony.eggs.length).toBe(1);
     const eggId = colony.eggs[0]!;
+    // Without an undergroundGrid the issue-#22 drop-tile scan short-circuits
+    // and the egg falls back to the queen's exact fixed-point position.
+    // 6i below is the with-grid variant that exercises the new placement.
     expect(world.ants.posX[eggId]).toBe(QUEEN_X);
     expect(world.ants.posY[eggId]).toBe(QUEEN_Y);
     expect(world.ants.zone[eggId]).toBe(Zone.Underground);
+  });
+
+  it('6i. issue #22 — lays egg at a non-queen Open chamber tile when underground grid is present', () => {
+    // Bug repro: pre-fix the egg was always placed at the queen's exact
+    // tile, so the queen sprite (depth 50) covered the egg sprite (depth
+    // 48). With an undergroundGrid available, the lay step scans the
+    // Queen chamber footprint and spreads eggs across all non-queen Open
+    // tiles by `eggId % openCount`. Asserts the egg lands on a chamber tile
+    // distinct from the queen's tile.
+    const QUEEN_TILE_X = 10;
+    const QUEEN_TILE_Y = 10;
+    const QUEEN_X = (QUEEN_TILE_X << FP_SHIFT) + (FP_ONE >> 1);
+    const QUEEN_Y = (QUEEN_TILE_Y << FP_SHIFT) + (FP_ONE >> 1);
+    const { world, colony } = setupWorldWithQueen(10_000, QUEEN_X, QUEEN_Y);
+    // Queen chamber footprint = (10..11, 10..11). Mark every chamber tile Open
+    // in a 16×16 grid so the scan can pick a non-queen tile.
+    const grid = createUndergroundGrid(16, 16);
+    for (let ty = QUEEN_TILE_Y; ty < QUEEN_TILE_Y + 2; ty++) {
+      for (let tx = QUEEN_TILE_X; tx < QUEEN_TILE_X + 2; tx++) {
+        ugSet(grid, tx, ty, UndergroundTileState.Open);
+      }
+    }
+    world.undergroundGrids[COLONY_ID] = grid;
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(1);
+    const eggId = colony.eggs[0]!;
+    expect(eggId).toBe(1); // queen=0, first egg=1
+    const eggTileX = world.ants.posX[eggId]! >> FP_SHIFT;
+    const eggTileY = world.ants.posY[eggId]! >> FP_SHIFT;
+    // Inside the Queen chamber footprint…
+    expect(eggTileX).toBeGreaterThanOrEqual(QUEEN_TILE_X);
+    expect(eggTileX).toBeLessThan(QUEEN_TILE_X + 2);
+    expect(eggTileY).toBeGreaterThanOrEqual(QUEEN_TILE_Y);
+    expect(eggTileY).toBeLessThan(QUEEN_TILE_Y + 2);
+    // …and NOT on the queen's tile (visual de-overlap, the bug's user-facing claim).
+    expect(eggTileX === QUEEN_TILE_X && eggTileY === QUEEN_TILE_Y).toBe(false);
+    // 3 non-queen Open tiles in row-major order: (11,10), (10,11), (11,11).
+    // eggId=1, openCount=3, targetIndex = 1 % 3 = 1 → second tile (10, 11).
+    expect(eggTileX).toBe(QUEEN_TILE_X);
+    expect(eggTileY).toBe(QUEEN_TILE_Y + 1);
+  });
+
+  it('6i-spread. issue #22 — successive eggs spread across distinct non-queen Open tiles', () => {
+    // Pre-spread fix every queen-laid egg landed on the same row-major-first
+    // non-queen tile, recreating the visual stack one tile over. With
+    // eggId % openCount distribution, four sequential eggs in a 2×2 chamber
+    // (3 non-queen Open tiles) should visit at least 2 distinct tiles
+    // (cycle 1→2→0→1 over openCount=3).
+    const QUEEN_TILE_X = 10;
+    const QUEEN_TILE_Y = 10;
+    const QUEEN_X = (QUEEN_TILE_X << FP_SHIFT) + (FP_ONE >> 1);
+    const QUEEN_Y = (QUEEN_TILE_Y << FP_SHIFT) + (FP_ONE >> 1);
+    const { world, colony } = setupWorldWithQueen(10_000_000, QUEEN_X, QUEEN_Y);
+    const grid = createUndergroundGrid(16, 16);
+    for (let ty = QUEEN_TILE_Y; ty < QUEEN_TILE_Y + 2; ty++) {
+      for (let tx = QUEEN_TILE_X; tx < QUEEN_TILE_X + 2; tx++) {
+        ugSet(grid, tx, ty, UndergroundTileState.Open);
+      }
+    }
+    world.undergroundGrids[COLONY_ID] = grid;
+
+    // Lay 3 eggs by re-firing tickQueenEggProduction on tick 0, 300, 600
+    // (multiples of QUEEN_EGG_INTERVAL_TICKS so Gate 1 passes each time).
+    const tiles = new Set<string>();
+    for (let i = 0; i < 3; i++) {
+      world.tick = i * QUEEN_EGG_INTERVAL_TICKS;
+      tickQueenEggProduction(world, colony);
+    }
+    expect(colony.eggs.length).toBe(3);
+    for (const eggId of colony.eggs) {
+      const tx = world.ants.posX[eggId]! >> FP_SHIFT;
+      const ty = world.ants.posY[eggId]! >> FP_SHIFT;
+      tiles.add(`${tx},${ty}`);
+    }
+    // 3 eggs into 3 non-queen Open tiles → all 3 distinct (full coverage).
+    // eggIds 1,2,3 → indices 1,2,0 → tiles (10,11), (11,11), (11,10).
+    expect(tiles.size).toBe(3);
+    expect(tiles.has(`${QUEEN_TILE_X + 1},${QUEEN_TILE_Y}`)).toBe(true);
+    expect(tiles.has(`${QUEEN_TILE_X},${QUEEN_TILE_Y + 1}`)).toBe(true);
+    expect(tiles.has(`${QUEEN_TILE_X + 1},${QUEEN_TILE_Y + 1}`)).toBe(true);
+  });
+
+  it('6j. issue #22 fallback — degenerate 1×1 chamber lays egg at queen tile (no other Open tile)', () => {
+    // Edge case: when the chamber has no Open tile other than the queen's,
+    // the drop-tile scan finds nothing and the lay falls back to the
+    // queen's tile. This keeps reproduction working in pathological
+    // chamber configurations rather than blocking egg-laying entirely.
+    const QUEEN_X = (5 << FP_SHIFT) + (FP_ONE >> 1);
+    const QUEEN_Y = (5 << FP_SHIFT) + (FP_ONE >> 1);
+    const { world, colony } = setupWorldWithQueen(10_000, QUEEN_X, QUEEN_Y);
+    // Shrink the Queen chamber footprint to 1×1 around the queen tile.
+    for (const ch of colony.chambers) {
+      if (ch.chamberType === ChamberType.Queen) {
+        ch.width  = 1;
+        ch.height = 1;
+      }
+    }
+    const grid = createUndergroundGrid(16, 16);
+    ugSet(grid, 5, 5, UndergroundTileState.Open);
+    world.undergroundGrids[COLONY_ID] = grid;
+    world.tick = 0;
+
+    tickQueenEggProduction(world, colony);
+
+    expect(colony.eggs.length).toBe(1);
+    const eggId = colony.eggs[0]!;
+    expect(world.ants.posX[eggId]).toBe(QUEEN_X);
+    expect(world.ants.posY[eggId]).toBe(QUEEN_Y);
   });
 });
 
