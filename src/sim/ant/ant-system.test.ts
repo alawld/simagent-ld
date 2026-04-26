@@ -50,6 +50,7 @@ import {
   SEARCH_LEASH_MAX_WAVE,
   ENTRANCE_DEPOSIT_SUPPRESS_RADIUS,
   WORKER_BASE_SPEED,
+  QUEEN_EGG_INTERVAL_TICKS,
 } from '../constants.js';
 import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import { Zone, UndergroundTileState, ugGet, ugSet, createUndergroundGrid } from '../terrain.js';
@@ -4605,7 +4606,11 @@ describe('tickAntMovement — P1 queen relocation', () => {
     expect(world.ants.posY[queenId]).toBe(beforeY);
   });
 
-  it('Q-2. queen already inside Queen chamber footprint → no movement', () => {
+  it('Q-2. queen inside Queen chamber footprint → wanders toward a chamber Open tile (Issue #16)', () => {
+    // Queen at (3,3). 2×2 chamber footprint = {(2,2),(3,2),(2,3),(3,3)}. At
+    // tick=0 the wander target is the first enumerated Open tile (2,2), so the
+    // Manhattan step picks westward (|dx|===|dy| → dx-branch wins). She moves
+    // one half-tile west into tile (2,3) and remains inside the chamber.
     const { world, chamberFlowFields, queenId } = setupQueenWorld({
       queenTileX: 3, queenTileY: 3,            // inside chamber (2,2)-(3,3)
       addQueenChamber: true,
@@ -4620,8 +4625,45 @@ describe('tickAntMovement — P1 queen relocation', () => {
     const rng = new Rng(42);
     tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
 
-    expect(world.ants.posX[queenId]).toBe(beforeX);
-    expect(world.ants.posY[queenId]).toBe(beforeY);
+    const afterX = world.ants.posX[queenId]!;
+    const afterY = world.ants.posY[queenId]!;
+    // She moved (wander step is always one Manhattan dimension at speed 128 fp).
+    expect(afterX !== beforeX || afterY !== beforeY).toBe(true);
+    // She stayed inside the chamber footprint (no dirt-cut, no escape).
+    const afterTileX = afterX >> FP_SHIFT;
+    const afterTileY = afterY >> FP_SHIFT;
+    expect(afterTileX).toBeGreaterThanOrEqual(2);
+    expect(afterTileX).toBeLessThanOrEqual(3);
+    expect(afterTileY).toBeGreaterThanOrEqual(2);
+    expect(afterTileY).toBeLessThanOrEqual(3);
+  });
+
+  it('Q-2b. wander target advances every QUEEN_EGG_INTERVAL_TICKS (Issue #16)', () => {
+    // Same fixture as Q-2. At tick=0 the target is chamber Open tile index 0
+    // = (2,2). After advancing tick by QUEEN_EGG_INTERVAL_TICKS the target
+    // index becomes 1 = (3,2). The queen, having had ample time to reach
+    // (2,2), now drifts back toward (3,2). This pins the cadence contract:
+    // the wander cycle is tied to the egg-laying interval.
+    const { world, chamberFlowFields, queenId } = setupQueenWorld({
+      queenTileX: 2, queenTileY: 2,            // already at cycle-0 target
+      addQueenChamber: true,
+      queenChamberTileX: 2, queenChamberTileY: 2,
+      queenChamberWidth: 2, queenChamberHeight: 2,
+      computeQueenField: true,
+    });
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    // Cycle 0: she's already at target (2,2) → holds.
+    const t0X = world.ants.posX[queenId]!;
+    const t0Y = world.ants.posY[queenId]!;
+    tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
+    expect(world.ants.posX[queenId]).toBe(t0X);
+    expect(world.ants.posY[queenId]).toBe(t0Y);
+
+    // Advance to cycle 1 (target = (3,2)) and verify she now steps east.
+    world.tick = QUEEN_EGG_INTERVAL_TICKS;
+    tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
+    expect(world.ants.posX[queenId]).toBeGreaterThan(t0X);
   });
 
   it('Q-3. underground queen routes toward Queen chamber (flow-field step)', () => {

@@ -49,6 +49,7 @@ import {
   EXCURSION_TURN_PERCENT,
   EXCURSION_WOBBLE_PERCENT,
   ENTRANCE_DEPOSIT_SUPPRESS_RADIUS,
+  QUEEN_EGG_INTERVAL_TICKS,
 } from '../constants.js';
 import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import { Rng } from '../rng.js';
@@ -1882,11 +1883,15 @@ function isInsideQueenChamber(colony: ColonyRecord, tileX: number, tileY: number
 }
 
 /**
- * Move every alive colony queen one step toward her Queen chamber.
+ * Move every alive colony queen one step toward (or around inside) her Queen chamber.
  *
  * No Queen chamber → queen holds (initial state — any starting position is
  * the "home" position for Phase 3 playability).
- * Queen already inside Queen chamber footprint → hold.
+ * Queen already inside Queen chamber footprint → wander deterministically
+ * between chamber Open tiles, advancing the target every QUEEN_EGG_INTERVAL_TICKS.
+ * (Issue #16: prevents her sticking in whichever corner the flow-field first
+ * delivered her to; also spreads brood across the chamber since eggs spawn
+ * at the queen's current tile.)
  * Surface → step toward nearest OPEN entrance; descend when on the entrance
  * tile (Surface → Underground, posY = 0).
  * Underground → consume the per-colony `queen` chamber flow-field; fall back
@@ -1927,17 +1932,73 @@ function moveQueens(
     const tileX = prevPosX >> FP_SHIFT;
     const tileY = prevPosY >> FP_SHIFT;
 
-    // Already home — no movement.
-    if (zone === Zone.Underground && isInsideQueenChamber(colony, tileX, tileY)) continue;
+    let dx = 0;
+    let dy = 0;
 
-    // Pre-move descent: if the queen is already standing on one of her
-    // colony's OPEN entrance tiles, descend immediately rather than computing
-    // a (0,0) Manhattan delta and bailing via the zero-delta early return.
-    // Debug case: starter colony spawns the queen on the entrance tile with a
-    // completed Queen chamber already in place — without this short-circuit
-    // she would sit on the entrance forever and Gate 6 would block egg
-    // production indefinitely.
-    if (zone === Zone.Surface) {
+    // Issue #16 — once the queen is inside her chamber, drift between Open
+    // tiles instead of holding wherever the flow-field first delivered her
+    // (always a corner). Cycles deterministically every QUEEN_EGG_INTERVAL_TICKS
+    // so the target advances each egg-laying interval. Eggs spawn at her
+    // current tile (lifecycle-system.ts), so the wander also distributes
+    // brood across the chamber footprint.
+    const isAlreadyHome = zone === Zone.Underground && isInsideQueenChamber(colony, tileX, tileY);
+    if (isAlreadyHome) {
+      const underground = world.undergroundGrids[ants.currentGridColonyId[qId]!];
+      if (!underground) continue;
+      let openCount = 0;
+      for (let c = 0; c < colony.chambers.length; c++) {
+        const ch = colony.chambers[c]!;
+        if (ch.chamberType !== ChamberType.Queen) continue;
+        const bx = ch.posX >> FP_SHIFT;
+        const by = ch.posY >> FP_SHIFT;
+        for (let ty = 0; ty < ch.height; ty++) {
+          for (let tx = 0; tx < ch.width; tx++) {
+            if (ugGet(underground, bx + tx, by + ty) === UndergroundTileState.Open) openCount++;
+          }
+        }
+      }
+      if (openCount === 0) continue;
+      // eslint-disable-next-line no-restricted-syntax -- integer division via `| 0`; tick / interval is integer arithmetic, not fixed-point math
+      const targetIndex = ((world.tick / QUEEN_EGG_INTERVAL_TICKS) | 0) % openCount;
+      let i = 0;
+      let targetTileX = -1;
+      let targetTileY = -1;
+      for (let c = 0; c < colony.chambers.length && targetTileX < 0; c++) {
+        const ch = colony.chambers[c]!;
+        if (ch.chamberType !== ChamberType.Queen) continue;
+        const bx = ch.posX >> FP_SHIFT;
+        const by = ch.posY >> FP_SHIFT;
+        for (let ty = 0; ty < ch.height && targetTileX < 0; ty++) {
+          for (let tx = 0; tx < ch.width; tx++) {
+            const cx = bx + tx;
+            const cy = by + ty;
+            if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
+            if (i === targetIndex) {
+              targetTileX = cx;
+              targetTileY = cy;
+              break;
+            }
+            i++;
+          }
+        }
+      }
+      if (targetTileX < 0) continue;
+      if (targetTileX === tileX && targetTileY === tileY) continue;
+      const rawDx = targetTileX - tileX;
+      const rawDy = targetTileY - tileY;
+      if (Math.abs(rawDx) >= Math.abs(rawDy)) {
+        dx = rawDx > 0 ? 1 : rawDx < 0 ? -1 : 0;
+      } else {
+        dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
+      }
+    } else if (zone === Zone.Surface) {
+      // Pre-move descent: if the queen is already standing on one of her
+      // colony's OPEN entrance tiles, descend immediately rather than computing
+      // a (0,0) Manhattan delta and bailing via the zero-delta early return.
+      // Debug case: starter colony spawns the queen on the entrance tile with a
+      // completed Queen chamber already in place — without this short-circuit
+      // she would sit on the entrance forever and Gate 6 would block egg
+      // production indefinitely.
       for (let e = 0; e < colony.entrances.length; e++) {
         const entrance = colony.entrances[e]!;
         if (!entrance.isOpen) continue;
@@ -1956,10 +2017,7 @@ function moveQueens(
       if (ants.zone[qId] === Zone.Underground) continue;
     }
 
-    let dx = 0;
-    let dy = 0;
-
-    if (zone === Zone.Surface) {
+    if (!isAlreadyHome && zone === Zone.Surface) {
       // Route to the nearest OPEN entrance. Deterministic tie-break:
       // smallest entranceId wins (same rule tickAntMovement uses).
       let bestDist = -1;
@@ -1985,7 +2043,7 @@ function moveQueens(
       } else {
         dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
       }
-    } else {
+    } else if (!isAlreadyHome) {
       // Underground → follow the queen flow-field (seeded only from Queen
       // chamber Open tiles). A Nursery-only chamber tile must NOT be a
       // resting target for the queen, so we never consume the nursing field
