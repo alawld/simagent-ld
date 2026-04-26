@@ -78,6 +78,7 @@ import {
   WORKER_SPRITE_WIDTH,
 } from './ant-sprite-layer.js';
 import { AntSpritePool } from './ant-sprite-pool.js';
+import { SUBTERRANS_READY_EVENT } from './lifecycle.js';
 
 // Sprite assets are served from code/public/ as real files. Vite's
 // `new URL(..., import.meta.url)` pattern inlines SVGs under ~4KB as
@@ -282,6 +283,16 @@ export class GameScene extends Phaser.Scene {
     } else {
       this.bootFresh();
     }
+
+    // Lifecycle signal — preload assets are loaded (we're in create()), the
+    // scene graph is constructed, and the chosen boot path (fresh world or
+    // SavePrompt overlay) has been dispatched. Phaser's first render tick
+    // runs after create() returns, so the canvas paints on the next frame;
+    // "ready" here means "interactive imminently", which is the right
+    // moment for a host page to hide a loading spinner. Emit after the
+    // bootMode branch so both paths reach it. main.ts converts this to
+    // `MountedGame.ready: Promise<void>` for the host page.
+    this.game.events.emit(SUBTERRANS_READY_EVENT);
   }
 
   // ---------------------------------------------------------------------------

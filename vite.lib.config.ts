@@ -14,11 +14,14 @@
 // Output filename is content-hashed (index.[hash].js) so the website can
 // publish it under Cache-Control: immutable without invalidation churn.
 // A sibling manifest.json maps `entry → filename` so the deploy can inject
-// the correct <script src=…> URL into the host page.
+// the correct <script src=…> URL into the host page. A sibling index.d.ts
+// declares the public API surface (mount/MountOptions/MountedGame) for
+// type-only imports in the host project.
 
 import { defineConfig, type Plugin } from 'vite';
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import ts from 'typescript';
 
 /** Emit dist-lib/manifest.json after the bundle is written, so the website
  *  deploy can read `entry` and inject the right hashed <script src=…>.
@@ -47,12 +50,97 @@ const manifestPlugin = (): Plugin => ({
   },
 });
 
+/** Emit dist-lib/index.d.ts by running the TypeScript compiler programmatically
+ *  on `src/main.ts`. Generates declarations from the actual source — no
+ *  hand-maintained string, no drift risk: any change to MountOptions /
+ *  MountedGame / mount in main.ts flows through to the published types on
+ *  the next build. JSDoc comments are preserved verbatim by tsc.
+ *
+ *  We don't use vite-plugin-dts because (a) we already have `typescript`
+ *  as a devDep and (b) we want to emit only main.ts's declarations, not
+ *  the transitive render-internal modules — `program.emit(sourceFile, …)`
+ *  with the writeFile callback constrains output to the single file.
+ *
+ *  The output filename is fixed (`index.d.ts`, no hash) because TS module
+ *  resolution is path-based; consumers reference types via a stable path
+ *  that is decoupled from the runtime entry name in manifest.json. */
+const dtsPlugin = (): Plugin => ({
+  name: 'subterrans-lib-dts',
+  writeBundle(options) {
+    const dir = options.dir ?? 'dist-lib';
+    writeFileSync(join(dir, 'index.d.ts'), generateMainDts());
+  },
+});
+
+/** Run tsc programmatically on src/main.ts and return the emitted .d.ts
+ *  text. Inherits the project's tsconfig (incl. `types: [vite/client]` so
+ *  `import.meta.env` resolves) but forces declaration-only emit. */
+function generateMainDts(): string {
+  const SRC = 'src/main.ts';
+  const configPath = ts.findConfigFile('.', ts.sys.fileExists, 'tsconfig.json');
+  if (configPath === undefined) {
+    throw new Error('subterrans-lib-dts: tsconfig.json not found in cwd');
+  }
+  const { config, error } = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (error !== undefined) {
+    throw new Error(`subterrans-lib-dts: failed to read tsconfig.json: ${error.messageText}`);
+  }
+  const parsed = ts.parseJsonConfigFileContent(config, ts.sys, dirname(configPath));
+  const program = ts.createProgram({
+    rootNames: [SRC],
+    options: {
+      ...parsed.options,
+      declaration: true,
+      emitDeclarationOnly: true,
+      noEmit: false,
+      outDir: undefined,
+      declarationMap: false,
+      sourceMap: false,
+    },
+  });
+  const sourceFile = program.getSourceFile(SRC);
+  if (sourceFile === undefined) {
+    throw new Error(`subterrans-lib-dts: tsc could not load ${SRC}`);
+  }
+  // Fail loudly on type errors before emit. `npm run verify` runs
+  // `tsc --noEmit` upstream and would catch these too, but a developer
+  // running `build:lib` in isolation should not be able to ship a
+  // garbage-but-syntactically-valid .d.ts on top of broken types.
+  // Restrict to main.ts diagnostics — type errors in transitive modules
+  // are out of scope for this build step (they are caught by typecheck).
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(sourceFile),
+    ...program.getSemanticDiagnostics(sourceFile),
+  ];
+  if (diagnostics.length > 0) {
+    const formatted = ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+      getCanonicalFileName: (f) => f,
+      getCurrentDirectory: ts.sys.getCurrentDirectory,
+      getNewLine: () => ts.sys.newLine,
+    });
+    throw new Error(
+      `subterrans-lib-dts: TypeScript errors in ${SRC} block .d.ts emit:\n${formatted}`,
+    );
+  }
+  let dts: string | undefined;
+  // Pass sourceFile to constrain emit to main.ts only (skip the 50+
+  // transitively imported modules). The writeFile callback captures the
+  // emitted text in-memory rather than letting tsc write to disk.
+  program.emit(sourceFile, (fileName, content) => {
+    if (fileName.endsWith('main.d.ts')) dts = content;
+  });
+  if (dts === undefined) {
+    throw new Error('subterrans-lib-dts: tsc emit produced no main.d.ts output');
+  }
+  return dts;
+}
+
 export default defineConfig({
   // Suppress copying public/* into dist-lib/. Sprite assets live in the
   // website's deploy at /demo/play/assets/sprites/* — the library bundle
   // doesn't need to ship duplicates.
   publicDir: false,
-  plugins: [manifestPlugin()],
+  plugins: [manifestPlugin(), dtsPlugin()],
   build: {
     target: 'es2022',
     outDir: 'dist-lib',
