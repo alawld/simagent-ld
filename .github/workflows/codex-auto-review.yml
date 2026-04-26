@@ -36,7 +36,7 @@ jobs:
   request-review:
     name: Request @codex review
     runs-on: ubuntu-latest
-    # Skip drafts and fork PRs.
+    # Skip drafts, fork PRs, and PRs authored by the repo owner.
     #
     # Drafts: Codex doesn't review drafts on its own anyway, and the comment
     # would just sit there until ready_for_review fires (which retriggers).
@@ -51,9 +51,18 @@ jobs:
     # that reads PR-controlled inputs (titles, branch names, file contents)
     # into shell or untrusted contexts becomes a script-injection target.
     # Make that switch in its own PR with explicit security review.
+    #
+    # Owner PRs: LightAxe's own PRs already get a Codex review automatically
+    # (the connector reviews them server-side without needing the @codex
+    # mention). Posting "@codex review" on top of that produces a redundant
+    # second review and burns Codex quota. Contributor PRs do NOT get the
+    # automatic server-side review (that path is gated on the PR author's
+    # ChatGPT plan), so they still need the explicit mention. Skip when the
+    # PR author matches the owner login.
     if: >
       github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name &&
+      github.event.pull_request.user.login != 'LightAxe'
     steps:
       - name: Post "@codex review" (skip if posted recently)
         uses: actions/github-script@v9
