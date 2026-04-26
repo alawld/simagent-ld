@@ -1,0 +1,108 @@
+name: Codex Auto Review
+
+# Auto-posts an "@codex review" comment on non-draft PRs so the OpenAI Codex
+# GitHub App performs a review on every open / push / ready-for-review event.
+# This is the keyword the Codex connector listens for (confirmed in its own
+# reply text on prior PRs in this repo) — it removes the need for a manual
+# trigger comment and avoids the Pro-gated "Automatic Reviews" toggle on the
+# Codex side.
+#
+# Out of scope: this workflow does not consume the review output. Codex posts
+# its findings as a separate comment from chatgpt-codex-connector.
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+# Least-privilege scoping. `pull-requests: write` is sufficient for posting
+# conversation comments on PRs via github.rest.issues.createComment (PRs are
+# issues under the hood; pull-requests permission governs PR-issue endpoints).
+# `contents: read` is unused by this workflow but kept at read so a future
+# step that reads repo files (e.g. config-driven trigger keyword) doesn't
+# silently fail.
+permissions:
+  pull-requests: write
+  contents: read
+
+# Per-PR concurrency. A rapid sequence of pushes on the same branch produces
+# back-to-back synchronize events; cancel-in-progress: true ensures only the
+# latest run posts (and the dedupe step below catches anything that already
+# slipped through).
+concurrency:
+  group: codex-auto-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  request-review:
+    name: Request @codex review
+    runs-on: ubuntu-latest
+    # Skip drafts and fork PRs.
+    #
+    # Drafts: Codex doesn't review drafts on its own anyway, and the comment
+    # would just sit there until ready_for_review fires (which retriggers).
+    #
+    # Forks: GITHUB_TOKEN issued for `pull_request` events from forks is
+    # read-only — github.rest.issues.createComment would 403. To support
+    # fork PRs, switch the trigger to `pull_request_target`, which gets a
+    # read/write token even on fork PRs. SECURITY CAVEAT: pull_request_target
+    # runs the workflow definition from the BASE branch with the base ref's
+    # secrets and write token. That's safe for a comment-only workflow like
+    # this one (no checkout, no PR code execution), but any future addition
+    # that reads PR-controlled inputs (titles, branch names, file contents)
+    # into shell or untrusted contexts becomes a script-injection target.
+    # Make that switch in its own PR with explicit security review.
+    if: >
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    steps:
+      - name: Post "@codex review" (skip if posted recently)
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const reviewBody = '@codex review';
+
+            // Dedupe burst events: if our last bot comment on this PR is
+            // already "@codex review" and landed within DEDUPE_WINDOW_MS,
+            // skip the post. Protects against rapid synchronize events
+            // stacking review requests faster than Codex can respond.
+            //
+            // Trade-off: a legitimate quick follow-up push (typo fix within
+            // a few minutes) won't re-trigger Codex. That's acceptable — a
+            // re-review can always be requested manually with @codex review.
+            const DEDUPE_WINDOW_MS = 3 * 60 * 1000; // 3 minutes
+            const BOT_LOGIN = 'github-actions[bot]';
+
+            // First page (100 comments, ascending order) is sufficient for
+            // any realistic PR. A PR with >100 comments where the bot's
+            // most recent post is off-page falls back to posting again,
+            // which is the safe failure mode.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const lastBotComment = [...comments]
+              .reverse()
+              .find((c) => c.user && c.user.login === BOT_LOGIN);
+
+            if (lastBotComment && lastBotComment.body.trim() === reviewBody) {
+              const ageMs = Date.now() - new Date(lastBotComment.created_at).getTime();
+              if (ageMs < DEDUPE_WINDOW_MS) {
+                core.info(
+                  `Skipping: last ${BOT_LOGIN} comment on PR #${prNumber} is ` +
+                  `already "${reviewBody}" (${Math.round(ageMs / 1000)}s ago).`,
+                );
+                return;
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: reviewBody,
+            });
+            core.info(`Posted "${reviewBody}" on PR #${prNumber}.`);
