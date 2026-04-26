@@ -477,9 +477,15 @@ export function tickNurseActions(world: WorldState): void {
  * restricted to alive entities whose tile is NOT already inside any Nursery
  * footprint. If every brood is already in a Nursery, does nothing.
  *
- * Destination: first Nursery chamber in colony.chambers order; within it,
- * the first Open tile in row-major iteration over its footprint. Writes
- * posX/posY in fixed-point (tile-center) and zone=Underground.
+ * Destination: spread across every Open tile in every Nursery chamber the
+ * colony owns. The candidate tiles are enumerated row-major across all
+ * Nursery chambers in colony.chambers order; the chosen tile is index
+ * `pickId % openCount` (issue #21 fix — pre-fix this always wrote to the
+ * first Open tile, stacking every brood at one corner). Writes posX/posY
+ * in fixed-point (tile-center) and zone=Underground. With a single Open
+ * tile (e.g., a 1×1 Nursery, or a Nursery whose other tiles are still
+ * Solid) the modulo collapses to 0 and brood necessarily land on that
+ * one tile — there is no other valid Open tile to spread to.
  *
  * No allocations, no RNG, no wall-clock.
  */
@@ -503,8 +509,14 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
   }
   if (pickId < 0) return;
 
-  // 2. Find the first Nursery Open tile (row-major within the first Nursery
-  //    chamber). Requires the colony's underground grid to check state.
+  // 2. Distribute across all Nursery Open tiles (issue #21). Pre-fix the
+  //    transport always picked the first Open tile in row-major order across
+  //    the first Nursery chamber, so successive brood stacked at one corner.
+  //    Now: count Open tiles across every Nursery chamber the colony owns,
+  //    then deposit at index `pickId % openCount` in row-major order. Using
+  //    pickId (the brood's own entity ID) gives a deterministic, replay-safe
+  //    spread that fans out as new brood is transported — different IDs land
+  //    on different tiles. Same two-pass count/find pattern as moveQueens.
   //
   // Phase 09.1 Chunk 0 disposition: own-colony chamber membership — brood
   // is transported into its own colony's Nursery chamber, never into an
@@ -513,6 +525,24 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
   const underground = world.undergroundGrids[colony.colonyId];
   if (!underground) return;
 
+  let openCount = 0;
+  for (let c = 0; c < colony.chambers.length; c++) {
+    const ch = colony.chambers[c]!;
+    if (ch.chamberType !== ChamberType.Nursery) continue;
+    const bx = ch.posX >> FP_SHIFT;
+    const by = ch.posY >> FP_SHIFT;
+    for (let ty = 0; ty < ch.height; ty++) {
+      for (let tx = 0; tx < ch.width; tx++) {
+        if (ugGet(underground, bx + tx, by + ty) === UndergroundTileState.Open) openCount++;
+      }
+    }
+  }
+  if (openCount === 0) return;
+
+  // pickId is a non-negative entity ID, so the modulo is always in
+  // [0, openCount) without the negative-fold guard moveQueens needs.
+  const targetIndex = pickId % openCount;
+  let cursor = 0;
   for (let c = 0; c < colony.chambers.length; c++) {
     const ch = colony.chambers[c]!;
     if (ch.chamberType !== ChamberType.Nursery) continue;
@@ -523,16 +553,19 @@ function transportBroodToNursery(world: WorldState, colony: ColonyRecord): void 
         const cx = bx + tx;
         const cy = by + ty;
         if (ugGet(underground, cx, cy) !== UndergroundTileState.Open) continue;
-        // Fixed-point tile-center position.
-        ants.posX[pickId] = (cx << FP_SHIFT) + (FP_ONE >> 1);
-        ants.posY[pickId] = (cy << FP_SHIFT) + (FP_ONE >> 1);
-        ants.zone[pickId] = Zone.Underground;
-        // Phase 09.1 Chunk 0 — descent invariant. Brood teleported into
-        // nursery now occupies that colony's grid. Today brood is in its
-        // OWN colony so colony.colonyId === ants.colonyId[pickId] and this
-        // is a byte-identical no-op.
-        ants.currentGridColonyId[pickId] = colony.colonyId;
-        return;
+        if (cursor === targetIndex) {
+          // Fixed-point tile-center position.
+          ants.posX[pickId] = (cx << FP_SHIFT) + (FP_ONE >> 1);
+          ants.posY[pickId] = (cy << FP_SHIFT) + (FP_ONE >> 1);
+          ants.zone[pickId] = Zone.Underground;
+          // Phase 09.1 Chunk 0 — descent invariant. Brood teleported into
+          // nursery now occupies that colony's grid. Today brood is in its
+          // OWN colony so colony.colonyId === ants.colonyId[pickId] and this
+          // is a byte-identical no-op.
+          ants.currentGridColonyId[pickId] = colony.colonyId;
+          return;
+        }
+        cursor++;
       }
     }
   }

@@ -4973,10 +4973,21 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
     };
   }
 
-  it('B-1. egg on non-Nursery tile is teleported to Nursery Open tile', () => {
+  // Issue #21 — brood are now spread across the Nursery footprint by
+  //   index = pickId % openCount
+  // (row-major over Nursery Open tiles). Pre-fix every transport collapsed
+  // to nurseryTile (top-left), stacking every brood at one corner. Tests
+  // below pin the exact post-fix tile each pickId lands on so a regression
+  // back to "always tile 0" lights up immediately. setupBroodTransportWorld
+  // allocates queenId=0 + nurseId=1 first, so the first user-allocated
+  // brood gets entityId=2 — which under the 2×2 Nursery (4 open tiles) maps
+  // to the 3rd tile in row-major order: (nurseryTile.x, nurseryTile.y + 1).
+
+  it('B-1. egg on non-Nursery tile is teleported to a Nursery Open tile (spread by pickId)', () => {
     const { world, colony, nurseryTile } = setupBroodTransportWorld({});
     // Add an egg at (0,0) — outside Nursery footprint.
     const eggId = allocateEntityId(world);
+    expect(eggId).toBe(2); // queenId=0, nurseId=1 → eggId=2; pin the spread math.
     initAnt(world.ants, eggId, {
       colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
     });
@@ -4985,16 +4996,18 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
 
     tickNurseActions(world);
 
+    // pickId=2, openCount=4, targetIndex=2 → 3rd row-major Open tile.
     const eggTileX = world.ants.posX[eggId]! >> FP_SHIFT;
     const eggTileY = world.ants.posY[eggId]! >> FP_SHIFT;
     expect(eggTileX).toBe(nurseryTile.x);
-    expect(eggTileY).toBe(nurseryTile.y);
+    expect(eggTileY).toBe(nurseryTile.y + 1);
     expect(world.ants.zone[eggId]).toBe(Zone.Underground);
   });
 
-  it('B-2. larva is teleported to Nursery on nurse service', () => {
+  it('B-2. larva is teleported to a Nursery Open tile on nurse service (spread by pickId)', () => {
     const { world, colony, nurseryTile } = setupBroodTransportWorld({});
     const larvaId = allocateEntityId(world);
+    expect(larvaId).toBe(2);
     initAnt(world.ants, larvaId, {
       colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
     });
@@ -5003,8 +5016,9 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
 
     tickNurseActions(world);
 
+    // pickId=2, targetIndex=2 → (nurseryTile.x, nurseryTile.y + 1).
     expect(world.ants.posX[larvaId]! >> FP_SHIFT).toBe(nurseryTile.x);
-    expect(world.ants.posY[larvaId]! >> FP_SHIFT).toBe(nurseryTile.y);
+    expect(world.ants.posY[larvaId]! >> FP_SHIFT).toBe(nurseryTile.y + 1);
   });
 
   it('B-3. no Nursery chamber → brood stays in place (gate enforced)', () => {
@@ -5047,6 +5061,7 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
   it('B-5. dead brood is skipped — transport picks the next alive entity', () => {
     const { world, colony, nurseryTile } = setupBroodTransportWorld({});
     const deadEgg = allocateEntityId(world);
+    expect(deadEgg).toBe(2);
     initAnt(world.ants, deadEgg, {
       colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
     });
@@ -5054,6 +5069,7 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
     colony.eggs.push(deadEgg);
 
     const aliveEgg = allocateEntityId(world);
+    expect(aliveEgg).toBe(3);
     initAnt(world.ants, aliveEgg, {
       colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
     });
@@ -5064,9 +5080,10 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
 
     // Dead brood must not have moved.
     expect(world.ants.posX[deadEgg]).toBe(0);
-    // Alive brood is teleported.
-    expect(world.ants.posX[aliveEgg]! >> FP_SHIFT).toBe(nurseryTile.x);
-    expect(world.ants.posY[aliveEgg]! >> FP_SHIFT).toBe(nurseryTile.y);
+    // Alive brood is teleported. pickId=3, openCount=4, targetIndex=3 →
+    // 4th row-major Open tile = (nurseryTile.x + 1, nurseryTile.y + 1).
+    expect(world.ants.posX[aliveEgg]! >> FP_SHIFT).toBe(nurseryTile.x + 1);
+    expect(world.ants.posY[aliveEgg]! >> FP_SHIFT).toBe(nurseryTile.y + 1);
   });
 
   it('B-6. deterministic lowest-id selection across multiple brood', () => {
@@ -5076,6 +5093,7 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
     // first. Push `higherId` FIRST into colony.eggs to prove that selection
     // is by entity ID, not by insertion order.
     const lowerId = allocateEntityId(world);
+    expect(lowerId).toBe(2);
     initAnt(world.ants, lowerId, {
       colonyId: COLONY_ID, posX: 1 << FP_SHIFT, posY: 1 << FP_SHIFT, speed: 0, zone: Zone.Underground,
     });
@@ -5088,8 +5106,10 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
 
     tickNurseActions(world);
 
-    // The smaller entity ID must be the one moved.
+    // The smaller entity ID is the one moved. pickId=2 → 3rd Open tile =
+    // (nurseryTile.x, nurseryTile.y + 1). Higher-id brood stays put.
     expect(world.ants.posX[lowerId]!  >> FP_SHIFT).toBe(nurseryTile.x);
+    expect(world.ants.posY[lowerId]!  >> FP_SHIFT).toBe(nurseryTile.y + 1);
     expect(world.ants.posX[higherId]! >> FP_SHIFT).toBe(1);
   });
 
@@ -5097,6 +5117,7 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
     const { world, colony, nurseryTile } = setupBroodTransportWorld({});
     // Place egg inside the Nursery footprint — it must be skipped.
     const insideEgg = allocateEntityId(world);
+    expect(insideEgg).toBe(2);
     initAnt(world.ants, insideEgg, {
       colonyId: COLONY_ID,
       posX:     (nurseryTile.x << FP_SHIFT) + (FP_ONE >> 1),
@@ -5107,6 +5128,7 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
 
     // Add an outside egg — it is the one the nurse should move.
     const outsideEgg = allocateEntityId(world);
+    expect(outsideEgg).toBe(3);
     initAnt(world.ants, outsideEgg, {
       colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
     });
@@ -5114,6 +5136,133 @@ describe('tickNurseActions — P2 brood transport to Nursery', () => {
 
     tickNurseActions(world);
 
-    expect(world.ants.posX[outsideEgg]! >> FP_SHIFT).toBe(nurseryTile.x);
+    // pickId=3 → 4th Open tile = (nurseryTile.x + 1, nurseryTile.y + 1).
+    expect(world.ants.posX[outsideEgg]! >> FP_SHIFT).toBe(nurseryTile.x + 1);
+    expect(world.ants.posY[outsideEgg]! >> FP_SHIFT).toBe(nurseryTile.y + 1);
+  });
+
+  it('B-8a. issue #21 degenerate — 1×1 Nursery collapses spread to the single Open tile (no other tile to spread to)', () => {
+    // Edge case: a Nursery with exactly one Open tile (e.g., 1×1 chamber, or
+    // a 2×2 chamber where the other three tiles are still Solid mid-dig).
+    // openCount = 1 so the modulo is always 0 and every brood lands on the
+    // single tile. This is not a regression of #21 — there is no other
+    // valid Open tile to spread to. Test pins the openCount=1 collapse so
+    // a future refactor cannot silently change the contract (e.g., a
+    // refactor that produced an off-by-one cursor or skipped the only tile
+    // would land brood elsewhere and fail this assertion).
+    const { world, colony, nurseryTile } = setupBroodTransportWorld({});
+    // Shrink the Nursery to 1×1; underground grid stays all-Open so the
+    // single tile (nurseryTile.x, nurseryTile.y) is the only Open Nursery tile.
+    for (const ch of colony.chambers) {
+      if (ch.chamberType === ChamberType.Nursery) {
+        ch.width  = 1;
+        ch.height = 1;
+      }
+    }
+    const eggId = allocateEntityId(world);
+    initAnt(world.ants, eggId, {
+      colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
+    });
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+
+    tickNurseActions(world);
+
+    expect(world.ants.posX[eggId]! >> FP_SHIFT).toBe(nurseryTile.x);
+    expect(world.ants.posY[eggId]! >> FP_SHIFT).toBe(nurseryTile.y);
+  });
+
+  it('B-8. issue #21 — successive brood transports spread across Nursery tiles, not one corner', () => {
+    // Bug repro: pre-fix transport always wrote to the first row-major Open
+    // tile in the first Nursery chamber, so every brood collapsed to a
+    // single corner. Build four brood, transport each, assert the four
+    // tiles visited cover all four 2×2 Nursery cells.
+    const { world, colony, nurseryTile, nurseId, queenTile } = setupBroodTransportWorld({});
+
+    const broodIds: number[] = [];
+    for (let k = 0; k < 4; k++) {
+      const id = allocateEntityId(world);
+      initAnt(world.ants, id, {
+        colonyId: COLONY_ID, posX: 0, posY: 0, speed: 0, zone: Zone.Underground,
+      });
+      colony.eggs.push(id);
+      broodIds.push(id);
+    }
+    colony.eggCount = 4;
+    expect(broodIds).toEqual([2, 3, 4, 5]); // pin pickId modulo math.
+
+    // Transport one brood per tickNurseActions call. After each call the
+    // nurse flips MovingToBrood→Feeding, so reset back to MovingToBrood
+    // (and re-place on the queen-chamber service tile) for the next round.
+    const visited = new Set<string>();
+    for (let k = 0; k < 4; k++) {
+      world.ants.task[nurseId]    = AntTask.Nursing;
+      world.ants.subTask[nurseId] = NursingSubState.MovingToBrood;
+      world.ants.posX[nurseId]    = (queenTile.x << FP_SHIFT) + (FP_ONE >> 1);
+      world.ants.posY[nurseId]    = (queenTile.y << FP_SHIFT) + (FP_ONE >> 1);
+      tickNurseActions(world);
+    }
+
+    for (const id of broodIds) {
+      const tx = world.ants.posX[id]! >> FP_SHIFT;
+      const ty = world.ants.posY[id]! >> FP_SHIFT;
+      // Every brood landed inside the Nursery footprint.
+      expect(tx).toBeGreaterThanOrEqual(nurseryTile.x);
+      expect(tx).toBeLessThan(nurseryTile.x + 2);
+      expect(ty).toBeGreaterThanOrEqual(nurseryTile.y);
+      expect(ty).toBeLessThan(nurseryTile.y + 2);
+      visited.add(`${tx},${ty}`);
+    }
+    // …and all four Nursery tiles were covered — no corner pile-up.
+    expect(visited.size).toBe(4);
+    // Pin the exact pickId→tile mapping (row-major over the 2×2 footprint:
+    // index 0=(x,y), 1=(x+1,y), 2=(x,y+1), 3=(x+1,y+1)). pickIds 2,3,4,5
+    // → indices 2,3,0,1 → tiles (x,y+1), (x+1,y+1), (x,y), (x+1,y).
+    expect(world.ants.posX[broodIds[0]!]! >> FP_SHIFT).toBe(nurseryTile.x);
+    expect(world.ants.posY[broodIds[0]!]! >> FP_SHIFT).toBe(nurseryTile.y + 1);
+    expect(world.ants.posX[broodIds[1]!]! >> FP_SHIFT).toBe(nurseryTile.x + 1);
+    expect(world.ants.posY[broodIds[1]!]! >> FP_SHIFT).toBe(nurseryTile.y + 1);
+    expect(world.ants.posX[broodIds[2]!]! >> FP_SHIFT).toBe(nurseryTile.x);
+    expect(world.ants.posY[broodIds[2]!]! >> FP_SHIFT).toBe(nurseryTile.y);
+    expect(world.ants.posX[broodIds[3]!]! >> FP_SHIFT).toBe(nurseryTile.x + 1);
+    expect(world.ants.posY[broodIds[3]!]! >> FP_SHIFT).toBe(nurseryTile.y);
+  });
+
+  it('B-8b. issue #21 — Nursery with zero Open tiles short-circuits (no teleport)', () => {
+    // Edge case: a Nursery chamber exists in colony.chambers but every tile
+    // in its footprint is Solid (e.g., the chamber was just registered but
+    // the dig pass has not converted any tile yet). openCount=0, so the
+    // transport must early-return without writing posX/posY/zone — leaving
+    // the brood at its original (queen-tile-side) position to be retried on
+    // a later tick once the Nursery actually has Open tiles.
+    const { world, colony, nurseId, queenTile } = setupBroodTransportWorld({});
+    // Mark every Nursery tile Solid so openCount across the chamber is 0.
+    const grid = world.undergroundGrids[COLONY_ID]!;
+    for (const ch of colony.chambers) {
+      if (ch.chamberType !== ChamberType.Nursery) continue;
+      const bx = ch.posX >> FP_SHIFT;
+      const by = ch.posY >> FP_SHIFT;
+      for (let ty = 0; ty < ch.height; ty++) {
+        for (let tx = 0; tx < ch.width; tx++) {
+          ugSet(grid, bx + tx, by + ty, UndergroundTileState.Solid);
+        }
+      }
+    }
+    // Brood placed at the queen's tile (outside the now-Solid Nursery).
+    const eggId = allocateEntityId(world);
+    const startX = (queenTile.x << FP_SHIFT) + (FP_ONE >> 1);
+    const startY = (queenTile.y << FP_SHIFT) + (FP_ONE >> 1);
+    initAnt(world.ants, eggId, {
+      colonyId: COLONY_ID, posX: startX, posY: startY, speed: 0, zone: Zone.Underground,
+    });
+    colony.eggs.push(eggId);
+    colony.eggCount = 1;
+    void nurseId;
+
+    tickNurseActions(world);
+
+    // Brood was NOT moved — the Nursery had no Open tile to teleport to.
+    expect(world.ants.posX[eggId]).toBe(startX);
+    expect(world.ants.posY[eggId]).toBe(startY);
   });
 });
