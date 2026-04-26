@@ -300,11 +300,37 @@ export function drawUndergroundEntities(
   // or the slot wasn't alive in prev (freshly-spawned ant whose prev.posX/Y
   // is a stale default), interpolating prev→curr briefly renders the ant on
   // the wrong plane or at the origin. Snap to curr in those cases.
+  //
+  // Issue #22 — exclude brood entities from this loop. Eggs and larvae share
+  // the same AntComponents entity IDs as workers/queens (single SoA store),
+  // and after Gate 6 they live in zone=Underground with currentGridColonyId
+  // set to their own colony. Without this skip, the loop draws each brood as
+  // a worker-ant sprite at depth 50, hiding the egg/larva sprite that the
+  // brood loop below paints at depth 48. The user-visible artifact is "eggs
+  // appear to have ants drawn on them" — the actual root cause of issue #22
+  // (the earlier egg-position-spread fix in lifecycle-system.ts addresses a
+  // related visual concern but does not fix this one).
+  //
+  // We collect brood IDs across every colony as a defensive over-collection.
+  // Today brood-never-invades (mirror of queens-never-invade), so only the
+  // active colony's brood would actually appear in this grid; widening the
+  // Set keeps this loop correct if a future Phase introduces cross-grid
+  // brood movement and a corresponding draw-brood update walks all colonies.
+  // Note the asymmetry with the per-active-colony `isQueen` check below: the
+  // queen check stays single-colony because queens never cross grids and
+  // entity IDs are world-globally unique (no collision risk).
+  const broodIds = new Set<number>();
+  for (const c of Object.values(curr.colonies)) {
+    if (c === undefined) continue;
+    for (let i = 0; i < c.eggs.length;   i++) broodIds.add(c.eggs[i]!);
+    for (let i = 0; i < c.larvae.length; i++) broodIds.add(c.larvae[i]!);
+  }
   const maxId = curr.ants.alive.length;
   for (let id = 0; id < maxId; id++) {
     if (!isAlive(curr.ants, id)) continue;
     if (curr.ants.zone[id] !== 1) continue; // underground only
     if (curr.ants.currentGridColonyId[id] !== activeUndergroundColonyId) continue; // grid-of-occupancy filter
+    if (broodIds.has(id)) continue; // issue #22 — brood is rendered by drawBrood, not as worker sprites
 
     const useInterp = isAlive(prev.ants, id) && prev.ants.zone[id] === curr.ants.zone[id];
 
