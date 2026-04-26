@@ -102,6 +102,26 @@ function generateMainDts(): string {
   if (sourceFile === undefined) {
     throw new Error(`subterrans-lib-dts: tsc could not load ${SRC}`);
   }
+  // Fail loudly on type errors before emit. `npm run verify` runs
+  // `tsc --noEmit` upstream and would catch these too, but a developer
+  // running `build:lib` in isolation should not be able to ship a
+  // garbage-but-syntactically-valid .d.ts on top of broken types.
+  // Restrict to main.ts diagnostics — type errors in transitive modules
+  // are out of scope for this build step (they are caught by typecheck).
+  const diagnostics = [
+    ...program.getSyntacticDiagnostics(sourceFile),
+    ...program.getSemanticDiagnostics(sourceFile),
+  ];
+  if (diagnostics.length > 0) {
+    const formatted = ts.formatDiagnosticsWithColorAndContext(diagnostics, {
+      getCanonicalFileName: (f) => f,
+      getCurrentDirectory: ts.sys.getCurrentDirectory,
+      getNewLine: () => ts.sys.newLine,
+    });
+    throw new Error(
+      `subterrans-lib-dts: TypeScript errors in ${SRC} block .d.ts emit:\n${formatted}`,
+    );
+  }
   let dts: string | undefined;
   // Pass sourceFile to constrain emit to main.ts only (skip the 50+
   // transitively imported modules). The writeFile callback captures the
