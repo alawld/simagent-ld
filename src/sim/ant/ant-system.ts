@@ -1958,8 +1958,12 @@ function moveQueens(
         }
       }
       if (openCount === 0) continue;
+      // `| 0` coerces to Int32; the cast wraps negative for tick > 2^31
+      // (≈3.4y at 20Hz). `((x % n) + n) % n` folds negatives back into
+      // [0, openCount) so the second-pass match never falls off the end.
       // eslint-disable-next-line no-restricted-syntax -- integer division via `| 0`; tick / interval is integer arithmetic, not fixed-point math
-      const targetIndex = ((world.tick / QUEEN_EGG_INTERVAL_TICKS) | 0) % openCount;
+      const cycleIndex = (world.tick / QUEEN_EGG_INTERVAL_TICKS) | 0;
+      const targetIndex = ((cycleIndex % openCount) + openCount) % openCount;
       let i = 0;
       let targetTileX = -1;
       let targetTileY = -1;
@@ -2015,9 +2019,7 @@ function moveQueens(
         break;
       }
       if (ants.zone[qId] === Zone.Underground) continue;
-    }
 
-    if (!isAlreadyHome && zone === Zone.Surface) {
       // Route to the nearest OPEN entrance. Deterministic tie-break:
       // smallest entranceId wins (same rule tickAntMovement uses).
       let bestDist = -1;
@@ -2043,7 +2045,7 @@ function moveQueens(
       } else {
         dy = rawDy > 0 ? 1 : rawDy < 0 ? -1 : 0;
       }
-    } else if (!isAlreadyHome) {
+    } else {
       // Underground → follow the queen flow-field (seeded only from Queen
       // chamber Open tiles). A Nursery-only chamber tile must NOT be a
       // resting target for the queen, so we never consume the nursing field

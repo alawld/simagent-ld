@@ -4666,6 +4666,76 @@ describe('tickAntMovement — P1 queen relocation', () => {
     expect(world.ants.posX[queenId]).toBeGreaterThan(t0X);
   });
 
+  it('Q-2c. queen visits every chamber Open tile across one full wander cycle (Issue #16)', () => {
+    // 2×2 chamber → 4 Open tiles. Across QUEEN_EGG_INTERVAL_TICKS × 4 ticks,
+    // the wander target advances four times and the queen should occupy every
+    // tile in the chamber footprint at least once. A regression where the
+    // modulo is wrong (e.g. `% 1` collapses every cycle to tile 0, or
+    // openCount is computed as width*height including non-Open tiles) would
+    // fail by leaving at least one tile unvisited.
+    const { world, chamberFlowFields, queenId } = setupQueenWorld({
+      queenTileX: 2, queenTileY: 2,
+      addQueenChamber: true,
+      queenChamberTileX: 2, queenChamberTileY: 2,
+      queenChamberWidth: 2, queenChamberHeight: 2,
+      computeQueenField: true,
+    });
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    const visited = new Set<string>();
+    for (let t = 0; t < 4 * QUEEN_EGG_INTERVAL_TICKS; t++) {
+      world.tick = t;
+      tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
+      const tx = world.ants.posX[queenId]! >> FP_SHIFT;
+      const ty = world.ants.posY[queenId]! >> FP_SHIFT;
+      visited.add(`${tx},${ty}`);
+    }
+    expect(visited.has('2,2')).toBe(true);
+    expect(visited.has('3,2')).toBe(true);
+    expect(visited.has('2,3')).toBe(true);
+    expect(visited.has('3,3')).toBe(true);
+    // She also never escaped the chamber.
+    expect(visited.size).toBe(4);
+  });
+
+  it('Q-2d. wander counts only Open tiles when the chamber has a Solid corner (Issue #16)', () => {
+    // 3×3 chamber footprint with one Solid corner tile (4,2). The wander
+    // must count Open tiles (8) — a regression that uses width*height (9)
+    // would shift the modulo and miss a tile, or pick the Solid tile and
+    // get blocked indefinitely. Run 8 cycles and verify the queen
+    // (a) never occupies the Solid tile and (b) visits every Open tile.
+    //
+    // Solid placed in a corner rather than the chamber center because the
+    // queen's Manhattan stepping is not a path-finder: a center Solid tile
+    // would force Manhattan paths through it and would expose a separate
+    // limitation (no diagonal routing) unrelated to the "count Open tiles"
+    // contract under test here.
+    const { world, chamberFlowFields, queenId } = setupQueenWorld({
+      queenTileX: 2, queenTileY: 2,
+      addQueenChamber: true,
+      queenChamberTileX: 2, queenChamberTileY: 2,
+      queenChamberWidth: 3, queenChamberHeight: 3,
+      computeQueenField: true,
+    });
+    const underground = world.undergroundGrids[COLONY_ID]!;
+    ugSet(underground, 4, 2, UndergroundTileState.Solid);
+
+    const digFlowFields = createDigFlowFields();
+    const rng = new Rng(42);
+    const visited = new Set<string>();
+    for (let t = 0; t < 8 * QUEEN_EGG_INTERVAL_TICKS; t++) {
+      world.tick = t;
+      tickAntMovement(world, rng, digFlowFields, undefined, chamberFlowFields);
+      const tx = world.ants.posX[queenId]! >> FP_SHIFT;
+      const ty = world.ants.posY[queenId]! >> FP_SHIFT;
+      visited.add(`${tx},${ty}`);
+    }
+    expect(visited.has('4,2')).toBe(false); // never on the Solid tile
+    const expectedOpen = ['2,2','3,2','2,3','3,3','4,3','2,4','3,4','4,4'];
+    for (const k of expectedOpen) expect(visited.has(k)).toBe(true);
+    expect(visited.size).toBe(expectedOpen.length);
+  });
+
   it('Q-3. underground queen routes toward Queen chamber (flow-field step)', () => {
     const { world, chamberFlowFields, queenId } = setupQueenWorld({
       queenTileX: 5, queenTileY: 5,
