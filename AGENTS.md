@@ -64,10 +64,10 @@ This applies to AI agents working in this repo as well as human contributors. Th
 
 ## PR Review Process
 
-Every PR is reviewed by two AI agents independently:
+Every PR is reviewed by at least two independent AI code reviewers:
 
-1. **Claude Code** — Reviews via the `subterrans-pr-review` skill (architectural compliance, principle violations, code quality).
-2. **Codex** — Independent review for a second perspective.
+1. **Architectural review** — Uses the `subterrans-pr-review` skill (architectural compliance, principle violations, code quality).
+2. **Independent review** — A second agent providing an independent perspective.
 
 Either reviewer can block; both must approve for merge (or owner override). The review checklist includes:
 
@@ -78,6 +78,55 @@ Either reviewer can block; both must approve for merge (or owner override). The 
 - [ ] No variable timestep usage
 - [ ] Tests cover new simulation logic
 - [ ] Deterministic replay is not broken (replay tests pass)
+
+## Review guidelines
+
+These rules are addressed to AI code reviewers inspecting pull requests.
+
+**Be adversarial.** Push back hard on anything that differs from the requirements below or from established best practice. Do not soften criticism, do not assume the author had a good reason, and do not skip a finding because the diff is small or the author is the project owner. A useful review surfaces problems the author missed; a polite review that approves a violation is worse than no review at all. If a rule below is violated, say so plainly and block the PR — do not bury the finding in a list of nits.
+
+Use strong language deliberately — these are non-negotiable invariants of the codebase, not style preferences. Block the PR on any violation in the **Determinism** or **Sim/Render boundary** sections; flag the rest as actionable comments.
+
+### Determinism (sim/ only)
+
+- The directory `src/sim/` must remain deterministic. Any new non-determinism source is a blocker.
+- `Math.random()` is forbidden in `src/sim/`. All randomness must go through the seeded Mulberry32 PRNG (`src/sim/rng.ts`). Flag any `Math.random` reference under `src/sim/` regardless of context.
+- Wall-clock APIs are forbidden in `src/sim/`: `Date`, `Date.now()`, `performance.now()`, `setTimeout`, `setInterval`, `requestAnimationFrame`. Time in the simulation is tick count, not real time.
+- Floating-point arithmetic is forbidden in `src/sim/`. All quantities are fixed-point integers using `FP_SHIFT = 8` / `FP_ONE = 256` (see `src/sim/fixed.ts`). Float literals (`1.5`, `0.1`), the division operator (`/`), and `Math.sqrt`/`sin`/`cos`/`atan2` are banned. The ESLint `simSafetyConfig` enforces this; review still reads PRs that disable the rule inline.
+- Every PRNG call must be seeded from the world's RNG instance — never construct a fresh `Mulberry32` per call site, and never thread a literal seed through new code without explaining why in the PR description.
+
+### Sim/render boundary (FNDN-04, FNDN-07)
+
+- `src/sim/` must not import from `src/render/`, `src/input/`, `src/platform/`, `phaser`, or any browser global (`window`, `document`, `localStorage`, `navigator`, `fetch`). This is enforced by `eslint.config.ts` and the `scripts/check-sim-boundary.sh` grep backstop — flag any change that loosens either.
+- `src/render/`, `src/input/`, and `src/platform/` must not mutate `WorldState` or any nested simulation store. They read sim state and enqueue commands via `commandQueue` (`src/sim/commands.ts`). A direct write to a sim store from outside `src/sim/` is a blocker even if tests pass.
+- New code under `src/sim/` must run unchanged in Node.js — no DOM types, no `HTMLElement`, no Phaser scene references. If a file under `src/sim/` needs a browser API, the design is wrong; suggest moving the logic to `src/platform/` or `src/render/`.
+
+### Fixed timestep
+
+- Simulation advances exactly 50 ms per tick (20 Hz). Code under `src/sim/` must not accept or branch on a `dt` / `deltaTime` / `elapsed` parameter. Variable timestep is a blocker.
+- Interpolation for rendering is the responsibility of `src/render/` and reads the *previous* and *current* tick snapshots — flag any render code that mutates sim state to "smooth" a frame.
+
+### ECS conventions
+
+- Entities are integer IDs (`EntityId = number`). Do not introduce `class Ant`, `class Pheromone`, or other entity classes — components live in typed-array stores (`Int32Array`, `Uint8Array`) or `Map<EntityId, T>`, not on instances.
+- Systems are pure functions over component stores. A new `src/sim/` module that holds mutable module-level state outside the world snapshot is a blocker — that state will not survive save/load or replay.
+- New components should follow the structure-of-arrays pattern already used in `src/sim/ant/`, `src/sim/colony/`, `src/sim/pheromone/`. Flag array-of-structs designs unless the PR explains why SoA is impractical for that data.
+
+### Hot-loop performance
+
+- Per-tick loops over entities (ant updates, pheromone diffusion, combat resolution) run thousands of times per second. Flag allocations inside these loops: `new Array`, `[...spread]`, object literals, `.map`/`.filter`/`.reduce` chains that create intermediate arrays, closure creation. Reuse pre-allocated buffers from the world struct.
+- `JSON.stringify` / `JSON.parse` and regex construction inside per-tick code paths are blockers. They belong in save/load, not the tick loop.
+
+### Test coverage
+
+- Any new logic under `src/sim/` must ship with Vitest unit tests in the same PR. Untested sim code is a blocker, not a follow-up.
+- Changes to tick-order, command application, save format, or PRNG usage must include or update a deterministic replay test. If the PR claims "replay still works" without a test demonstrating it, ask for one.
+- Render/input/platform changes need at least a smoke test (initialization + one happy path). Full coverage is not required at those layers.
+
+### Asset paths and build hygiene
+
+- Runtime asset URLs in `src/render/` must be built from `import.meta.env.BASE_URL` (or the `assetsBase` registry value plumbed via `mount()`), never hard-coded as root-absolute (`/assets/...`) or relative (`./assets/...`). Hard-coded paths break the embedded library build at non-root deploy paths. See `vite.lib.config.ts` and `src/main.ts`.
+- The library entry point is `src/main.ts`. Adding new top-level exports there expands the public API surface — flag undocumented additions and ask for a JSDoc block matching the existing `MountOptions` / `MountedGame` / `mount` style.
 
 ## Building and Running
 
