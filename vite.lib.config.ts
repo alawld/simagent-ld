@@ -20,7 +20,8 @@
 
 import { defineConfig, type Plugin } from 'vite';
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import ts from 'typescript';
 
 /** Emit dist-lib/manifest.json after the bundle is written, so the website
  *  deploy can read `entry` and inject the right hashed <script src=…>.
@@ -49,49 +50,70 @@ const manifestPlugin = (): Plugin => ({
   },
 });
 
-/** Emit a hand-written dist-lib/index.d.ts describing only the public API
- *  surface (mount, MountOptions, MountedGame). Hand-written rather than
- *  generated via vite-plugin-dts so we don't pull in a tsc-on-rollup
- *  dependency, and so the published types are exactly the embedder
- *  contract — not every transitively re-exported render-internal type.
+/** Emit dist-lib/index.d.ts by running the TypeScript compiler programmatically
+ *  on `src/main.ts`. Generates declarations from the actual source — no
+ *  hand-maintained string, no drift risk: any change to MountOptions /
+ *  MountedGame / mount in main.ts flows through to the published types on
+ *  the next build. JSDoc comments are preserved verbatim by tsc.
  *
- *  Filename is fixed (no hash) because TS module resolution looks up
- *  `.d.ts` next to the source path, and consumers reference types via a
- *  type-only import that is decoupled from the runtime entry name in
- *  manifest.json. Keep this string in sync with src/main.ts. */
+ *  We don't use vite-plugin-dts because (a) we already have `typescript`
+ *  as a devDep and (b) we want to emit only main.ts's declarations, not
+ *  the transitive render-internal modules — `program.emit(sourceFile, …)`
+ *  with the writeFile callback constrains output to the single file.
+ *
+ *  The output filename is fixed (`index.d.ts`, no hash) because TS module
+ *  resolution is path-based; consumers reference types via a stable path
+ *  that is decoupled from the runtime entry name in manifest.json. */
 const dtsPlugin = (): Plugin => ({
   name: 'subterrans-lib-dts',
   writeBundle(options) {
     const dir = options.dir ?? 'dist-lib';
-    const dts = `// Public API surface for the Subterrans library bundle. Hand-maintained
-// in vite.lib.config.ts; regenerated on each build. Keep in sync with
-// src/main.ts.
-
-export interface MountOptions {
-  /**
-   * Override the base path under which runtime assets are resolved. When
-   * set, sprite URLs become \`\${assetsBase}sprites/*.svg\` instead of the
-   * build-baked default. Must end with a trailing slash.
-   */
-  assetsBase?: string;
-}
-
-export interface MountedGame {
-  /** Tear down the underlying Phaser.Game and remove its canvas. */
-  destroy(): void;
-  /**
-   * Resolves once GameScene.create() has finished — preload assets are
-   * loaded, the canvas is painted, and the boot path (fresh world or
-   * SavePrompt overlay) is visible. Never rejects.
-   */
-  ready: Promise<void>;
-}
-
-export function mount(target: HTMLElement, options?: MountOptions): MountedGame;
-`;
-    writeFileSync(join(dir, 'index.d.ts'), dts);
+    writeFileSync(join(dir, 'index.d.ts'), generateMainDts());
   },
 });
+
+/** Run tsc programmatically on src/main.ts and return the emitted .d.ts
+ *  text. Inherits the project's tsconfig (incl. `types: [vite/client]` so
+ *  `import.meta.env` resolves) but forces declaration-only emit. */
+function generateMainDts(): string {
+  const SRC = 'src/main.ts';
+  const configPath = ts.findConfigFile('.', ts.sys.fileExists, 'tsconfig.json');
+  if (configPath === undefined) {
+    throw new Error('subterrans-lib-dts: tsconfig.json not found in cwd');
+  }
+  const { config, error } = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (error !== undefined) {
+    throw new Error(`subterrans-lib-dts: failed to read tsconfig.json: ${error.messageText}`);
+  }
+  const parsed = ts.parseJsonConfigFileContent(config, ts.sys, dirname(configPath));
+  const program = ts.createProgram({
+    rootNames: [SRC],
+    options: {
+      ...parsed.options,
+      declaration: true,
+      emitDeclarationOnly: true,
+      noEmit: false,
+      outDir: undefined,
+      declarationMap: false,
+      sourceMap: false,
+    },
+  });
+  const sourceFile = program.getSourceFile(SRC);
+  if (sourceFile === undefined) {
+    throw new Error(`subterrans-lib-dts: tsc could not load ${SRC}`);
+  }
+  let dts: string | undefined;
+  // Pass sourceFile to constrain emit to main.ts only (skip the 50+
+  // transitively imported modules). The writeFile callback captures the
+  // emitted text in-memory rather than letting tsc write to disk.
+  program.emit(sourceFile, (fileName, content) => {
+    if (fileName.endsWith('main.d.ts')) dts = content;
+  });
+  if (dts === undefined) {
+    throw new Error('subterrans-lib-dts: tsc emit produced no main.d.ts output');
+  }
+  return dts;
+}
 
 export default defineConfig({
   // Suppress copying public/* into dist-lib/. Sprite assets live in the

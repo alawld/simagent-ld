@@ -285,8 +285,11 @@ export class GameScene extends Phaser.Scene {
     }
 
     // Lifecycle signal — preload assets are loaded (we're in create()), the
-    // canvas is painted, and the chosen boot path (fresh world or
-    // SavePrompt overlay) is dispatched and visible. Emit after the
+    // scene graph is constructed, and the chosen boot path (fresh world or
+    // SavePrompt overlay) has been dispatched. Phaser's first render tick
+    // runs after create() returns, so the canvas paints on the next frame;
+    // "ready" here means "interactive imminently", which is the right
+    // moment for a host page to hide a loading spinner. Emit after the
     // bootMode branch so both paths reach it. main.ts converts this to
     // `MountedGame.ready: Promise<void>` for the host page.
     this.game.events.emit(SUBTERRANS_READY_EVENT);

@@ -40,11 +40,18 @@ export interface MountedGame {
 
   /**
    * Resolves once `GameScene.create()` has finished — preload assets
-   * are loaded, the canvas is painted, and the boot path (fresh world
-   * or SavePrompt overlay) is visible. Use this to hide a loading
-   * spinner the moment the game is interactive. Never rejects; if the
-   * caller `destroy()`s before boot completes the promise simply
-   * stays pending.
+   * loaded, scene graph constructed, boot path (fresh world or
+   * SavePrompt overlay) dispatched and ready to render on the next
+   * frame. Use this to hide a loading spinner the moment the game is
+   * interactive.
+   *
+   * Also resolves on `destroy()` so awaiters never deadlock if the host
+   * tears down before boot finishes.
+   *
+   * Never rejects. The one remaining edge case — `GameScene.create()`
+   * throws and `destroy()` is never called — leaves the promise pending,
+   * which is a programming error the host page should defend against
+   * with its own timeout.
    */
   ready: Promise<void>;
 }
@@ -95,14 +102,21 @@ export function mount(target: HTMLElement, options?: MountOptions): MountedGame 
   const game = new Phaser.Game(config);
 
   // Convert the one-shot SUBTERRANS_READY_EVENT into a Promise the host
-  // page can await. `events.once` auto-unsubscribes after the first
-  // emit, so there is nothing to clean up on destroy().
+  // page can await. We capture the resolver outside the constructor so
+  // destroy() can resolve it too — otherwise tearing down before boot
+  // finishes would leave awaiters stuck on a pending promise that holds
+  // the (about-to-be-destroyed) game graph reachable. Promise resolution
+  // is idempotent, so resolving from both the event and destroy() is
+  // safe regardless of order.
+  let resolveReady!: () => void;
   const ready = new Promise<void>((resolve) => {
-    game.events.once(SUBTERRANS_READY_EVENT, () => resolve());
+    resolveReady = resolve;
   });
+  game.events.once(SUBTERRANS_READY_EVENT, () => resolveReady());
 
   return {
     destroy() {
+      resolveReady();
       game.destroy(true);
     },
     ready,
