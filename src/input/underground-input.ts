@@ -40,9 +40,15 @@ import { contextMenuState, requestShowContextMenu } from '../render/context-menu
 export interface UndergroundInputState {
   /** True from the first pointerdown until pointerup — enables drag tile-mark. */
   isDragging: boolean;
-  /** Last tile X that had a MarkDigTileCommand emitted during this drag. */
+  /**
+   * X coord of the last tile the drag cursor has visited (debounce + Bresenham
+   * interpolation start). Seeded by the pointerdown click — including clicks
+   * on Marked/BeingDug tiles where no MarkDigTileCommand was emitted — so the
+   * subsequent drag interpolates from the actual click point, not from the
+   * last *emitted* mark. -1 sentinel means no drag in progress.
+   */
   lastMarkedTileX: number;
-  /** Last tile Y that had a MarkDigTileCommand emitted during this drag. */
+  /** Y coord counterpart to lastMarkedTileX. Same semantics — see above. */
   lastMarkedTileY: number;
 }
 
@@ -103,11 +109,22 @@ export function isTunnelEnd(world: WorldState, tileX: number, tileY: number, col
  * no state mutation. UIScene owns menu dismissal so the dismissal happens on
  * a deterministic frame boundary, not mid-pointerdown dispatch.
  *
- * Otherwise, if the clicked tile is Solid or Open, pushes MarkDigTileCommand
- * and sets isDragging=true to enable subsequent drag marks.
+ * Otherwise, arms the drag state (isDragging + lastMarkedTile) on every
+ * pointerdown that lands on a valid in-bounds tile, regardless of whether the
+ * tile is markable. This is intentional: a click-then-drag stroke that starts
+ * on an already-Marked or BeingDug tile must still mark newly-entered Solid
+ * tiles. Without the eager arm, the subsequent pointermove would observe
+ * isDragging=false and silently no-op for the rest of the gesture.
  *
- * No-ops if: activeView !== 'underground', pointer over HUD, out of bounds,
- * or tile is Marked/BeingDug (already claimed).
+ * Pushes MarkDigTileCommand only when the clicked tile is Solid or Open;
+ * Marked/BeingDug tiles are already claimed so emitting a command would just
+ * clutter the queue and replay log (the sim's MarkDigTile handler also drops
+ * non-Solid tiles, so a duplicate would be a no-op there too).
+ *
+ * No-ops entirely if: activeView !== 'underground', pointer over HUD, pan
+ * mode active, context menu visible, missing grid, or out of bounds. In all
+ * those cases the drag state is NOT armed — the gesture was rejected, not
+ * accepted-and-skipped.
  */
 export function handleUndergroundLeftClick(
   world: WorldState,
@@ -130,6 +147,13 @@ export function handleUndergroundLeftClick(
   const grid = world.undergroundGrids[PLAYER_COLONY_ID];
   if (!grid) return;
   if (tileX < 0 || tileY < 0 || tileX >= grid.width || tileY >= grid.height) return;
+  // Arm drag state up front (before the tile-state branch) so a stroke that
+  // begins on a Marked/BeingDug tile still marks subsequent Solid tiles. The
+  // debounce cursor is seeded to the clicked tile so the first Bresenham
+  // interpolation in handleUndergroundDrag starts from a real coordinate.
+  state.isDragging = true;
+  state.lastMarkedTileX = tileX;
+  state.lastMarkedTileY = tileY;
   // Only mark Solid or Open tiles (Marked/BeingDug are already claimed).
   const tileState = ugGet(grid, tileX, tileY);
   if (tileState !== UndergroundTileState.Solid && tileState !== UndergroundTileState.Open) return;
@@ -141,9 +165,6 @@ export function handleUndergroundLeftClick(
     issuedAtTick: world.tick,
   };
   world.commandQueue.push(cmd);
-  state.isDragging = true;
-  state.lastMarkedTileX = tileX;
-  state.lastMarkedTileY = tileY;
 }
 
 // ---------------------------------------------------------------------------
