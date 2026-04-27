@@ -35,6 +35,7 @@ import {
   checkPendingChambers,
   checkEntranceCompletion,
   hasCompletedChamber,
+  isFoodChamberDepositable,
 } from './colony/colony-system.js';
 import {
   tickQueenEggProduction,
@@ -508,7 +509,12 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
     const firstEntranceCompute = !(colony.colonyId in entranceFlowFields.fields);
     const firstDigCompute = !(colony.colonyId in digFlowFields.fields);
 
-    if (!colony.digFlowFieldDirty && !firstEntranceCompute && !firstDigCompute) continue;
+    if (
+      !colony.digFlowFieldDirty &&
+      !colony.foodFlowFieldDirty &&
+      !firstEntranceCompute &&
+      !firstDigCompute
+    ) continue;
 
     if (colony.digFlowFieldDirty || firstDigCompute) {
       const out = ensureDigFlowField(digFlowFields, colony.colonyId, gridSize);
@@ -526,7 +532,10 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
     // Recompute chamber flow-fields on the same cycle. Chamber completion
     // (which flips tile states from Marked/BeingDug to Open) is one of the
     // signals that sets digFlowFieldDirty upstream, so this cadence is
-    // sufficient to keep the fields fresh.
+    // sufficient to keep the fields fresh. Issue #15: the food field also
+    // recomputes when foodFlowFieldDirty fires (set when a FoodStorage chamber
+    // crosses the full↔not-full boundary) so carriers redirect away from full
+    // chambers without waiting for an unrelated topology change.
     const chamberBufs = ensureChamberFlowFields(chamberFlowFields, colony.colonyId, gridSize);
     computeChamberFlowField(
       underground,
@@ -534,6 +543,13 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
       FOOD_CHAMBER_TYPES,
       chamberBufs.food,
       chamberBufs.queue,
+      // Issue #15 follow-up: saturated chambers (free space <
+      // FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP) must not seed the BFS — otherwise
+      // a carrier mid-traversal across a near-full chamber gets pinned by
+      // the queen-drain-then-redeposit oscillation. Shared with the deposit
+      // path in ant-system.ts via `isFoodChamberDepositable`, so seed
+      // exclusion and deposit refusal stay in lockstep.
+      isFoodChamberDepositable,
     );
     computeChamberFlowField(
       underground,
@@ -551,6 +567,7 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
     );
 
     colony.digFlowFieldDirty = false;
+    colony.foodFlowFieldDirty = false;
   }
 
   // ---------------------------------------------------------------------------

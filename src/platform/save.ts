@@ -28,8 +28,22 @@ import { createPheromoneGrid } from '../sim/pheromone/pheromone-store.js';
 import type { FoodPile, FoodPileId } from '../sim/food.js';
 import { MAX_ENTITIES } from '../sim/constants.js';
 
-export const SAVE_FORMAT_VERSION = 1 as const;
-export const SAVE_KEY = 'subterrans:save:v1' as const;
+// SAVE_FORMAT_VERSION is bumped on any breaking change to the on-disk shape
+// or to invariants that survivors must respect. Pre-bump saves are rejected
+// by parseSaveFile (SaveVersionMismatchError) — the loadSave/hasSave path
+// returns null, so the caller boots a fresh scenario instead of corrupting
+// state. Per the original save.ts header note, version bumps "intentionally
+// invalidate old saves (intentional for beta)".
+//
+// History:
+//   v1 — Phase 9 / SCEN-04 baseline.
+//   v2 — Issue #15: chamber-authoritative food storage. Pre-v2 saves stored
+//        the entire stockpile in `colony.foodStored` (chambers held projected
+//        slices, recomputed each reconcile). Loading those into v2 would
+//        either double-count (slices + pool) or silently truncate to BASE on
+//        the next reconcile. Reject them — fresh scenarios are cheap in beta.
+export const SAVE_FORMAT_VERSION = 2 as const;
+export const SAVE_KEY = 'subterrans:save:v2' as const;
 export const AUTOSAVE_INTERVAL_MS = 30_000 as const;
 
 export class SaveVersionMismatchError extends Error {
@@ -92,6 +106,7 @@ interface SerializedColony {
   entrances: NestEntrance[];
   rallyPoint: { tileX: number; tileY: number } | null;
   digFlowFieldDirty: boolean;
+  foodFlowFieldDirty?: boolean;  // Issue #15 — defaults false on old saves
   killCount: number;   // Plan 09-01
   priorityFoodPileId: FoodPileId | null;  // Phase 9 / PRD §3d — per-colony priority food target
 }
@@ -184,6 +199,7 @@ function serializeColony(c: ColonyRecord): SerializedColony {
     entrances:            c.entrances.map((e) => ({ ...e })),
     rallyPoint:           c.rallyPoint === null ? null : { ...c.rallyPoint },
     digFlowFieldDirty:    c.digFlowFieldDirty,
+    foodFlowFieldDirty:   c.foodFlowFieldDirty,
     killCount:            c.killCount,
     priorityFoodPileId:   c.priorityFoodPileId,
   };
@@ -313,8 +329,12 @@ function deserializeAnts(saved: SerializedAnts, capacity: number): AntComponents
 
 function deserializeColony(s: SerializedColony): ColonyRecord {
   const c = createColonyRecord(s.colonyId, s.queenEntityId);
-  // createColonyRecord does NOT set the 3 Phase 3 extension fields — caller-side contract
-  // (colony-store.ts comment). Set them explicitly alongside scalar fields.
+  // createColonyRecord does NOT set the Phase 3 extension fields nor the
+  // issue-#15 `foodFlowFieldDirty` field — caller-side contract (see the
+  // colony-store.ts factory docblock). Set them explicitly alongside scalar
+  // fields. `foodFlowFieldDirty` is `?? false` defensively even though v2
+  // saves should always include it; pre-v2 saves are rejected upstream by
+  // parseSaveFile (SaveVersionMismatchError).
   c.queenStarvationTimer = s.queenStarvationTimer;
   c.foodStored           = s.foodStored;
   c.workerCount          = s.workerCount;
@@ -333,6 +353,7 @@ function deserializeColony(s: SerializedColony): ColonyRecord {
   c.entrances            = s.entrances.map((e) => ({ ...e }));
   c.rallyPoint           = s.rallyPoint === null ? null : { ...s.rallyPoint };
   c.digFlowFieldDirty    = s.digFlowFieldDirty;
+  c.foodFlowFieldDirty   = s.foodFlowFieldDirty ?? false;
   c.killCount            = s.killCount;
   c.priorityFoodPileId   = s.priorityFoodPileId ?? null;
   return c;
@@ -412,8 +433,21 @@ function parseSaveFile(raw: string): SaveFile {
   return parsed as SaveFile;
 }
 
+/**
+ * Opportunistically purge the v1 key so existing players don't carry the
+ * rejected pre-#15 envelope around in localStorage indefinitely. v2 fully
+ * supersedes v1; pre-bump saves are intentionally rejected (parseSaveFile
+ * throws SaveVersionMismatchError), so there is no recovery path that needs
+ * the old data. Called from both hasSave and loadSave so the purge fires on
+ * the first save-touching operation, regardless of which one runs first.
+ */
+function purgeLegacySaves(): void {
+  try { localStorage.removeItem('subterrans:save:v1'); } catch { /* quota / private mode — silent: best-effort cleanup, no UX signal */ }
+}
+
 export function hasSave(): boolean {
   try {
+    purgeLegacySaves();
     const raw = localStorage.getItem(SAVE_KEY);
     if (raw === null) return false;
     parseSaveFile(raw);
@@ -425,6 +459,7 @@ export function hasSave(): boolean {
 
 export function loadSave(): SaveFile | null {
   try {
+    purgeLegacySaves();
     const raw = localStorage.getItem(SAVE_KEY);
     if (raw === null) return null;
     return parseSaveFile(raw);

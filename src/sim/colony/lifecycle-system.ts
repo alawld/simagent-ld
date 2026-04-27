@@ -21,7 +21,7 @@ import { allocateEntityId } from '../types.js';
 import { initAnt } from '../ant/ant-store.js';
 import type { ColonyRecord } from './colony-store.js';
 import { AntTask, ChamberType } from '../enums.js';
-import { hasCompletedChamber } from './colony-system.js';
+import { hasCompletedChamber, colonyFoodTotal } from './colony-system.js';
 import { Zone, ugGet, UndergroundTileState } from '../terrain.js';
 import { FP_SHIFT, FP_ONE } from '../fixed.js';
 import {
@@ -39,7 +39,9 @@ import {
 //
 // Gating order (PRD §4b line 980 + 09 reproduction-gate memo):
 //   1. Tick-modulo gate:  world.tick % QUEEN_EGG_INTERVAL_TICKS !== 0 → return
-//   2. Food threshold:    colony.foodStored < QUEEN_EGG_FOOD_THRESHOLD → return
+//   2. Food threshold:    colonyFoodTotal(colony) < QUEEN_EGG_FOOD_THRESHOLD → return
+//                         (issue #15 — total stash = entrance pool + every
+//                         FoodStorage chamber, NOT colony.foodStored alone)
 //   3. Queen alive:       world.ants.alive[colony.queenEntityId] !== 1 → return
 //   4. Queen chamber:     colony has at least one COMPLETED Queen chamber (09 memo)
 //   5. Nursery chamber:   colony has at least one COMPLETED Nursery chamber (09 memo)
@@ -76,8 +78,11 @@ export function tickQueenEggProduction(world: WorldState, colony: ColonyRecord):
   // Gate 1: tick-modulo interval
   if ((world.tick % QUEEN_EGG_INTERVAL_TICKS) !== 0) return;
 
-  // Gate 2: food threshold
-  if (colony.foodStored < QUEEN_EGG_FOOD_THRESHOLD) return;
+  // Gate 2: food threshold — issue #15: read TOTAL stockpile (entrance pool +
+  // every FoodStorage chamber.foodStored). Pre-#15 this read colony.foodStored
+  // as the single pool; post-#15 colony.foodStored is only the entrance-shaft
+  // pool, so a colony whose entire stash lives in chambers would never lay.
+  if (colonyFoodTotal(colony) < QUEEN_EGG_FOOD_THRESHOLD) return;
 
   // Gate 3: queen alive
   if (world.ants.alive[colony.queenEntityId] !== 1) return;

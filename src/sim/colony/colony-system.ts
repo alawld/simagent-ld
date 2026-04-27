@@ -27,7 +27,7 @@
 
 import type { WorldState } from '../types.js';
 import { allocateEntityId } from '../types.js';
-import type { ColonyRecord } from './colony-store.js';
+import type { ChamberRecord, ColonyRecord } from './colony-store.js';
 import type { ColonyId } from './colony-store.js';
 import {
   QUEEN_FOOD_PER_TICK,
@@ -35,6 +35,7 @@ import {
   STARVATION_GRACE_TICKS,
   RECONCILE_INTERVAL_TICKS,
   FOOD_CHAMBER_CAPACITY,
+  FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP,
   BASE_FOOD_STORAGE_CAPACITY,
 } from '../constants.js';
 import { ChamberType } from '../enums.js';
@@ -43,39 +44,123 @@ import { ugGet, ugSet, UndergroundTileState } from '../terrain.js';
 import { FP_SHIFT } from '../fixed.js';
 
 // ---------------------------------------------------------------------------
-// withdrawFood — chamberless food withdrawal helper (PRD §4c)
+// withdrawFood / colonyFoodTotal — chamber-authoritative food withdrawal (issue #15)
 //
-// Phase 6 chamberless-fallback: unconditionally draws from colony.foodStored.
-// Phase 7 adds chamber-aware routing (UNDR-07), replacing this path.
+// Pre-issue-#15 the colony had a single `foodStored` pool that `tickReconcile`
+// projected across FoodStorage chambers. Foragers wrote the pool; once the
+// pool exceeded one chamber's slice, the SECOND chamber appeared full at the
+// next reconcile even though no ant had ever visited it. Players saw food
+// "magically appear" in distant rooms.
 //
-// Returns true if food was withdrawn, false if pool was empty.
+// New model: chamber.foodStored is the authoritative store for each
+// FoodStorage chamber. colony.foodStored persists as the entrance-shaft /
+// chamberless-fallback pool — used by the Phase 6 deposit-at-entrance path
+// (when no FoodStorage chamber exists, or when a forager deposits at the
+// entrance shaft top per `tickForagerActions` (b)) and seeded by scenarios
+// via STARTING_FOOD. Capacity contract: chambers cap at FOOD_CHAMBER_CAPACITY
+// each; the entrance pool caps at BASE_FOOD_STORAGE_CAPACITY. Total capacity
+// is unchanged: BASE + N × FOOD_CHAMBER_CAPACITY.
+//
+// Withdraw drains chambers in colony.chambers array order first, then the
+// entrance pool. Order matters for determinism — never sort.
 // ---------------------------------------------------------------------------
 
 /**
- * Attempt to withdraw `amount` food from `colony.foodStored`.
+ * Total stored food across the colony: entrance pool + every FoodStorage
+ * chamber. Use this for HUD displays, AI thresholds, and any code that
+ * previously read `colony.foodStored` as the colony total.
  *
- * Phase 6 chamberless fallback: draws directly from the colony pool.
- * Returns true on success (foodStored decremented by `amount`).
- * Returns false if foodStored < amount (no partial withdrawal — all-or-nothing).
+ * Reading `colony.foodStored` directly post-#15 yields ONLY the
+ * entrance-shaft pool, which is rarely what callers want.
+ */
+export function colonyFoodTotal(colony: ColonyRecord): number {
+  let total = colony.foodStored;
+  for (let i = 0; i < colony.chambers.length; i++) {
+    const ch = colony.chambers[i]!;
+    if (ch.chamberType === ChamberType.FoodStorage) total += ch.foodStored;
+  }
+  return total;
+}
+
+/**
+ * Issue #15 follow-up — single-source-of-truth predicate for "is this chamber
+ * an active deposit destination?" Used by:
+ *   - chamber-flow-field BFS seeding (tick.ts step 9)
+ *   - tickForagerActions step 16b deposit-site test
+ *   - antDepositFood chamber match
+ *   - tickAntMovement Manhattan fallback chamberTargetX selection
+ *
+ * Saturated (free space < FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP) chambers are
+ * EXCLUDED from all four sites in lockstep. This is what prevents the
+ * queen-drain-then-redeposit oscillation that pinned carriers on full-chamber
+ * tiles in seed-1294596103 tick-1876 (see the constant docs).
+ *
+ * Non-FoodStorage chambers always return false — the loops upstream already
+ * filter on chamberType, but this keeps the predicate self-contained so a
+ * single misuse can't accidentally treat a Queen/Nursery chamber as a food
+ * deposit target.
+ */
+export function isFoodChamberDepositable(chamber: ChamberRecord): boolean {
+  if (chamber.chamberType !== ChamberType.FoodStorage) return false;
+  return FOOD_CHAMBER_CAPACITY - chamber.foodStored >= FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP;
+}
+
+/**
+ * Attempt to withdraw `amount` food. All-or-nothing: returns false (no
+ * partial withdrawal) if the colony's combined stored food is below `amount`.
+ *
+ * Drain order is deterministic — FoodStorage chambers in colony.chambers
+ * array order, then the entrance-shaft pool (`colony.foodStored`). Each
+ * source contributes up to its current contents.
+ *
+ * Issue #15 follow-up — flow-field dirty: fires only when a chamber crosses
+ * the saturation→depositable boundary (per isFoodChamberDepositable), not
+ * on every cap → cap-N drain. A QUEEN_FOOD_PER_TICK=2 nibble of a full
+ * chamber must NOT mark the field dirty — otherwise step 9 re-seeds the
+ * still-saturated chamber every tick and carriers on its footprint pin in
+ * the oscillation cycle described in the FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP
+ * constant docs.
  */
 export function withdrawFood(colony: ColonyRecord, amount: number): boolean {
-  if (colony.foodStored < amount) return false;
-  colony.foodStored -= amount;
+  if (colonyFoodTotal(colony) < amount) return false;
+
+  let remaining = amount;
+  for (let i = 0; i < colony.chambers.length && remaining > 0; i++) {
+    const ch = colony.chambers[i]!;
+    if (ch.chamberType !== ChamberType.FoodStorage) continue;
+    if (ch.foodStored <= 0) continue;
+    const wasDepositable = isFoodChamberDepositable(ch);
+    const take = ch.foodStored < remaining ? ch.foodStored : remaining;
+    ch.foodStored -= take;
+    remaining -= take;
+    if (!wasDepositable && isFoodChamberDepositable(ch)) {
+      colony.foodFlowFieldDirty = true;
+    }
+  }
+  if (remaining > 0) {
+    colony.foodStored -= remaining;
+  }
   return true;
 }
 
 // ---------------------------------------------------------------------------
 // colonyFoodCapacity — 09 backlog memo: BASE + N × FOOD_CHAMBER_CAPACITY
 //
-// Returns the authoritative capacity for colony.foodStored. N counts only
-// COMPLETED FoodStorage chambers (entries in colony.chambers). Pending
-// FoodStorage chambers do NOT contribute — capacity grows only when the
-// chamber is fully excavated and promoted by checkPendingChambers.
+// Returns the colony's TOTAL food-storage capacity (entrance pool + every
+// FoodStorage chamber). Compare against `colonyFoodTotal(colony)`, not
+// `colony.foodStored` alone — post-#15, `colony.foodStored` caps at BASE
+// (the entrance pool only) while each FoodStorage chamber caps at
+// FOOD_CHAMBER_CAPACITY. N counts only COMPLETED FoodStorage chambers
+// (entries in colony.chambers). Pending FoodStorage chambers do NOT
+// contribute — capacity grows only when the chamber is fully excavated
+// and promoted by checkPendingChambers.
 // ---------------------------------------------------------------------------
 
 /**
  * Total colony food-storage capacity (fp): BASE + N × FOOD_CHAMBER_CAPACITY,
  * where N is the number of completed FoodStorage chambers in colony.chambers.
+ * Post-#15 this is the cap for `colonyFoodTotal(colony)` (pool + chambers),
+ * not for `colony.foodStored` (which caps at BASE alone).
  *
  * Pending FoodStorage chambers (world.pendingChambers) do NOT contribute —
  * promotion happens in checkPendingChambers once excavation completes.
@@ -264,6 +349,10 @@ export function tickDeathCleanup(world: WorldState, colony: ColonyRecord): void 
  * The recount pass (PRD §2) filters alive===1 entities in each bucket and
  * corrects eggCount, larvaeCount, workerCount. Doubles as a cleanup pass —
  * dead slots found during recount are swap-removed from the bucket.
+ * Issue #15: also clamps `colony.foodStored` to [0, BASE_FOOD_STORAGE_CAPACITY]
+ * and each FoodStorage chamber's `foodStored` to [0, FOOD_CHAMBER_CAPACITY] —
+ * defensive only; the deposit/withdraw paths cap at their own sources.
+ * NEVER redistributes food across chambers (that was the pre-#15 magic-fill bug).
  * Resets reconcileCountdown to RECONCILE_INTERVAL_TICKS after recount.
  *
  * CLNY-07: cached fields are guaranteed accurate at most RECONCILE_INTERVAL_TICKS
@@ -312,28 +401,20 @@ export function tickReconcile(world: WorldState, colony: ColonyRecord): void {
   }
   colony.workerCount = workerCount;
 
-  // Food validation (PRD §2 reconcile contract):
-  // colony.foodStored is the authoritative pooled total — never overwritten here.
-  // When FoodStorage chambers exist, derive their contents from the authoritative
-  // total (each capped at FOOD_CHAMBER_CAPACITY). colony.foodStored stays unchanged.
+  // Food validation (issue #15 — chamber-authoritative model):
+  // chamber.foodStored is authoritative per FoodStorage chamber; colony.foodStored
+  // is the entrance-shaft fallback pool. Deposits + withdraws clamp at their
+  // sources, so reconcile is a defensive backstop against drift. NEVER redistribute
+  // across chambers — that was the old magic-fill bug fixed in #15.
   if (colony.foodStored < 0) colony.foodStored = 0;
-  // 09 backlog memo — defensively clamp to colonyFoodCapacity. Deposits are
-  // clamped at the antDepositFood source, so this should be a no-op in steady
-  // state; the clamp is a backstop against any future code path that writes
-  // colony.foodStored directly without going through antDepositFood.
-  const cap = colonyFoodCapacity(colony);
-  if (colony.foodStored > cap) colony.foodStored = cap;
-
-  if (colony.chambers.length > 0) {
-    let distributed = 0;
-    for (let i = 0; i < colony.chambers.length; i++) {
-      const ch = colony.chambers[i]!;
-      if (ch.chamberType !== ChamberType.FoodStorage) continue;
-      const available = colony.foodStored - distributed;
-      const fill = available < FOOD_CHAMBER_CAPACITY ? (available > 0 ? available : 0) : FOOD_CHAMBER_CAPACITY;
-      ch.foodStored = fill;
-      distributed += fill;
-    }
+  if (colony.foodStored > BASE_FOOD_STORAGE_CAPACITY) {
+    colony.foodStored = BASE_FOOD_STORAGE_CAPACITY;
+  }
+  for (let i = 0; i < colony.chambers.length; i++) {
+    const ch = colony.chambers[i]!;
+    if (ch.chamberType !== ChamberType.FoodStorage) continue;
+    if (ch.foodStored < 0) ch.foodStored = 0;
+    if (ch.foodStored > FOOD_CHAMBER_CAPACITY) ch.foodStored = FOOD_CHAMBER_CAPACITY;
   }
 
   // Recompute allocation with corrected counts (PRD §2 reconcile contract +

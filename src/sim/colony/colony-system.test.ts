@@ -16,6 +16,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   withdrawFood,
+  colonyFoodTotal,
   colonyFoodCapacity,
   tickFoodConsumption,
   tickStarvationCheck,
@@ -35,6 +36,7 @@ import {
   QUEEN_FOOD_PER_TICK,
   LARVA_FOOD_PER_TICK,
   FOOD_CHAMBER_CAPACITY,
+  FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP,
   BASE_FOOD_STORAGE_CAPACITY,
 } from '../constants.js';
 import { createUndergroundGrid, ugSet, UndergroundTileState } from '../terrain.js';
@@ -162,6 +164,142 @@ describe('withdrawFood', () => {
     const result = withdrawFood(colony, 50);
     expect(result).toBe(true);
     expect(colony.foodStored).toBe(0);
+  });
+
+  // Issue #15 — drain-order contract: chambers in array order first, then the
+  // entrance pool. Other downstream code (HUD, AI gates) relies on chambers
+  // emptying before the pool so the dirty-flag / re-seed cadence is stable.
+  // A future refactor that flips the order would silently regress.
+  it('drains chambers before the entrance pool (issue #15)', () => {
+    const { colony } = setupWorldWithQueen(100);
+    colony.chambers.push({
+      chamberId: 1, chamberType: ChamberType.FoodStorage, foodStored: 200,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    const result = withdrawFood(colony, 50);
+    expect(result).toBe(true);
+    expect(colony.chambers[0]!.foodStored).toBe(150); // chamber drained
+    expect(colony.foodStored).toBe(100);              // pool untouched
+  });
+
+  it('drains the entrance pool only after every chamber is empty (issue #15)', () => {
+    const { colony } = setupWorldWithQueen(100);
+    colony.chambers.push({
+      chamberId: 1, chamberType: ChamberType.FoodStorage, foodStored: 30,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    const result = withdrawFood(colony, 50);
+    expect(result).toBe(true);
+    expect(colony.chambers[0]!.foodStored).toBe(0);   // chamber drained first
+    expect(colony.foodStored).toBe(80);               // remaining 20 from pool
+  });
+
+  it('sets foodFlowFieldDirty only on saturated→depositable transitions (issue #15 follow-up)', () => {
+    // Hysteresis: a chamber is "saturated" while free space <
+    // FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP. The flow-field re-seed must fire
+    // ONLY when withdraw pushes a chamber across the saturation boundary —
+    // not on every cap → cap-N drain. A naive full→not-full trigger fires on
+    // a single QUEEN_FOOD_PER_TICK=2 drain and pins carriers mid-traversal
+    // (see /tmp/stuck-dump.json — seed 1294596103 tick 1876).
+    const HYST = FOOD_CHAMBER_DEPOSIT_HYSTERESIS_FP;
+    const { colony } = setupWorldWithQueen(0);
+    // Chamber 0: full → still saturated after small drains until we reach
+    // the depositable threshold (free space >= HYST).
+    colony.chambers.push({
+      chamberId: 1, chamberType: ChamberType.FoodStorage, foodStored: FOOD_CHAMBER_CAPACITY,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    // Chamber 1: starts depositable (free space > HYST) — drains within the
+    // depositable band must NOT fire dirty.
+    colony.chambers.push({
+      chamberId: 2, chamberType: ChamberType.FoodStorage, foodStored: 100,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    colony.foodFlowFieldDirty = false;
+
+    // Tiny drain from chamber 0 — saturated → still saturated (free space < HYST).
+    // Must NOT fire dirty (this is the queen-drain oscillation case).
+    withdrawFood(colony, 1);
+    expect(colony.foodFlowFieldDirty).toBe(false);
+
+    // Drain enough to cross the saturation boundary — saturated → depositable.
+    // Chamber 0 now has free space == HYST. Must fire dirty.
+    withdrawFood(colony, HYST - 1);
+    expect(colony.foodFlowFieldDirty).toBe(true);
+
+    // Reset. Further drain in the depositable band — must NOT re-fire.
+    colony.foodFlowFieldDirty = false;
+    withdrawFood(colony, 1);
+    expect(colony.foodFlowFieldDirty).toBe(false);
+
+    // Drain across both chambers within the depositable band — must NOT fire.
+    // Withdraw drains chamber 0 (lower index) before chamber 1. Total chamber
+    // food at this point is 4607 + 100 = 4707; withdraw exactly 4707 to fully
+    // drain both. Chamber 0: depositable (free 513) → empty (free CAP) — both
+    // depositable. Chamber 1: depositable (free 5020) → empty — both
+    // depositable. No saturated→depositable transition occurs, so dirty
+    // must stay false. (Withdrawing `FOOD_CHAMBER_CAPACITY` here would
+    // exceed colonyFoodTotal=4707 and trigger withdrawFood's all-or-nothing
+    // early-return — assertion would pass vacuously without exercising the
+    // drain loop.)
+    colony.foodFlowFieldDirty = false;
+    expect(withdrawFood(colony, 4707)).toBe(true);
+    expect(colony.foodFlowFieldDirty).toBe(false);
+    expect(colony.chambers[0]!.foodStored).toBe(0);
+    expect(colony.chambers[1]!.foodStored).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// colonyFoodTotal — issue #15 regression guard
+//
+// colonyFoodTotal is the canonical "total stored food" reader post-#15.
+// HUD displays, AI thresholds, and forager-economy code all read it. A
+// regression that drops the chamber-summing branch (e.g. reverting it to
+// `return colony.foodStored` alone) would silently break every consumer.
+// These tests guard against that by exercising both contributions.
+// ---------------------------------------------------------------------------
+
+describe('colonyFoodTotal — issue #15', () => {
+  it('sums entrance pool only when no chambers exist', () => {
+    const { colony } = setupWorldWithQueen(123);
+    expect(colonyFoodTotal(colony)).toBe(123);
+  });
+
+  it('includes FoodStorage chamber food in the total', () => {
+    const { colony } = setupWorldWithQueen(0);
+    colony.chambers.push({
+      chamberId: 1, chamberType: ChamberType.FoodStorage, foodStored: 200,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    colony.chambers.push({
+      chamberId: 2, chamberType: ChamberType.FoodStorage, foodStored: 50,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    expect(colonyFoodTotal(colony)).toBe(250);
+  });
+
+  it('sums entrance pool + every FoodStorage chamber', () => {
+    const { colony } = setupWorldWithQueen(100);
+    colony.chambers.push({
+      chamberId: 1, chamberType: ChamberType.FoodStorage, foodStored: 200,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    expect(colonyFoodTotal(colony)).toBe(300);
+  });
+
+  it('excludes non-FoodStorage chamber types from the total', () => {
+    const { colony } = setupWorldWithQueen(100);
+    // A non-FoodStorage chamber's foodStored is meaningless — must not contribute.
+    colony.chambers.push({
+      chamberId: 1, chamberType: ChamberType.Queen, foodStored: 999,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    colony.chambers.push({
+      chamberId: 2, chamberType: ChamberType.Nursery, foodStored: 999,
+      posX: 0, posY: 0, width: 1, height: 1,
+    });
+    expect(colonyFoodTotal(colony)).toBe(100);
   });
 });
 
@@ -526,17 +664,18 @@ describe('tickReconcile', () => {
     expect(colony.foodStored).toBe(BASE_FOOD_STORAGE_CAPACITY);
   });
 
-  it('20b. reconcile clamps foodStored to BASE + N × FOOD_CHAMBER_CAPACITY when FoodStorage chambers exist', () => {
+  it('20b. reconcile clamps the entrance pool to BASE and each chamber.foodStored to FOOD_CHAMBER_CAPACITY independently (issue #15)', () => {
     const { world, colony } = setupWorldWithQueen();
+    // Issue #15: chamber.foodStored is per-chamber authoritative; the entrance
+    // pool (`colony.foodStored`) caps at BASE alone — chambers are NOT a
+    // capacity extension of the pool. Reconcile defensively clamps each side.
     colony.chambers.push(
-      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: FOOD_CHAMBER_CAPACITY + 200, posX: 0, posY: 0, width: 3, height: 3 },
     );
-    const cap = BASE_FOOD_STORAGE_CAPACITY + FOOD_CHAMBER_CAPACITY;
-    colony.foodStored = cap + 1000; // overshoot
+    colony.foodStored = BASE_FOOD_STORAGE_CAPACITY + 1000; // pool overshoot
     colony.reconcileCountdown = 1;
     tickReconcile(world, colony);
-    expect(colony.foodStored).toBe(cap);
-    // Chamber distribution still caps at FOOD_CHAMBER_CAPACITY — no inflation
+    expect(colony.foodStored).toBe(BASE_FOOD_STORAGE_CAPACITY);
     expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
   });
 
@@ -557,9 +696,12 @@ describe('tickReconcile', () => {
     expect(colony.foodStored).toBe(1000 - QUEEN_FOOD_PER_TICK);
   });
 
-  it('22. reconcile derives FoodStorage chamber contents from authoritative foodStored', () => {
+  it('22. reconcile NEVER redistributes the entrance pool across chambers (issue #15 regression)', () => {
+    // Pre-#15 the pool projected over N chambers, magically filling any chamber
+    // an ant had never visited. The post-#15 contract: chamber.foodStored is
+    // independent — it grows only when an ant deposits inside that chamber's
+    // footprint. Reconcile is forbidden from moving food across boundaries.
     const { world, colony } = setupWorldWithQueen(8000);
-    // Add two FoodStorage chambers and one Nursery (non-food)
     colony.chambers.push(
       { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
       { chamberId: 101, chamberType: ChamberType.Nursery,     foodStored: 0, posX: 4, posY: 0, width: 3, height: 3 },
@@ -569,32 +711,29 @@ describe('tickReconcile', () => {
     colony.reconcileCountdown = 1;
     tickReconcile(world, colony);
 
-    // Two FoodStorage chambers × FOOD_CHAMBER_CAPACITY = 10240; we have 8000, so:
-    // Chamber 0 gets min(8000, 5120) = 5120; distributed 5120
-    // Chamber 2 gets min(8000-5120, 5120) = 2880
-    // Nursery untouched
-    // colony.foodStored stays 8000 (authoritative — never overwritten)
-    expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
-    expect(colony.chambers[1]!.foodStored).toBe(0); // Nursery — untouched
-    expect(colony.chambers[2]!.foodStored).toBe(8000 - FOOD_CHAMBER_CAPACITY);
-    expect(colony.foodStored).toBe(8000);
+    // No ant deposits happened → all FoodStorage chambers stay at 0.
+    expect(colony.chambers[0]!.foodStored).toBe(0);
+    expect(colony.chambers[1]!.foodStored).toBe(0);
+    expect(colony.chambers[2]!.foodStored).toBe(0);
+    // Entrance pool clamps to BASE (8000 > BASE = 2048).
+    expect(colony.foodStored).toBe(BASE_FOOD_STORAGE_CAPACITY);
   });
 
-  it('23. reconcile overshoot clamped — colony.foodStored is pulled down to colonyFoodCapacity (09 backlog memo)', () => {
-    // Pre-memo behaviour was "colony.foodStored stays authoritative unchanged".
-    // Post-memo: reconcile defensively clamps to BASE + N × FOOD_CHAMBER_CAPACITY
-    // so an overshoot introduced by any non-deposit write path is corrected.
-    const { world, colony } = setupWorldWithQueen(15000);
+  it('23. reconcile defensively clamps a per-chamber overshoot down to FOOD_CHAMBER_CAPACITY (issue #15)', () => {
+    // The deposit + withdraw paths cap at source, but reconcile is the safety
+    // net for any drift. Direct chamber overshoot is clamped here.
+    const { world, colony } = setupWorldWithQueen(0);
     colony.chambers.push(
-      { chamberId: 100, chamberType: ChamberType.FoodStorage, foodStored: 0, posX: 0, posY: 0, width: 3, height: 3 },
+      { chamberId: 100, chamberType: ChamberType.FoodStorage,
+        foodStored: FOOD_CHAMBER_CAPACITY + 12345, // simulated drift
+        posX: 0, posY: 0, width: 3, height: 3 },
     );
 
     colony.reconcileCountdown = 1;
     tickReconcile(world, colony);
 
-    const cap = BASE_FOOD_STORAGE_CAPACITY + FOOD_CHAMBER_CAPACITY; // 7168
     expect(colony.chambers[0]!.foodStored).toBe(FOOD_CHAMBER_CAPACITY);
-    expect(colony.foodStored).toBe(cap);
+    expect(colony.foodStored).toBe(0);
   });
 });
 
