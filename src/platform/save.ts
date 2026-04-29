@@ -108,7 +108,12 @@ interface SerializedColony {
   foodStored: number; workerCount: number; eggCount: number; larvaeCount: number; nurseCount: number;
   eggs: EntityId[]; larvae: EntityId[]; workers: EntityId[];
   chambers: ChamberRecord[];
-  targetRatio: BehaviorRatio;
+  // Phase 10 / D-04 silent-migration: serialized shape is the runtime BehaviorRatio
+  // (post-migration `{ forage, fight }`), but the legacy `dig` field is allowed for
+  // backward compatibility with pre-Phase-10 saves. Migration via migrateBehaviorRatio
+  // at load time (deserializeColony) silently drops the `dig` field — no schema
+  // version bump per D-04 (pre-1.0, save compat is not a public contract).
+  targetRatio: { forage: number; fight: number; dig?: number };
   computedAllocation: WorkerAllocation;
   taskCensus: WorkerAllocation;
   defeated: boolean; reconcileCountdown: number;
@@ -272,6 +277,53 @@ export function serializeWorldState(world: WorldState): SerializedWorldState {
 // Deserialize helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Phase 10 / D-04 — silent BehaviorRatio migration on load.
+ *
+ * Pre-Phase-10 saves serialize targetRatio as `{ forage, dig, fight }` (3 fields).
+ * Phase 10 narrows BehaviorRatio to `{ forage, fight }`. This helper:
+ *   - drops the `dig` field (no proportional rescale)
+ *   - snaps all-zero `{ forage: 0, fight: 0 }` to `{ forage: 10, fight: 0 }`
+ *     (the player had pure dig under the old contract; default to 100% forage,
+ *     matching DEFAULT_BEHAVIOR_RATIO from Plan 01)
+ *   - leaves already-migrated saves untouched (idempotent)
+ *   - defensively defaults missing/non-numeric `forage` and `fight` to 0
+ *     (which then triggers the all-zero snap → `{ forage: 10, fight: 0 }`)
+ *
+ * No schema version bump — pre-1.0, save compat is not a public contract per D-04.
+ *
+ * Pure function: no PRNG, no clock, no side effects. Idempotent: applying twice
+ * produces the same output as applying once.
+ */
+export function migrateBehaviorRatio(
+  legacy: { forage?: number; dig?: number; fight?: number },
+): BehaviorRatio {
+  // Defensive: reject NaN, +/-Infinity, and negatives. typeof NaN === 'number',
+  // so the typeof guard alone allows NaN to propagate into colony.targetRatio
+  // and contaminate every downstream allocateWorkers call (WR-01). A negative
+  // weight is also rejected to mirror the SetBehaviorRatio command handler in
+  // tick.ts step 5 (any negative weight → reject command).
+  const rawForage = legacy.forage;
+  const rawFight  = legacy.fight;
+  const isForageValid = typeof rawForage === 'number' && Number.isFinite(rawForage) && rawForage >= 0;
+  const isFightValid  = typeof rawFight  === 'number' && Number.isFinite(rawFight)  && rawFight  >= 0;
+  const forage = isForageValid ? rawForage : 0;
+  const fight  = isFightValid  ? rawFight  : 0;
+  // All-zero edge case: snap to { forage: 10, fight: 0 } per D-04 — but ONLY
+  // when the input is legacy (has the `dig` key) or malformed (missing/NaN/
+  // negative fields). A post-Phase-10 caller that intentionally writes
+  // { forage: 0, fight: 0 } (idle slider, AI controller exotic state, debug
+  // command replay) is preserved verbatim — otherwise migrateBehaviorRatio
+  // would silently mutate valid two-field zeros and break snapshot-vs-replay
+  // determinism for tools that compare them (WR-10).
+  const isLegacy = 'dig' in legacy;
+  const isMalformed = !isForageValid || !isFightValid;
+  if (forage === 0 && fight === 0 && (isLegacy || isMalformed)) {
+    return { forage: 10, fight: 0 };
+  }
+  return { forage, fight };
+}
+
 function copyIntoInt32(dst: Int32Array, src: readonly number[]): void {
   const n = src.length < dst.length ? src.length : dst.length;
   for (let i = 0; i < n; i++) dst[i] = src[i]!;
@@ -371,7 +423,10 @@ function deserializeColony(s: SerializedColony): ColonyRecord {
   c.larvae               = [...s.larvae];
   c.workers              = [...s.workers];
   c.chambers             = s.chambers.map((ch) => ({ ...ch }));
-  c.targetRatio          = { ...s.targetRatio };
+  // Phase 10 / D-04 silent migration: legacy saves carry `targetRatio.dig`;
+  // migrateBehaviorRatio drops it, snaps all-zero to DEFAULT_BEHAVIOR_RATIO,
+  // and is idempotent on post-Phase-10 saves. See migrateBehaviorRatio docblock.
+  c.targetRatio          = migrateBehaviorRatio(s.targetRatio);
   c.computedAllocation   = { ...s.computedAllocation };
   c.taskCensus           = { ...s.taskCensus };
   c.defeated             = s.defeated;
@@ -459,6 +514,36 @@ function buildSaveFile(seed: number, inputLog: readonly SimCommand[], world: Wor
   };
 }
 
+/**
+ * Phase 10 / WR-09 — migrate a single inputLog entry on load.
+ *
+ * Pre-Phase-10 v2 saves (issue #15 bumped 1→2; Phase 10 narrowed without
+ * bumping per D-04) can carry `SetBehaviorRatio` commands shaped as
+ * `{ forage, dig, fight }`. The `dig` field is gone in the Phase 10 sim;
+ * replaying such a command verbatim would either silently drop the dig
+ * weight (turning legitimate dig-heavy commands into idle ones) or trip
+ * post-Phase-10 invariants. SCEN-06 replay truth requires the in-memory
+ * inputLog to match what the current sim accepts, so we migrate here
+ * rather than in the per-tick command handler.
+ *
+ * Migration semantics mirror `migrateBehaviorRatio` for the snapshot's
+ * persisted `targetRatio`:
+ *   - drop `dig` (no rescale)
+ *   - all-zero `{forage:0, fight:0}` snaps to DEFAULT_BEHAVIOR_RATIO
+ *     `{forage:10, fight:0}` (covers the pre-Phase-10 pure-dig case)
+ *
+ * Pure function, idempotent on already-migrated commands. Non-
+ * `SetBehaviorRatio` entries pass through untouched.
+ */
+function migrateInputLogCommand(cmd: SimCommand): SimCommand {
+  if (cmd.type !== 'SetBehaviorRatio') return cmd;
+  const ratioRaw = cmd.ratio as unknown as { forage?: number; dig?: number; fight?: number };
+  // Already in the two-field form (no `dig` key) — pass through.
+  if (!('dig' in ratioRaw)) return cmd;
+  const migrated = migrateBehaviorRatio(ratioRaw);
+  return { ...cmd, ratio: migrated };
+}
+
 function parseSaveFile(raw: string): SaveFile {
   const parsed = JSON.parse(raw) as { version?: unknown };
   if (typeof parsed.version !== 'number') {
@@ -467,7 +552,16 @@ function parseSaveFile(raw: string): SaveFile {
   if (parsed.version !== SAVE_FORMAT_VERSION) {
     throw new SaveVersionMismatchError(SAVE_FORMAT_VERSION, parsed.version);
   }
-  return parsed as SaveFile;
+  const file = parsed as SaveFile;
+  // WR-09: walk inputLog and migrate any legacy SetBehaviorRatio entries so
+  // SCEN-06 replay (`createScenario(seed) + tick(cmds[t])`) reproduces the
+  // migrated snapshot. Other command types pass through.
+  if (Array.isArray(file.inputLog)) {
+    for (let i = 0; i < file.inputLog.length; i++) {
+      file.inputLog[i] = migrateInputLogCommand(file.inputLog[i]!);
+    }
+  }
+  return file;
 }
 
 /**

@@ -12,7 +12,7 @@ import type { SimCommand } from './commands.js';
 import { initAnt } from './ant/ant-store.js';
 import { createColonyRecord } from './colony/colony-store.js';
 import { createPheromoneGrid, phGet, phSet, pheromoneGridKey } from './pheromone/pheromone-store.js';
-import { AntTask, ForagingSubState, PheromoneType, FightingSubState, ChamberType } from './enums.js';
+import { AntTask, ForagingSubState, PheromoneType, FightingSubState, ChamberType, NursingSubState } from './enums.js';
 import type { WorldState } from './types.js';
 import type { ColonyId } from './colony/colony-store.js';
 import {
@@ -117,13 +117,12 @@ describe('Step 1: command processing', () => {
     const cmd: SimCommand = {
       type: 'SetBehaviorRatio',
       colonyId: colonyId,
-      ratio: { forage: 5, dig: 3, fight: 2 },
+      ratio: { forage: 5, fight: 2 },
       issuedAtTick: 0,
     };
     tick(world, [cmd]);
     const colony = world.colonies[colonyId]!;
     expect(colony.targetRatio.forage).toBe(5);
-    expect(colony.targetRatio.dig).toBe(3);
     expect(colony.targetRatio.fight).toBe(2);
   });
 
@@ -143,7 +142,7 @@ describe('Step 1: command processing', () => {
     const cmd1: SimCommand = {
       type: 'SetBehaviorRatio',
       colonyId,
-      ratio: { forage: 10, dig: 0, fight: 0 },
+      ratio: { forage: 10, fight: 0 },
       issuedAtTick: 0,
     };
     tick(world, [cmd1]);
@@ -156,14 +155,19 @@ describe('Step 1: command processing', () => {
     const cmd2: SimCommand = {
       type: 'SetBehaviorRatio',
       colonyId,
-      ratio: { forage: 0, dig: 10, fight: 0 },
+      ratio: { forage: 0, fight: 10 },
       issuedAtTick: 1,
     };
     tick(world, [cmd2]);
-    // Same tick as issuance — new ratio takes effect
+    // Same tick as issuance — new ratio takes effect (CTRL-04 immediate-takeup).
+    // Phase 10 / CTRL-06: dig is auto-assigned per Marked-tile presence, NOT per ratio.
+    // With no Marked tiles in this colony's underground grid, computeDigDemand returns 0
+    // and the entire 10-worker pool flows to fight. Pre-Plan-02 this asserted dig:10
+    // (the old fallback when the triangle had a `dig` vertex); the rewire here pins
+    // CTRL-04 against the two-role widget contract.
     expect(world.colonies[colonyId]!.computedAllocation.forage).toBe(0);
-    expect(world.colonies[colonyId]!.computedAllocation.dig).toBe(10);
-    expect(world.colonies[colonyId]!.computedAllocation.fight).toBe(0);
+    expect(world.colonies[colonyId]!.computedAllocation.dig).toBe(0);
+    expect(world.colonies[colonyId]!.computedAllocation.fight).toBe(10);
   });
 
   // Test 4: SetBehaviorRatio rejects negative weights
@@ -173,7 +177,7 @@ describe('Step 1: command processing', () => {
     const cmd: SimCommand = {
       type: 'SetBehaviorRatio',
       colonyId,
-      ratio: { forage: -1, dig: 5, fight: 5 },
+      ratio: { forage: -1, fight: 5 },
       issuedAtTick: 0,
     };
     tick(world, [cmd]);
@@ -185,7 +189,7 @@ describe('Step 1: command processing', () => {
     const cmd: SimCommand = {
       type: 'SetBehaviorRatio',
       colonyId: 999 as ColonyId,
-      ratio: { forage: 5, dig: 5, fight: 0 },
+      ratio: { forage: 5, fight: 0 },
       issuedAtTick: 0,
     };
     expect(() => tick(world, [cmd])).not.toThrow();
@@ -232,7 +236,7 @@ describe('Step 1: command processing', () => {
       cmds.push({
         type: 'SetBehaviorRatio',
         colonyId,
-        ratio: { forage: r, dig: 0, fight: 0 },
+        ratio: { forage: r, fight: 0 },
         issuedAtTick: 0,
       });
     }
@@ -277,7 +281,7 @@ describe('Step ordering observable proofs', () => {
     const cmd: SimCommand = {
       type: 'SetBehaviorRatio',
       colonyId,
-      ratio: { forage: 0, dig: 0, fight: 0 },
+      ratio: { forage: 0, fight: 0 },
       issuedAtTick: 0,
     };
     tick(world, [cmd]);
@@ -420,7 +424,6 @@ describe('Step ordering observable proofs', () => {
     colony.computedAllocation.fight  = 0;
     colony.computedAllocation.nurse  = 0;
     colony.targetRatio.forage = 10;
-    colony.targetRatio.dig    = 0;
     colony.targetRatio.fight  = 0;
 
     // Tick 1: step 10a sees Digging (not Idle) → skipped. Step 10b tickDigExecution
@@ -477,7 +480,6 @@ describe('Step ordering observable proofs', () => {
     colony.computedAllocation.fight  = 1;
     colony.taskCensus.forage = 1;
     colony.targetRatio.forage = 0;
-    colony.targetRatio.dig    = 0;
     colony.targetRatio.fight  = 10;
 
     tick(world, []);
@@ -553,8 +555,12 @@ describe('Step ordering observable proofs', () => {
     colony.computedAllocation.dig    = 1;
     colony.computedAllocation.fight  = 0;
     colony.targetRatio.forage = 0;
-    colony.targetRatio.dig    = 10;
     colony.targetRatio.fight  = 0;
+    // Phase 10 (CTRL-06): dig is auto-assigned via need.dig from Marked tiles, not
+    // via targetRatio. Step 10a's auto-dig override will set computedAllocation.dig=0
+    // here (no Marked tiles, no active digger). The pre-set dig=1 above is noise but
+    // harmless: the assertion below — "mid-carry forager NOT preempted by Idle-eligibility"
+    // — depends only on the eligibility predicate, not on which task has demand.
 
     tick(world, []);
 
@@ -612,7 +618,6 @@ describe('Step ordering observable proofs', () => {
 
       // targetRatio that produces {nurse:3, forage:4, dig:0, fight:3} via allocateWorkers(10, 9, ratio).
       colony.targetRatio.forage = 4;
-      colony.targetRatio.dig    = 0;
       colony.targetRatio.fight  = 3;
 
       tick(w, []);
@@ -661,12 +666,13 @@ describe('Step ordering observable proofs', () => {
       w.ants.foodCarrying[carryWid] = 256;
       colony.workers.push(carryWid);
 
-      // Allocation: forage:2, dig:2, fight:1, nurse:1 (sum=6=workerCount)
-      // Step 9(a) counts: actualForage=1 (mid-carry), actualIdle=5
-      // need: forage=1, dig=2, fight=1, nurse=1 (total=5 = eligibles)
+      // Pre-seed computedAllocation; step 8 will overwrite via allocateWorkers under
+      // the actual ratio. Phase 10 (CTRL-06): dig is auto-assigned per Marked-tile
+      // presence (none in this fixture → dig=0). The test's load-bearing assertion is
+      // the non-negative invariant + sum=workerCount + mid-carry-not-preempted, all
+      // of which hold for any valid allocation that step 10a produces.
       colony.computedAllocation = { nurse: 1, forage: 2, dig: 2, fight: 1 };
       colony.targetRatio.forage = 10;
-      colony.targetRatio.dig    = 5;
       colony.targetRatio.fight  = 3;
 
       tick(w, []);
@@ -719,7 +725,6 @@ describe('09 reproduction-gate memo — starvation-shape regression', () => {
     // Forage-favored triangle; no chambers at all (intentional — this is the
     // pre-excavation colony state from the memo).
     colony.targetRatio.forage = 10;
-    colony.targetRatio.dig    = 0;
     colony.targetRatio.fight  = 0;
 
     tick(w, []);
@@ -757,8 +762,10 @@ describe('09 reproduction-gate memo — starvation-shape regression', () => {
     }
 
     colony.targetRatio.forage = 3;
-    colony.targetRatio.dig    = 2;
     colony.targetRatio.fight  = 0;
+    // Phase 10 (CTRL-06): dig is auto-assigned via Marked-tile presence; this fixture
+    // has no Marked tiles so computedAllocation.dig stays 0 and the assertions below
+    // (nurse=0 under no-Nursery memo gate; brood inert; sum=workerCount) hold.
 
     tick(w, []);
 
@@ -801,7 +808,6 @@ describe('09 reproduction-gate memo — starvation-shape regression', () => {
     });
 
     colony.targetRatio.forage = 10;
-    colony.targetRatio.dig    = 0;
     colony.targetRatio.fight  = 0;
 
     tick(w, []);
@@ -1526,9 +1532,15 @@ describe('Phase 7: Integration tests', () => {
     const colonyId = PLAYER_COLONY_ID as ColonyId;
     const colony = world.colonies[colonyId]!;
 
-    // Set high dig ratio so workers reassign to Digging
-    colony.targetRatio.forage = 0;
-    colony.targetRatio.dig    = 10;
+    // Phase 10 (CTRL-06): dig is auto-assigned via need.dig from Marked tiles.
+    // The MarkDigTile below is the load-bearing lever (not targetRatio). Per
+    // D-02 LOCKED + WR-06, auto-dig carves from `computedAllocation.forage`,
+    // so a non-zero forage budget is required for dig to fire. Forage-only
+    // ratio guarantees the carve reserves exactly one slot for dig (forage
+    // budget = N − 1, dig budget = 1) on the activation tick; subsequent
+    // ticks see `computeDigDemand` return 0 because an ant is already
+    // Digging, so the strict 1-cap holds across the 10-tick window.
+    colony.targetRatio.forage = 10;
     colony.targetRatio.fight  = 0;
 
     // Mark a tile adjacent to the pre-excavated player shaft (entrance column=24,
@@ -2736,5 +2748,601 @@ describe('resetFlowFieldCaches — cross-world isolation', () => {
     expect(chamberA.foodStored).toBeLessThanOrEqual(aBefore);
 
     resetFlowFieldCaches();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 10 / CTRL-06 — auto-dig demand-driven role (D-02 LOCKED)
+// ---------------------------------------------------------------------------
+//
+// These tests pin the contract added in Plan 10-02 (and locked by CONTEXT.md D-02):
+//
+//   - need.dig = (Marked tile count > 0 && no ant currently Digging) ? 1 : 0
+//   - When need.dig > 0 and at least one ant is Idle, step 10a auto-assigns
+//     exactly ONE Idle ant to AntTask.Digging (strict 1-digger cap).
+//   - When dig work exists but no ant is Idle, the simulation WAITS — no
+//     preemption of foragers/fighters.
+//   - When a Digging ant finishes (tile clears or it dies), it transitions to
+//     Idle; step 10a next tick reassigns it (auto-dig if more Marked tiles,
+//     else forage/fight per ratio).
+//   - The AI colony uses the SAME path — there is no isPlayer / colonyId
+//     branching in the auto-dig logic (CLNY-08 invariant).
+//
+// Discipline (per Plan 09.1-03 conventions): every test asserts BOTH t=0
+// preconditions (so a fixture-drift pass doesn't masquerade as a green) AND
+// t=N outcomes (the specific behavioral claim). Diagnostic for "feature missing
+// vs. feature broken" is encoded into the precondition asserts.
+// ---------------------------------------------------------------------------
+
+describe('Phase 10 / CTRL-06 auto-dig', () => {
+  /**
+   * Build a single-colony world with an underground grid pre-shaped so that
+   * (24, 1) is Open (mirrors the entrance shaft created by createScenario but
+   * runs against makeWorldWithColony for fast setup). The tile (25, 1) starts
+   * Solid; tests can MarkDigTile to flip it to Marked.
+   */
+  function makeWorldWithUndergroundForAutoDig(seed = 42): {
+    world: WorldState;
+    colonyId: ColonyId;
+    queenId: number;
+  } {
+    const { world, colonyId, queenId } = makeWorldWithColony(seed);
+    const colony = world.colonies[colonyId]!;
+    colony.entrances = [];
+    colony.rallyPoint = null;
+    colony.digFlowFieldDirty = false;
+    const ug = createUndergroundGrid(UNDERGROUND_GRID_WIDTH, UNDERGROUND_GRID_HEIGHT);
+    // Open the entrance shaft so a Marked tile at (25, y) has a reachable Open
+    // neighbor for the BFS flow field; matches the shape used by SC 1.
+    ug.data[0 * UNDERGROUND_GRID_WIDTH + 24] = UndergroundTileState.Open;
+    ug.data[1 * UNDERGROUND_GRID_WIDTH + 24] = UndergroundTileState.Open;
+    world.undergroundGrids[colonyId] = ug;
+    return { world, colonyId, queenId };
+  }
+
+  it('Test 1: demand activation — Marked tile + Idle ant → ant becomes Digging within 1 tick', () => {
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // Add 3 Idle workers (one will be picked; the strict cap holds the others).
+    colony.workerCount = 3;
+    for (let i = 0; i < 3; i++) {
+      const wid = allocateEntityId(world);
+      initAnt(world.ants, wid, { colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT, task: AntTask.Idle, subTask: 0 });
+      world.ants.zone[wid] = 1; // Underground; matches the Open shaft cell
+      colony.workers.push(wid);
+    }
+
+    // Forage-only ratio so non-dig demand is 0; auto-dig is the only signal.
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.fight  = 0;
+
+    // t=0 preconditions
+    expect(colony.workers.length).toBe(3);
+    let initialIdle = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Idle) initialIdle += 1;
+    expect(initialIdle).toBe(3);
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Solid);
+    let initialDigging = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) initialDigging += 1;
+    expect(initialDigging).toBe(0);
+    expect(colony.computedAllocation.dig).toBe(0);
+
+    // Mark a tile adjacent to the Open shaft.
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 25, tileY: 1, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    // t=N outcomes
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Marked);
+    expect(colony.computedAllocation.dig).toBe(1);
+    let diggingCount = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) diggingCount += 1;
+    expect(diggingCount).toBeGreaterThanOrEqual(1);
+    // Strict cap holds even on the activation tick.
+    expect(diggingCount).toBe(1);
+  });
+
+  it('Test 2: 1-digger cap — 5 Marked tiles + 5 Idle ants → exactly 1 Digging at t=1 and t=2', () => {
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    colony.workerCount = 5;
+    for (let i = 0; i < 5; i++) {
+      const wid = allocateEntityId(world);
+      initAnt(world.ants, wid, { colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT, task: AntTask.Idle, subTask: 0 });
+      world.ants.zone[wid] = 1;
+      colony.workers.push(wid);
+    }
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.fight  = 0;
+
+    // Mark 5 tiles in a column adjacent to the Open shaft.
+    const markCmds: SimCommand[] = [];
+    for (let dy = 1; dy <= 5; dy++) {
+      markCmds.push({ type: 'MarkDigTile', colonyId, tileX: 25, tileY: dy, issuedAtTick: 0 });
+    }
+
+    // t=0 preconditions
+    expect(colony.workers.length).toBe(5);
+    for (let dy = 1; dy <= 5; dy++) {
+      expect(ugGet(underground, 25, dy)).toBe(UndergroundTileState.Solid);
+    }
+    let initialDigging = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) initialDigging += 1;
+    expect(initialDigging).toBe(0);
+
+    tick(world, markCmds);
+
+    // t=1: cap holds — exactly 1 ant Digging despite 5 Marked tiles + 5 Idle.
+    let markedCount = 0;
+    for (let dy = 1; dy <= 5; dy++) {
+      if (ugGet(underground, 25, dy) === UndergroundTileState.Marked) markedCount += 1;
+    }
+    expect(markedCount).toBe(5);
+    expect(colony.computedAllocation.dig).toBe(1);
+    let digT1 = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) digT1 += 1;
+    expect(digT1).toBe(1);
+
+    tick(world, []);
+
+    // t=2: still exactly 1 — cap holds across ticks while a digger is active.
+    let digT2 = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) digT2 += 1;
+    expect(digT2).toBe(1);
+    // WR-07: slot stays reserved (dig=1) while a digger is active so the
+    // forage carve persists across ticks; without the reservation, the
+    // canonical iteration would over-book forage/fight and starve nurse
+    // for the duration of every dig job (codex P1 v2).
+    expect(colony.computedAllocation.dig).toBe(1);
+  });
+
+  it('Test 3: scarcity wait — Marked tile + 0 Idle ants → 0 Digging; foragers not preempted', () => {
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // 3 mid-cycle foragers carrying food (not Idle, not eligible for reassignment).
+    colony.workerCount = 3;
+    const foragerIds: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const wid = allocateEntityId(world);
+      initAnt(world.ants, wid, {
+        colonyId,
+        posX: 24 << FP_SHIFT,
+        posY: 1 << FP_SHIFT,
+        task: AntTask.Foraging,
+        subTask: ForagingSubState.CarryingFood,
+      });
+      world.ants.zone[wid] = 1;
+      world.ants.foodCarrying[wid] = 256; // mid-cycle; PRD §7c — not idle-checkpoint eligible
+      colony.workers.push(wid);
+      foragerIds.push(wid);
+    }
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.fight  = 0;
+    // Pre-populate computedAllocation so step 10a doesn't try to reassign these.
+    colony.computedAllocation = { nurse: 0, forage: 3, dig: 0, fight: 0 };
+
+    // t=0 preconditions
+    let initialIdle = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Idle) initialIdle += 1;
+    expect(initialIdle).toBe(0);
+    let initialDigging = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) initialDigging += 1;
+    expect(initialDigging).toBe(0);
+    // Snapshot foragers' tasks at t=0 — they must NOT be preempted at t=N.
+    const t0Tasks: Record<number, number> = {};
+    for (const wid of foragerIds) t0Tasks[wid] = world.ants.task[wid]!;
+
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 25, tileY: 1, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    // Run 4 more ticks — wait policy: dig demand persists, no auto-assignment.
+    for (let i = 0; i < 4; i++) tick(world, []);
+
+    // t=N=5 outcomes
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Marked); // tile still Marked (nobody reached it)
+    let diggingCount = 0;
+    for (const wid of colony.workers) if (world.ants.task[wid] === AntTask.Digging) diggingCount += 1;
+    expect(diggingCount).toBe(0);
+    // No forager was preempted to dig.
+    for (const wid of foragerIds) {
+      expect(world.ants.task[wid]).toBe(t0Tasks[wid]);
+    }
+    // Demand check fired every tick — colony.computedAllocation.dig is 1 (Marked tile present, no ant Digging).
+    expect(colony.computedAllocation.dig).toBe(1);
+  });
+
+  it('Test 4: return-to-Idle reassign — Digging ant finishes → next tick goes Foraging (no more Marked)', () => {
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // Place a worker already in Digging+Excavating ON a BeingDug tile with digTicksRemaining=1.
+    // After 1 tick, tickDigExecution opens the tile and flips back to MovingToTile.
+    // With no remaining Marked tiles, the next tick releases ant to Idle, and step 10a
+    // reassigns to Foraging per the {forage:10, fight:0} ratio.
+    colony.workerCount = 1;
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId,
+      posX: 25 << FP_SHIFT,
+      posY: 1 << FP_SHIFT,
+      task: AntTask.Digging,
+      subTask: DiggingSubState.Excavating,
+    });
+    world.ants.zone[wid] = 1;
+    world.ants.digTileX[wid] = 25;
+    world.ants.digTileY[wid] = 1;
+    world.ants.digTicksRemaining[wid] = 1;
+    underground.data[1 * UNDERGROUND_GRID_WIDTH + 25] = UndergroundTileState.BeingDug;
+    colony.workers.push(wid);
+    colony.digFlowFieldDirty = true;
+
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.fight  = 0;
+
+    // t=0 preconditions
+    expect(world.ants.task[wid]).toBe(AntTask.Digging);
+    expect(world.ants.subTask[wid]).toBe(DiggingSubState.Excavating);
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.BeingDug);
+    expect(world.ants.digTicksRemaining[wid]).toBe(1);
+
+    // Tick 1: excavation completes (digTicksRemaining 1→0), tile becomes Open, ant → MovingToTile.
+    tick(world, []);
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Open);
+
+    // Tick 2: step 10a sees the ant still as Digging (release hasn't fired yet —
+    // tickDigExecution runs at step 10b, AFTER step 10a). Then at step 10b the dormant-
+    // digger release path flips Digging → Idle since no Marked source remains.
+    tick(world, []);
+    expect(world.ants.task[wid]).toBe(AntTask.Idle);
+
+    // Tick 3: step 10a sees the now-Idle ant; with no Marked tiles, computeDigDemand
+    // returns 0 and the canonical iteration assigns to Foraging per the {forage:10, fight:0} ratio.
+    tick(world, []);
+
+    // t=N outcomes
+    expect(world.ants.task[wid]).toBe(AntTask.Foraging);
+    expect(colony.computedAllocation.dig).toBe(0);
+  });
+
+  it('Test 5: AI parity — Marked tile + Idle ant in AI colony → AI ant becomes Digging via the same path', () => {
+    // CLNY-08 self-check: the auto-dig path is colony-symmetric. A MarkDigTileCommand with
+    // colonyId === ENEMY_COLONY_ID drives an AI ant into Digging through the SAME step 10a
+    // wire that the player uses. No isPlayer / colonyId branching.
+    const world = createScenario(42);
+    const aiColonyId = ENEMY_COLONY_ID as ColonyId;
+    const playerColonyId = PLAYER_COLONY_ID as ColonyId;
+    const aiColony = world.colonies[aiColonyId]!;
+    const aiUg = world.undergroundGrids[aiColonyId]!;
+
+    // Use a Marked tile adjacent to the AI's pre-excavated entrance shaft. createScenario
+    // opens the entrance shaft for both colonies the same way (see scenario.ts:167-168).
+    // We pick a tile reachable from the AI's Open region. ENEMY_START_X is the shaft column.
+    // Any tile (col±1, row 1) where col is the AI shaft is reachable; we use a fixed
+    // offset that sits next to the shaft and flip Solid→Marked via MarkDigTile.
+    let aiShaftCol = -1;
+    for (let x = 0; x < UNDERGROUND_GRID_WIDTH; x++) {
+      if (aiUg.data[1 * UNDERGROUND_GRID_WIDTH + x] === UndergroundTileState.Open) {
+        aiShaftCol = x;
+        break;
+      }
+    }
+    expect(aiShaftCol).toBeGreaterThanOrEqual(0); // sanity: scenario.ts opened a shaft
+    const markX = aiShaftCol + 1;
+    const markY = 1;
+    expect(ugGet(aiUg, markX, markY)).toBe(UndergroundTileState.Solid);
+
+    // Force AI workers to be Idle and underground at the shaft so they can pick up dig work.
+    // STARTING_WORKERS spawn surface-side; for this test we just relocate one.
+    expect(aiColony.workers.length).toBeGreaterThan(0);
+    const aiWorkerId = aiColony.workers[0]!;
+    world.ants.task[aiWorkerId] = AntTask.Idle;
+    world.ants.subTask[aiWorkerId] = 0;
+    world.ants.posX[aiWorkerId] = aiShaftCol << FP_SHIFT;
+    world.ants.posY[aiWorkerId] = 1 << FP_SHIFT;
+    world.ants.zone[aiWorkerId] = 1; // Underground — needed for tickDigExecution claim path
+
+    // t=0 preconditions
+    let aiDiggingT0 = 0;
+    for (const wid of aiColony.workers) if (world.ants.task[wid] === AntTask.Digging) aiDiggingT0 += 1;
+    expect(aiDiggingT0).toBe(0);
+    expect(world.ants.task[aiWorkerId]).toBe(AntTask.Idle);
+
+    // Issue MarkDigTile on the AI colony — same command surface as the player.
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId: aiColonyId, tileX: markX, tileY: markY, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    // t=N outcomes — AI colony has exactly 1 Digging ant via the auto-dig path.
+    expect(ugGet(aiUg, markX, markY)).toBe(UndergroundTileState.Marked);
+    expect(aiColony.computedAllocation.dig).toBe(1);
+    let aiDiggingT1 = 0;
+    for (const wid of aiColony.workers) if (world.ants.task[wid] === AntTask.Digging) aiDiggingT1 += 1;
+    expect(aiDiggingT1).toBe(1);
+
+    // Player colony got NO Digging ants (no Mark in player colony) — proves the path is colony-scoped.
+    const playerColony = world.colonies[playerColonyId]!;
+    let playerDiggingT1 = 0;
+    for (const wid of playerColony.workers) if (world.ants.task[wid] === AntTask.Digging) playerDiggingT1 += 1;
+    expect(playerDiggingT1).toBe(0);
+  });
+
+  it('Test 6 (WR-06): nurse cap eats the only worker → auto-dig waits, nurse not preempted', () => {
+    // Regression for the codex P1 finding: in a brood-heavy 1-worker colony,
+    // the nurse cap (ceil(1/4)=1) eats the entire pool, leaving forage budget = 0.
+    // Without WR-06, the auto-dig override would still set computedAllocation.dig=1
+    // and the forage→dig→fight→nurse iteration would assign the only Idle ant to
+    // Digging — starving nurse. With the gate, dig is suppressed and nurse wins.
+    //
+    // The load-bearing setup here is brood + Nursery + workerCount=1 (driving the
+    // cap); targetRatio is irrelevant (the cap saturates first and forage_share
+    // would be 0 even with forage=10).
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    colony.workerCount = 1;
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+      task: AntTask.Idle, subTask: 0,
+    });
+    world.ants.zone[wid] = 1;
+    colony.workers.push(wid);
+
+    for (let e = 0; e < 30; e++) {
+      const lid = allocateEntityId(world);
+      initAnt(world.ants, lid, { colonyId, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
+      colony.larvae.push(lid);
+      colony.larvaeCount += 1;
+    }
+    colony.chambers.push({
+      chamberId: 9100, chamberType: ChamberType.Nursery,
+      foodStored: 0, posX: 0, posY: 0, width: 2, height: 2,
+    });
+
+    // t=0 preconditions
+    expect(colony.workers.length).toBe(1);
+    expect(world.ants.task[wid]).toBe(AntTask.Idle);
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Solid);
+
+    // Mark a tile + tick. allocateWorkers will compute nurse=1, forage=0; the
+    // auto-dig override must observe forage=0 and suppress dig demand.
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 25, tileY: 1, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    // t=N outcomes — nurse cap is the actual cause; explicitly assert it.
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Marked); // Mark persists — waiting
+    expect(colony.computedAllocation.nurse).toBe(1);
+    expect(colony.computedAllocation.forage).toBe(0); // <- nurse cap, not targetRatio, drove this
+    expect(colony.computedAllocation.dig).toBe(0); // suppressed (no forage slot to carve)
+    expect(world.ants.task[wid]).toBe(AntTask.Nursing); // nurse won, not dig
+    expect(world.ants.subTask[wid]).toBe(NursingSubState.MovingToBrood); // freshly assigned, not just inherited
+  });
+
+  it('Test 7 (WR-08): slider-to-fight (forage:0, no brood) → dig carves from fight, issue #13 honored', () => {
+    // When the player slams the 1-D slider all the way to Fight ({forage:0,
+    // fight:10}) with no brood, allocation = {nurse:0, forage:0, dig:0,
+    // fight:N}. Issue #13's promise ("auto-assign one digger when a Mark
+    // exists and an ant is Idle") still holds because the WR-08 carve falls
+    // back to fight when forage is empty. nurse is still never carved.
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    colony.workerCount = 3;
+    const widList: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const wid = allocateEntityId(world);
+      initAnt(world.ants, wid, {
+        colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+        task: AntTask.Idle, subTask: 0,
+      });
+      world.ants.zone[wid] = 1;
+      colony.workers.push(wid);
+      widList.push(wid);
+    }
+
+    colony.targetRatio.forage = 0;
+    colony.targetRatio.fight  = 10;
+
+    let initialIdle = 0;
+    for (const id of widList) if (world.ants.task[id] === AntTask.Idle) initialIdle += 1;
+    expect(initialIdle).toBe(3);
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Solid);
+
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 25, tileY: 1, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    // t=N outcomes — Mark dug, 1 worker Digging, 2 Fighting (carve from fight).
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Marked);
+    expect(colony.computedAllocation.forage).toBe(0);
+    expect(colony.computedAllocation.fight).toBe(3); // canonical post-allocation; carve is local
+    expect(colony.computedAllocation.dig).toBe(1);
+    let diggingCount = 0;
+    let fightingCount = 0;
+    for (const id of widList) {
+      if (world.ants.task[id] === AntTask.Digging) diggingCount += 1;
+      if (world.ants.task[id] === AntTask.Fighting) fightingCount += 1;
+    }
+    expect(diggingCount).toBe(1);
+    expect(fightingCount).toBe(2);
+  });
+
+  it('Test 10 (WR-11): zero-ratio {forage:0, fight:0} with Idle ants → dig fires (CTRL-06 honored without a carve source)', () => {
+    // codex P2 follow-up to PR #26: WR-10 leaves {forage:0, fight:0} as a
+    // valid post-Phase-10 targetRatio (snap-to-default only fires for
+    // legacy/malformed inputs). With both ratio-driven roles at 0 there is
+    // nothing to carve from, but the unallocated remainder
+    // (workerCount - nurseCount) sits Idle. Without WR-11 the CTRL-06
+    // promise — "assign one digger when a Mark exists and an ant is Idle" —
+    // silently breaks. WR-11 fires digDemand directly when Idle ants exist
+    // (workerCount > nurseCount), keeping CLNY-09 nurse intact.
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // 3 workers, no brood — auto-nurse stays at 0 so all 3 are Idle.
+    colony.workerCount = 3;
+    const widList: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      const wid = allocateEntityId(world);
+      initAnt(world.ants, wid, {
+        colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+        task: AntTask.Idle, subTask: 0,
+      });
+      world.ants.zone[wid] = 1;
+      colony.workers.push(wid);
+      widList.push(wid);
+    }
+
+    // Valid post-Phase-10 zero-ratio. WR-10 keeps this as-is (the snap only
+    // catches legacy {forage:0, dig:N, fight:0} inputs).
+    colony.targetRatio.forage = 0;
+    colony.targetRatio.fight  = 0;
+
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 25, tileY: 1, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    // CTRL-06 honored — exactly one ant Digging despite zero ratio budget.
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Marked);
+    expect(colony.computedAllocation.nurse).toBe(0);
+    expect(colony.computedAllocation.forage).toBe(0);
+    expect(colony.computedAllocation.fight).toBe(0);
+    expect(colony.computedAllocation.dig).toBe(1);
+    let diggingCount = 0;
+    let idleCount    = 0;
+    for (const id of widList) {
+      if (world.ants.task[id] === AntTask.Digging) diggingCount += 1;
+      if (world.ants.task[id] === AntTask.Idle)    idleCount    += 1;
+    }
+    expect(diggingCount).toBe(1);
+    expect(idleCount).toBe(2); // remaining Idle ants stay Idle (no other role demands)
+  });
+
+  it('Test 9 (WR-08): all-nurse colony (forage=fight=0) → auto-dig genuinely waits', () => {
+    // Counterpoint to Test 7 — and a future-regression guard against any
+    // attempt to carve from nurse when both ratio-driven roles are empty.
+    // When forage AND fight are both 0 (e.g., 1-worker brood-heavy colony
+    // where the nurse cap pinned the only worker to nurse), there is no
+    // ratio-driven slot to carve from. nurse is never carved (CLNY-09),
+    // so dig waits — same scarcity-wait philosophy as no-Idle-ant case.
+    // This case passes under both the old `forage > 0` gate and the new
+    // forage→fight rule; its job is to lock in the "never carve from nurse"
+    // floor so a future contributor doesn't extend the fallback chain.
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // 1 worker, brood-heavy + Nursery so nurse cap (ceil(1/4)=1) pins everything.
+    colony.workerCount = 1;
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+      task: AntTask.Idle, subTask: 0,
+    });
+    world.ants.zone[wid] = 1;
+    colony.workers.push(wid);
+
+    for (let e = 0; e < 30; e++) {
+      const lid = allocateEntityId(world);
+      initAnt(world.ants, lid, { colonyId, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
+      colony.larvae.push(lid);
+      colony.larvaeCount += 1;
+    }
+    colony.chambers.push({
+      chamberId: 9300, chamberType: ChamberType.Nursery,
+      foodStored: 0, posX: 0, posY: 0, width: 2, height: 2,
+    });
+
+    // Slider-to-fight; combined with the nurse cap this leaves zero ratio
+    // budget for any carve — the all-nurse case.
+    colony.targetRatio.forage = 0;
+    colony.targetRatio.fight  = 10;
+
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 25, tileY: 1, issuedAtTick: 0 };
+    tick(world, [cmd]);
+
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.Marked); // Mark waits
+    expect(colony.computedAllocation.nurse).toBe(1);
+    expect(colony.computedAllocation.forage).toBe(0);
+    expect(colony.computedAllocation.fight).toBe(0); // nurse cap ate available
+    expect(colony.computedAllocation.dig).toBe(0); // no ratio-driven slot to carve
+    expect(world.ants.task[wid]).toBe(AntTask.Nursing);
+  });
+
+
+  it('Test 8 (WR-07): dig slot reserved while digger is active → nurse not preempted by forage', () => {
+    // Regression for codex P1 v2: in a 2-worker / brood-heavy / forage-only
+    // colony with one ant actively excavating, the second (Idle) ant must
+    // become a nurse, not a forager. allocateWorkers gives {nurse:1, forage:1,
+    // fight:0}; without WR-07 the carve disappears mid-dig (rawDigDemand=0
+    // under the 1-cap) and the forage→…→nurse iteration assigns the Idle
+    // ant to Foraging — starving nurse for the entire dig duration. WR-07
+    // holds digDemand=1 while actualDig>0, preserving the carve.
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    // Worker A: actively excavating with a long countdown so the dig persists
+    // across the tick under test.
+    colony.workerCount = 2;
+    const widDigger = allocateEntityId(world);
+    initAnt(world.ants, widDigger, {
+      colonyId, posX: 25 << FP_SHIFT, posY: 1 << FP_SHIFT,
+      task: AntTask.Digging, subTask: DiggingSubState.Excavating,
+    });
+    world.ants.zone[widDigger] = 1;
+    world.ants.digTileX[widDigger] = 25;
+    world.ants.digTileY[widDigger] = 1;
+    world.ants.digTicksRemaining[widDigger] = 10;
+    underground.data[1 * UNDERGROUND_GRID_WIDTH + 25] = UndergroundTileState.BeingDug;
+    colony.workers.push(widDigger);
+    colony.digFlowFieldDirty = true;
+
+    // Worker B: Idle, the candidate for nurse vs forage.
+    const widIdle = allocateEntityId(world);
+    initAnt(world.ants, widIdle, {
+      colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+      task: AntTask.Idle, subTask: 0,
+    });
+    world.ants.zone[widIdle] = 1;
+    colony.workers.push(widIdle);
+
+    // Brood + Nursery so nurse=1, available=1, allocation={nurse:1, forage:1}.
+    for (let e = 0; e < 30; e++) {
+      const lid = allocateEntityId(world);
+      initAnt(world.ants, lid, { colonyId, posX: 100, posY: 100, task: AntTask.Idle, subTask: 0, speed: 0 });
+      colony.larvae.push(lid);
+      colony.larvaeCount += 1;
+    }
+    colony.chambers.push({
+      chamberId: 9200, chamberType: ChamberType.Nursery,
+      foodStored: 0, posX: 0, posY: 0, width: 2, height: 2,
+    });
+
+    colony.targetRatio.forage = 10;
+    colony.targetRatio.fight  = 0;
+
+    // t=0 preconditions
+    expect(world.ants.task[widDigger]).toBe(AntTask.Digging);
+    expect(world.ants.task[widIdle]).toBe(AntTask.Idle);
+    expect(ugGet(underground, 25, 1)).toBe(UndergroundTileState.BeingDug);
+    expect(world.ants.digTicksRemaining[widDigger]).toBe(10);
+
+    tick(world, []);
+
+    // t=N outcomes — digger persists, idle ant goes to Nursing (not Foraging).
+    expect(world.ants.task[widDigger]).toBe(AntTask.Digging);
+    expect(world.ants.digTicksRemaining[widDigger]).toBe(9); // step 10b decremented
+    expect(colony.computedAllocation.nurse).toBe(1);
+    expect(colony.computedAllocation.forage).toBe(1); // canonical post-allocation; carve is local
+    expect(colony.computedAllocation.dig).toBe(1); // slot reserved while digger active
+    expect(world.ants.task[widIdle]).toBe(AntTask.Nursing);
+    expect(world.ants.subTask[widIdle]).toBe(NursingSubState.MovingToBrood);
   });
 });

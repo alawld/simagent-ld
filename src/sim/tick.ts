@@ -25,7 +25,7 @@ import {
   SURFACE_GRID_HEIGHT,
 } from './constants.js';
 import { FP_SHIFT } from './fixed.js';
-import { allocateWorkers } from './behavior/allocation-system.js';
+import { allocateWorkers, computeDigDemand } from './behavior/allocation-system.js';
 import {
   tickReconcile,
   tickFoodConsumption,
@@ -185,13 +185,44 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
         // Colony lookup; silently skip if colony does not exist (PRD §5 T-01-02).
         const colony = world.colonies[cmd.colonyId];
         if (colony === undefined) break;
-        // Validate ratio fields: any negative weight rejects the command.
-        if (cmd.ratio.forage < 0 || cmd.ratio.dig < 0 || cmd.ratio.fight < 0) break;
+        // Phase 10 (CTRL-01'): two-role widget — only forage / fight; digging is
+        // auto-assigned per CTRL-06 in step 10a (Plan 02).
+        //
+        // WR-09 — defense in depth. The canonical migration site for pre-
+        // Phase-10 `{forage, dig, fight}` shapes is `parseSaveFile` in
+        // platform/save.ts (it walks inputLog on load so SCEN-06 replay
+        // reproduces the migrated snapshot). This handler also runs the
+        // same migration inline as a belt-and-suspenders guard for any
+        // call path that reaches the dispatcher without going through
+        // loadSave (debug-snapshot replay tools, ad-hoc tests, future
+        // remote-command surfaces). Inline to avoid a sim → platform
+        // dependency. Idempotent on already-migrated commands: the
+        // `'dig' in ratioRaw` guard short-circuits when the legacy key
+        // is absent, so post-Phase-10 commands (including a legitimate
+        // {forage:0, fight:0} idle slider) pass through unchanged.
+        const ratioRaw = cmd.ratio as unknown as { forage?: number; dig?: number; fight?: number };
+        let nextForage = cmd.ratio.forage;
+        let nextFight  = cmd.ratio.fight;
+        if ('dig' in ratioRaw) {
+          // Mirrors migrateBehaviorRatio in platform/save.ts: drop dig,
+          // snap all-zero remainder to DEFAULT_BEHAVIOR_RATIO {10, 0}.
+          if (nextForage === 0 && nextFight === 0) {
+            nextForage = 10;
+            nextFight  = 0;
+          }
+        }
+        // Validate ratio fields: reject NaN, +/-Infinity, and negatives.
+        // `NaN < 0` is false, so the negative-only check would let NaN poison
+        // colony.targetRatio and contaminate every downstream allocateWorkers
+        // call (mirrors the NaN guard in migrateBehaviorRatio per WR-01).
+        if (!Number.isFinite(nextForage) || !Number.isFinite(nextFight)) break;
+        if (nextForage < 0 || nextFight < 0) break;
         // Field-by-field copy to preserve object identity for copyWorldState determinism.
-        colony.targetRatio.forage = cmd.ratio.forage;
-        colony.targetRatio.dig    = cmd.ratio.dig;
-        colony.targetRatio.fight  = cmd.ratio.fight;
+        colony.targetRatio.forage = nextForage;
+        colony.targetRatio.fight  = nextFight;
         // CTRL-04: run allocateWorkers immediately in the same tick the command is issued.
+        // alloc0.dig is 0 here under the two-role contract — auto-dig (Plan 02 step 10a)
+        // overwrites colony.computedAllocation.dig later in this same tick when need.dig > 0.
         const brood0 = colony.eggCount + colony.larvaeCount;
         const hasNursery0 = hasCompletedChamber(colony, ChamberType.Nursery);
         const alloc0 = allocateWorkers(colony.workerCount, brood0, colony.targetRatio, hasNursery0);
@@ -615,6 +646,113 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
       else                             actualIdle   += 1;
     }
 
+    // Phase 10 / CTRL-06 (D-02 LOCKED) — auto-dig demand override.
+    // need.dig = (Marked tile present in colony grid) AND (no ant currently Digging) ? 1 : 0.
+    // Mirrors auto-nurse (CLNY-09): demand-driven role outside the player ratio.
+    //
+    // Per D-02 ("third demand-driven check, BEFORE the forage/fight split"), the
+    // override carves a slot out of the player's ratio-driven roles (forage
+    // first, then fight) so the canonical forage→dig→fight→nurse iteration
+    // below assigns one Idle ant to Digging instead of letting forage/fight
+    // absorb the whole Idle pool. The carve never touches `nurse`, which is
+    // demand-driven (CLNY-09) and must be preserved.
+    //
+    // Strict 1-digger cap falls out for free: computeDigDemand returns 0 when any
+    // ant of the colony is already Digging, so we don't double-carve.
+    //
+    // Scarcity policy (D-02 — wait, no preemption): if dig demand exists but no ant
+    // is Idle, the eligibles loop simply has nothing to assign — Marked tiles wait
+    // until an ant naturally goes Idle. Foragers/fighters mid-cycle are NOT preempted.
+    // The carve is bookkeeping only when no Idle ants are present.
+    //
+    // WR-06 / WR-08 (codex P1 series): the carve must protect nurse but must
+    // NOT block dig when only forage is empty. The earlier "forage > 0 only"
+    // gate fixed the nurse-starvation case at the cost of deadlocking dig
+    // whenever the player slid the slider all-fight (issue #13's promise:
+    // "auto-assign one digger when a Mark exists and an ant is Idle"). The
+    // current rule prefers carving from forage (per D-02 LOCKED), then falls
+    // back to fight, and finally suppresses dig only when the entire
+    // remaining ratio-driven budget is 0 (e.g., a 1-worker brood-heavy nurse
+    // cap pinning every worker to nurse). nurse is never carved — the
+    // CLNY-09 invariant.
+    //
+    // WR-07 (codex P1 v2): the dig slot must stay reserved while a digger is
+    // actively excavating, not only on the activation tick. `computeDigDemand`
+    // returns 0 as soon as any ant is Digging (the strict 1-cap), so without
+    // an extra hold on `actualDig > 0` the carve disappears mid-dig and the
+    // forage→…→nurse iteration overbooks the remaining workforce — starving
+    // nurse for the duration of every multi-tick dig. Holding `digDemand=1`
+    // while a digger is active makes `need.dig = 1 - actualDig = 0` (no new
+    // assignment) but keeps the carve budget at N − 1, so a freshly-Idle
+    // worker reaches the nurse branch instead of being stolen by forage/fight.
+    //
+    // Wind-down semantics: `actualDig > 0` also fires for the single tick
+    // between excavation completion (step 10b flips the tile Open and the
+    // ant's subTask back to MovingToTile) and the dormant-digger release
+    // (step 10b next tick flips Digging → Idle when no Marked source
+    // remains). For that one tick `computedAllocation.dig = 1` even though
+    // no useful dig work is happening; the next tick the count drops to
+    // 0 and allocation self-corrects. Accepted: a stricter gate would
+    // need to introspect Mark/BeingDug grid state, and the drift is one
+    // tick / one slot per dig job.
+    const undergroundGrid10a = world.undergroundGrids[colony.colonyId];
+    const rawDigDemand = undergroundGrid10a !== undefined
+      ? computeDigDemand(colony, undergroundGrid10a, world.ants)
+      : 0;
+    const wantDigSlot = rawDigDemand > 0 || actualDig > 0;
+    // Try to carve from forage first (D-02 preference), then fight. nurse is
+    // never carved (CLNY-09 invariant). digDemand is the canonical 0/1 flag
+    // both for `colony.computedAllocation.dig` and `need.dig` below.
+    let digDemand = 0;
+    let carvedForage = colony.computedAllocation.forage;
+    let carvedFight  = colony.computedAllocation.fight;
+    if (wantDigSlot) {
+      if (colony.computedAllocation.forage > 0) {
+        digDemand = 1;
+        carvedForage = colony.computedAllocation.forage - 1;
+      } else if (colony.computedAllocation.fight > 0) {
+        digDemand = 1;
+        carvedFight = colony.computedAllocation.fight - 1;
+      } else if (colony.workerCount > colony.nurseCount) {
+        // WR-11 (codex P2 follow-up): zero-ratio case. WR-10 leaves
+        // {forage:0, fight:0} as a valid post-Phase-10 targetRatio (the
+        // snap-to-default only fires for legacy/malformed inputs). With
+        // both ratio-driven roles at 0, allocateWorkers returns 0 for
+        // forage and fight; the unallocated remainder
+        // (workerCount - nurseCount) sits Idle. Without this branch the
+        // CTRL-06 promise — "assign one digger when a Mark exists and an
+        // ant is Idle" — silently breaks for {0,0} ratios. Skip the carve
+        // (nothing to carve) and set demand directly; the eligibles loop
+        // pulls one Idle ant per CTRL-06.
+        //
+        // CLNY-09 nurse invariant preserved: this branch is gated on
+        // workerCount > nurseCount, so the all-nurse colony (1-worker
+        // brood-heavy where nurseCap pins everyone) still falls through
+        // to the dig-waits path.
+        //
+        // Wind-down drift (accepted): if the player flips to {0,0} while
+        // non-nurse workers are still mid-Forage/Fight from a prior tick,
+        // computedAllocation.dig stays at 1 for one or more ticks while
+        // taskCensus.dig remains 0 (no Idle ant to assign). Same one-tick
+        // self-correcting drift WR-07 already accepts on the wind-down
+        // edge — gating here on actual Idle presence would require a
+        // pre-scan of the workforce before the carve, which costs more
+        // than the cosmetic invariant is worth.
+        digDemand = 1;
+      }
+      // else: every worker is pinned to nurse (1-worker brood-heavy) —
+      // dig waits. Same wait-no-preemption philosophy as the no-Idle-ant
+      // scarcity case.
+    }
+    colony.computedAllocation.dig = digDemand;
+    // WR-02: the carve is LOCAL to the eligibles loop. We do NOT mutate
+    // `colony.computedAllocation.forage` or `.fight`. The persisted fields
+    // remain the step-8 / SetBehaviorRatio result (= targetRatio × worker
+    // budget); any mid-tick consumer (renderer, debug HUD, autosave snapshot)
+    // that reads them between tick boundaries sees the canonical allocation,
+    // not a post-carve value. Determinism is preserved: the need calculations
+    // below are algebraically equivalent to a hypothetical in-place decrement.
+
     // (b) Collect ants at PRD §7c idle checkpoints, sorted ascending by EntityId (SCEN-06 determinism).
     //     The eligibility predicate is `task === AntTask.Idle` — the single, uniform rule per §7c
     //     as revised by Errata E-01. The per-task rows of the §7c table (post-deposit for Foraging,
@@ -634,9 +772,9 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
     //     Canonical target iteration order: forage → dig → fight → nurse (matches PRD §7a result shape).
     //     This deterministic if/else chain is the ONLY selection strategy.
     const need = {
-      forage: colony.computedAllocation.forage - actualForage,
+      forage: carvedForage                     - actualForage,
       dig:    colony.computedAllocation.dig    - actualDig,
-      fight:  colony.computedAllocation.fight  - actualFight,
+      fight:  carvedFight                      - actualFight,
       nurse:  colony.computedAllocation.nurse  - actualNurse,
     };
 

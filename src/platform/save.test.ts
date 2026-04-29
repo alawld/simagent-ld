@@ -4,6 +4,7 @@ import {
   SAVE_FORMAT_VERSION, SAVE_KEY, AUTOSAVE_INTERVAL_MS,
   serializeWorldState, deserializeWorldState,
   hasSave, loadSave, deleteSave, tickAutosave,
+  migrateBehaviorRatio,
   type SaveFile,
 } from './save.js';
 import { createScenario } from '../sim/scenario.js';
@@ -467,6 +468,303 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       for (const cmd of loaded.inputLog) {
         const t = cmd.issuedAtTick;
         (byTick[t] ??= []).push(cmd);
+      }
+      for (let t = 0; t < 50; t++) tick(replay, byTick[t] ?? []);
+
+      expect(JSON.stringify(serializeWorldState(replay)))
+        .toBe(JSON.stringify(serializeWorldState(original)));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 10 / D-04 — silent BehaviorRatio migration on load
+  //
+  // Pre-Phase-10 saves serialize targetRatio as { forage, dig, fight } (3 fields).
+  // Phase 10 narrows BehaviorRatio to { forage, fight }. The migrateBehaviorRatio
+  // helper drops the dig field, snaps all-zero { forage:0, fight:0 } to the
+  // default { forage:10, fight:0 }, and is idempotent on already-migrated saves.
+  // No schema version bump per D-04 (pre-1.0, save compat is not a public contract).
+  // ---------------------------------------------------------------------------
+  describe('Phase 10 / D-04 — migrateBehaviorRatio', () => {
+    it('(typical) drops dig field: { forage: 5, dig: 3, fight: 2 } → { forage: 5, fight: 2 }', () => {
+      // The dig field is silently dropped — no proportional rescale.
+      const result = migrateBehaviorRatio({ forage: 5, dig: 3, fight: 2 });
+      expect(result).toEqual({ forage: 5, fight: 2 });
+      // Sanity: the `dig` key is GONE, not zeroed.
+      expect('dig' in result).toBe(false);
+    });
+    it('(all-zero edge / pre-Phase-10 pure-dig) snaps to { forage: 10, fight: 0 }', () => {
+      // Pre-Phase-10 player who set pure dig: { forage: 0, dig: 10, fight: 0 }.
+      // Under the two-role contract this would be all-zero; D-04 snaps to the
+      // DEFAULT_BEHAVIOR_RATIO { forage: 10, fight: 0 }.
+      const result = migrateBehaviorRatio({ forage: 0, dig: 10, fight: 0 });
+      expect(result).toEqual({ forage: 10, fight: 0 });
+    });
+    it('(already-migrated, idempotent) { forage: 7, fight: 3 } → { forage: 7, fight: 3 }', () => {
+      // No-op pass-through for post-Phase-10 saves (no dig field).
+      // Applying the helper twice produces the same result as applying once.
+      const once = migrateBehaviorRatio({ forage: 7, fight: 3 });
+      expect(once).toEqual({ forage: 7, fight: 3 });
+      const twice = migrateBehaviorRatio(once);
+      expect(twice).toEqual({ forage: 7, fight: 3 });
+    });
+    it('(already-migrated, intentional zeros) { forage: 0, fight: 0 } passes through unchanged (WR-10)', () => {
+      // Post-Phase-10 callers can legitimately set both fields to 0 (idle
+      // slider, AI exotic state, replay tooling). The snap is restricted to
+      // legacy or malformed inputs so snapshot-vs-replay determinism is
+      // preserved for valid two-field zeros.
+      const result = migrateBehaviorRatio({ forage: 0, fight: 0 });
+      expect(result).toEqual({ forage: 0, fight: 0 });
+    });
+    it('(missing fields defensive) {} → { forage: 10, fight: 0 }', () => {
+      // Missing/non-numeric forage and fight default to 0, which then triggers
+      // the malformed-input branch of the snap. Garbage in → safe default out.
+      const result = migrateBehaviorRatio({});
+      expect(result).toEqual({ forage: 10, fight: 0 });
+    });
+    it('(NaN field defensive) { forage: NaN, fight: 0 } → { forage: 10, fight: 0 }', () => {
+      // NaN counts as malformed — the snap fires defensively.
+      const result = migrateBehaviorRatio({ forage: NaN, fight: 0 });
+      expect(result).toEqual({ forage: 10, fight: 0 });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 10 / D-04 — full save round-trip migration
+  //
+  // deserializeColony must invoke migrateBehaviorRatio so that loading a save
+  // with a pre-Phase-10 3-field targetRatio produces a runtime ColonyRecord
+  // with the post-Phase-10 2-field shape. Round-trip determinism: load legacy
+  // → save → reload yields a stable two-field-only serialized targetRatio.
+  // ---------------------------------------------------------------------------
+  describe('Phase 10 / D-04 — save round-trip migration', () => {
+    // Build a SerializedWorldState from createScenario, then mutate the player
+    // colony's targetRatio to the desired legacy/post shape. Using the live
+    // serializer keeps every other field of the envelope correct, so tests
+    // assert ONLY the migration behavior — not the rest of the envelope.
+    function legacySaveWithRatio(
+      legacy: { forage: number; dig?: number; fight: number },
+    ) {
+      const w = createScenario(42);
+      const s = serializeWorldState(w);
+      const colonyKey = String(PLAYER_COLONY_ID);
+      // Cast through unknown to inject the legacy 3-field shape (which the
+      // SerializedColony type now accepts via `dig?: number`).
+      (s.colonies[colonyKey] as { targetRatio: typeof legacy }).targetRatio = legacy;
+      return s;
+    }
+
+    it('typical legacy save: { forage: 5, dig: 3, fight: 2 } loads with dig dropped', () => {
+      // After deserialize, the runtime ColonyRecord has the post-Phase-10
+      // two-field shape. The `dig` key is GONE, not zeroed (verifies the
+      // migration is structural, not just numeric).
+      const s = legacySaveWithRatio({ forage: 5, dig: 3, fight: 2 });
+      const w2 = deserializeWorldState(s);
+      const ratio = w2.colonies[PLAYER_COLONY_ID]!.targetRatio;
+      expect(ratio).toEqual({ forage: 5, fight: 2 });
+      expect('dig' in ratio).toBe(false);
+    });
+    it('pure-dig legacy save: { forage: 0, dig: 10, fight: 0 } snaps to default { forage: 10, fight: 0 }', () => {
+      // The all-zero edge case: a pre-Phase-10 player who set pure dig had
+      // forage===0 AND fight===0 under the new contract. D-04 snaps to the
+      // DEFAULT_BEHAVIOR_RATIO { forage: 10, fight: 0 }.
+      const s = legacySaveWithRatio({ forage: 0, dig: 10, fight: 0 });
+      const w2 = deserializeWorldState(s);
+      const ratio = w2.colonies[PLAYER_COLONY_ID]!.targetRatio;
+      expect(ratio).toEqual({ forage: 10, fight: 0 });
+      expect('dig' in ratio).toBe(false);
+    });
+    it('already-migrated save: { forage: 7, fight: 3 } loads unchanged (no-op pass-through)', () => {
+      // Post-Phase-10 saves load idempotently — no re-snap, no field drift.
+      const s = legacySaveWithRatio({ forage: 7, fight: 3 });
+      const w2 = deserializeWorldState(s);
+      expect(w2.colonies[PLAYER_COLONY_ID]!.targetRatio).toEqual({ forage: 7, fight: 3 });
+    });
+    it('two-colony round-trip: each colony migrates independently', () => {
+      // Sanity: per-colony migration is independent. Player gets a typical
+      // legacy ratio (dig dropped); enemy gets the pure-dig edge case (snap).
+      const w = createScenario(42);
+      const s = serializeWorldState(w);
+      (s.colonies[String(PLAYER_COLONY_ID)] as { targetRatio: { forage: number; dig: number; fight: number } })
+        .targetRatio = { forage: 5, dig: 3, fight: 2 };
+      (s.colonies[String(ENEMY_COLONY_ID)] as { targetRatio: { forage: number; dig: number; fight: number } })
+        .targetRatio = { forage: 0, dig: 10, fight: 0 };
+      const w2 = deserializeWorldState(s);
+      expect(w2.colonies[PLAYER_COLONY_ID]!.targetRatio).toEqual({ forage: 5, fight: 2 });
+      expect(w2.colonies[ENEMY_COLONY_ID]!.targetRatio).toEqual({ forage: 10, fight: 0 });
+    });
+    it('round-trip determinism: load legacy → save → re-load produces byte-stable two-field targetRatio', () => {
+      // Critical SCEN-06 contract: after migration, a re-saved snapshot
+      // serializes a CLEAN two-field targetRatio, and a second load is the
+      // idempotent no-op case in migrateBehaviorRatio. The second-save JSON
+      // must contain no `dig` field.
+      const s1 = legacySaveWithRatio({ forage: 5, dig: 3, fight: 2 });
+      const w2 = deserializeWorldState(s1);
+      const s2 = serializeWorldState(w2);
+      const reSerializedRatio = s2.colonies[String(PLAYER_COLONY_ID)]!.targetRatio;
+      expect(reSerializedRatio).toEqual({ forage: 5, fight: 2 });
+      expect('dig' in reSerializedRatio).toBe(false);
+      // Load a third time; the second-save JSON has no dig field, so this is
+      // the post-migration idempotent pass-through path.
+      const w3 = deserializeWorldState(s2);
+      expect(w3.colonies[PLAYER_COLONY_ID]!.targetRatio).toEqual({ forage: 5, fight: 2 });
+    });
+    it('round-trip determinism: post-load tick sequence is deterministic', () => {
+      // Two worlds loaded from the SAME legacy save and ticked the same
+      // number of ticks must produce byte-identical serialized state.
+      // This guards against migration introducing any non-determinism
+      // (e.g. iteration order, PRNG drift) in the load path.
+      const legacy = legacySaveWithRatio({ forage: 5, dig: 3, fight: 2 });
+      const a = deserializeWorldState(legacy);
+      const b = deserializeWorldState(legacy);
+      for (let t = 0; t < 30; t++) {
+        tick(a, []);
+        tick(b, []);
+      }
+      expect(JSON.stringify(serializeWorldState(a)))
+        .toBe(JSON.stringify(serializeWorldState(b)));
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 10 / WR-09 — inputLog SetBehaviorRatio migration on load
+  //
+  // SCEN-06 requires that `createScenario(seed) + tick(cmds[t])` reproduce the
+  // loaded snapshot. Pre-Phase-10 v2 saves (issue #15 → Phase 10 transition)
+  // can carry SetBehaviorRatio entries shaped as `{forage, dig, fight}` in
+  // their inputLog. Replaying those verbatim under post-Phase-10 code would
+  // silently drop the dig weight and (for pure-dig players) collapse to an
+  // idle command. parseSaveFile walks inputLog and applies the same migration
+  // semantics as deserializeColony's targetRatio: drop dig, snap all-zero
+  // remainder to {forage:10, fight:0}, leave already-migrated entries alone.
+  // ---------------------------------------------------------------------------
+  describe('Phase 10 / WR-09 — inputLog migration on load', () => {
+    function writeSave(file: { version: number; seed: number; inputLog: unknown[]; snapshot: unknown }): void {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(file));
+    }
+
+    it('typical legacy entry: SetBehaviorRatio { forage:5, dig:3, fight:2 } loads with dig dropped', () => {
+      const w = createScenario(42);
+      const legacyEntry = {
+        type: 'SetBehaviorRatio',
+        colonyId: PLAYER_COLONY_ID,
+        ratio: { forage: 5, dig: 3, fight: 2 },
+        issuedAtTick: 0,
+      };
+      writeSave({
+        version: SAVE_FORMAT_VERSION, seed: 42,
+        inputLog: [legacyEntry],
+        snapshot: serializeWorldState(w),
+      });
+      const loaded = loadSave()!;
+      expect(loaded.inputLog.length).toBe(1);
+      const ratio = (loaded.inputLog[0] as { ratio: unknown }).ratio;
+      expect(ratio).toEqual({ forage: 5, fight: 2 });
+      expect('dig' in (ratio as object)).toBe(false);
+    });
+
+    it('pure-dig legacy entry: { forage:0, dig:10, fight:0 } snaps to default { forage:10, fight:0 }', () => {
+      const w = createScenario(42);
+      const legacyEntry = {
+        type: 'SetBehaviorRatio',
+        colonyId: PLAYER_COLONY_ID,
+        ratio: { forage: 0, dig: 10, fight: 0 },
+        issuedAtTick: 0,
+      };
+      writeSave({
+        version: SAVE_FORMAT_VERSION, seed: 42,
+        inputLog: [legacyEntry],
+        snapshot: serializeWorldState(w),
+      });
+      const loaded = loadSave()!;
+      const ratio = (loaded.inputLog[0] as { ratio: unknown }).ratio;
+      expect(ratio).toEqual({ forage: 10, fight: 0 });
+    });
+
+    it('post-Phase-10 entry without dig field passes through unchanged (including idle {0,0})', () => {
+      const w = createScenario(42);
+      const modernIdle: SimCommand = {
+        type: 'SetBehaviorRatio',
+        colonyId: PLAYER_COLONY_ID as ColonyId,
+        ratio: { forage: 0, fight: 0 },
+        issuedAtTick: 7,
+      };
+      writeSave({
+        version: SAVE_FORMAT_VERSION, seed: 42,
+        inputLog: [modernIdle],
+        snapshot: serializeWorldState(w),
+      });
+      const loaded = loadSave()!;
+      expect((loaded.inputLog[0] as { ratio: unknown }).ratio).toEqual({ forage: 0, fight: 0 });
+    });
+
+    it('mixed inputLog: only SetBehaviorRatio entries are touched; other commands pass through', () => {
+      const w = createScenario(42);
+      writeSave({
+        version: SAVE_FORMAT_VERSION, seed: 42,
+        inputLog: [
+          { type: 'SetBehaviorRatio', colonyId: PLAYER_COLONY_ID, ratio: { forage: 5, dig: 3, fight: 2 }, issuedAtTick: 0 },
+          { type: 'MarkDigTile', colonyId: PLAYER_COLONY_ID, tileX: 7, tileY: 3, issuedAtTick: 5 },
+          { type: 'NoOp', issuedAtTick: 10 },
+        ],
+        snapshot: serializeWorldState(w),
+      });
+      const loaded = loadSave()!;
+      expect((loaded.inputLog[0] as { ratio: unknown }).ratio).toEqual({ forage: 5, fight: 2 });
+      expect(loaded.inputLog[1]).toMatchObject({ type: 'MarkDigTile', tileX: 7, tileY: 3 });
+      expect(loaded.inputLog[2]).toMatchObject({ type: 'NoOp' });
+    });
+
+    it('replay round-trip: pure-dig legacy inputLog → load → replay reproduces the migrated snapshot', () => {
+      // The full SCEN-06 contract: migrated inputLog applied to a fresh
+      // scenario reproduces the migrated snapshot byte-for-byte.
+      //
+      // Discriminating case: pure-dig legacy {forage:0, dig:5, fight:0} is
+      // the only shape where migrated and verbatim playback produce
+      // DIFFERENT results: migrated snaps to {forage:10, fight:0}, while
+      // verbatim replay through the post-Phase-10 handler reads {forage:0,
+      // fight:0} (idle, no allocation). Mid-dig and mid-forage cases like
+      // {forage:5, dig:3, fight:2} → {forage:5, fight:2} cannot
+      // discriminate — both paths give the same answer because the handler
+      // ignores the `dig` field regardless.
+      const seed = 42;
+      const original = createScenario(seed);
+      // Build the original world by applying the POST-MIGRATION shape:
+      // {forage:10, fight:0} at tick 5. This is the state the migrated
+      // legacy command should reproduce on replay.
+      const postMigrationCmd: SimCommand = {
+        type: 'SetBehaviorRatio',
+        colonyId: PLAYER_COLONY_ID as ColonyId,
+        ratio: { forage: 10, fight: 0 },
+        issuedAtTick: 5,
+      };
+      for (let t = 0; t < 50; t++) {
+        const cmds: SimCommand[] = (t === 5) ? [postMigrationCmd] : [];
+        tick(original, cmds);
+      }
+
+      // Persist with a LEGACY pure-dig entry in the inputLog.
+      const legacyEntry = {
+        type: 'SetBehaviorRatio',
+        colonyId: PLAYER_COLONY_ID,
+        ratio: { forage: 0, dig: 5, fight: 0 },
+        issuedAtTick: 5,
+      };
+      writeSave({
+        version: SAVE_FORMAT_VERSION, seed,
+        inputLog: [legacyEntry],
+        snapshot: serializeWorldState(original),
+      });
+
+      const loaded = loadSave()!;
+      // Sanity: the legacy entry got snapped to {forage:10, fight:0}.
+      expect((loaded.inputLog[0] as { ratio: unknown }).ratio).toEqual({ forage: 10, fight: 0 });
+
+      const replay = createScenario(loaded.seed);
+      const byTick: SimCommand[][] = [];
+      for (const c of loaded.inputLog) {
+        const t = c.issuedAtTick;
+        (byTick[t] ??= []).push(c);
       }
       for (let t = 0; t < 50; t++) tick(replay, byTick[t] ?? []);
 
