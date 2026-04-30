@@ -1055,7 +1055,7 @@ describe('PHER-02 two-grid integration', () => {
 // Phase 7: Command processing tests
 // ---------------------------------------------------------------------------
 
-import { createUndergroundGrid, UndergroundTileState, ugGet } from './terrain.js';
+import { createUndergroundGrid, UndergroundTileState, ugGet, ugSet } from './terrain.js';
 import { DiggingSubState } from './enums.js';
 import type { FoodPile } from './food.js';
 import {
@@ -1108,6 +1108,36 @@ describe('Phase 7: MarkDigTile command processing', () => {
     tick(world, [cmd]);
     // Should remain Open (not changed to Marked)
     expect(ugGet(underground, 10, 10)).toBe(UndergroundTileState.Open);
+  });
+
+  // Issue #30 (sim-side): ceiling-row reject regardless of dispatch source.
+  it('Issue #30: MarkDigTile on tileY=0 (ceiling row) → silent drop, tile stays Solid', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = { type: 'MarkDigTile', colonyId, tileX: 30, tileY: 0, issuedAtTick: 0 };
+    tick(world, [cmd]);
+    const underground = world.undergroundGrids[colonyId]!;
+    // Tile stays Solid — the ceiling-row gate fires before the Marked write.
+    expect(ugGet(underground, 30, 0)).toBe(UndergroundTileState.Solid);
+  });
+
+  // Issue #30 (carve-out): DesignateEntrance must still mark row 0 at the
+  // entrance column. Entrance columns are exempt by design — the renderer
+  // paints them as the gold-tinted "way in" hole, not as the grass ceiling.
+  // The MarkDigTile gate above is scoped to the MarkDigTile dispatch path
+  // only; DesignateEntrance writes via direct ugSet to preserve this
+  // legitimate exemption. Regression guard so a future overreach of the
+  // ceiling-row rule doesn't break entrance shaft excavation.
+  it('Issue #30: DesignateEntrance still marks the row-0 shaft tile at the entrance column', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const cmd: SimCommand = {
+      type: 'DesignateEntrance', colonyId,
+      surfaceTileX: 40, surfaceTileY: 64, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    const underground = world.undergroundGrids[colonyId]!;
+    // Row-0 tile at the designated column is Marked — entrance columns
+    // are exempt from the ceiling-row prohibition.
+    expect(ugGet(underground, 40, 0)).toBe(UndergroundTileState.Marked);
   });
 
   // Test P7-3: MarkDigTile out of bounds → silent drop
@@ -1239,6 +1269,21 @@ describe('Phase 7: MarkDigTile command processing', () => {
     tick(world, [cmd2]);
     // Overlapping chamber should NOT have been created
     expect(world.pendingChambers[`${colonyId}:12:10`]).toBeUndefined();
+  });
+
+  // Issue #30 (sim-side): PlaceChamber footprint must not include the
+  // ceiling row. Symmetric with the MarkDigTile gate.
+  it('Issue #30: PlaceChamber rejected when anchorTileY=0 (footprint overlaps ceiling)', () => {
+    const { world, colonyId } = makeWorldWithUnderground();
+    const underground = world.undergroundGrids[colonyId]!;
+    underground.data[0 * UNDERGROUND_GRID_WIDTH + 10] = UndergroundTileState.Open;
+    const cmd: SimCommand = {
+      type: 'PlaceChamber', colonyId,
+      chamberType: ChamberType.Queen,
+      anchorTileX: 10, anchorTileY: 0, issuedAtTick: 0,
+    };
+    tick(world, [cmd]);
+    expect(world.pendingChambers[`${colonyId}:10:0`]).toBeUndefined();
   });
 
   // Test P7-9: PlaceChamber rejected if out of bounds
@@ -2775,6 +2820,20 @@ describe('resetFlowFieldCaches — cross-world isolation', () => {
 // ---------------------------------------------------------------------------
 
 describe('Phase 10 / CTRL-06 auto-dig', () => {
+  // Reset the module-level dig flow-field cache between every test in this
+  // block. Without this, a test that mutates the underground grid via
+  // `ugSet` (rather than the MarkDigTileCommand handler that sets
+  // colony.digFlowFieldDirty=true) inherits the cached flow field from
+  // whichever test ran before — step 9 sees a falsy dirty flag AND a non-
+  // first-compute state, and skips recomputation. The flow field then
+  // doesn't reflect the tiles the test just marked, so tickDigExecution's
+  // unreachable-release path (-2 reading) misclassifies a freshly-assigned
+  // Digger and bounces it back to Idle. Caught while authoring Tests 11/12
+  // for issue #31 (computeDigDemand reachability fix).
+  beforeEach(() => {
+    resetFlowFieldCaches();
+  });
+
   /**
    * Build a single-colony world with an underground grid pre-shaped so that
    * (24, 1) is Open (mirrors the entrance shaft created by createScenario but
@@ -3222,6 +3281,93 @@ describe('Phase 10 / CTRL-06 auto-dig', () => {
     }
     expect(diggingCount).toBe(1);
     expect(idleCount).toBe(2); // remaining Idle ants stay Idle (no other role demands)
+  });
+
+  it('Test 11 (issue #31): isolated Marked island (no Open neighbor) → dig demand = 0, Idle ants reassign to forage', () => {
+    // Repro of the user-visible "ant sitting at chamber doing nothing" bug
+    // captured in seed1521505688-tick2967. The player marked 4 tiles in the
+    // top row of the underground grid by clicking the grass-textured ceiling
+    // strip (issue #30); none of those tiles has an Open 4-neighbor. Pre-fix:
+    // computeDigDemand returns 1, step 10a carves a slot and assigns one
+    // Idle ant to Digging, the dig flow-field reports unreachable, the ant
+    // bounces back to Idle each tick — locked out of forage indefinitely.
+    // Post-fix (issue #31): Marked tiles without an Open neighbor don't
+    // count, demand=0, the Idle ant gets reassigned to Foraging normally.
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    colony.workerCount = 2;
+    const widList: number[] = [];
+    for (let i = 0; i < 2; i++) {
+      const wid = allocateEntityId(world);
+      initAnt(world.ants, wid, {
+        colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+        task: AntTask.Idle, subTask: 0,
+      });
+      world.ants.zone[wid] = 1;
+      colony.workers.push(wid);
+      widList.push(wid);
+    }
+
+    // Mark a 2-tile island far from the entrance shaft, with no Open
+    // 4-neighbor. The shaft Open tiles are at (24, 0) and (24, 1) per the
+    // helper; the marks at (50, 30)/(50, 31) sit in a sea of Solid. The
+    // describe-level `beforeEach(resetFlowFieldCaches)` ensures step 9's
+    // firstDigCompute gate fires this tick, so direct ugSet without
+    // dirty-flagging is safe here.
+    ugSet(underground, 50, 30, UndergroundTileState.Marked);
+    ugSet(underground, 50, 31, UndergroundTileState.Marked);
+
+    // t=0 preconditions — confirm the island is genuinely isolated.
+    expect(ugGet(underground, 50, 30)).toBe(UndergroundTileState.Marked);
+    expect(ugGet(underground, 50, 31)).toBe(UndergroundTileState.Marked);
+    expect(ugGet(underground, 49, 30)).toBe(UndergroundTileState.Solid);
+    expect(ugGet(underground, 51, 30)).toBe(UndergroundTileState.Solid);
+    expect(ugGet(underground, 50, 29)).toBe(UndergroundTileState.Solid);
+    expect(ugGet(underground, 50, 32)).toBe(UndergroundTileState.Solid);
+
+    tick(world, []);
+
+    // Dig demand suppressed — the Marked island is unreachable, so the
+    // forage-carve never fires. Both workers go to forage.
+    expect(colony.computedAllocation.dig).toBe(0);
+    let diggingCount = 0;
+    let foragingCount = 0;
+    for (const id of widList) {
+      if (world.ants.task[id] === AntTask.Digging)  diggingCount  += 1;
+      if (world.ants.task[id] === AntTask.Foraging) foragingCount += 1;
+    }
+    expect(diggingCount).toBe(0);
+    expect(foragingCount).toBe(2);
+  });
+
+  it('Test 12 (issue #31): one Marked tile with an Open neighbor + one isolated → dig demand = 1', () => {
+    // Mixed island scenario: prove the fix doesn't over-suppress. As long as
+    // ANY Marked tile has an Open 4-neighbor, dig demand fires — the
+    // unreachable marks are simply ignored.
+    const { world, colonyId } = makeWorldWithUndergroundForAutoDig();
+    const colony = world.colonies[colonyId]!;
+    const underground = world.undergroundGrids[colonyId]!;
+
+    colony.workerCount = 1;
+    const wid = allocateEntityId(world);
+    initAnt(world.ants, wid, {
+      colonyId, posX: 24 << FP_SHIFT, posY: 1 << FP_SHIFT,
+      task: AntTask.Idle, subTask: 0,
+    });
+    world.ants.zone[wid] = 1;
+    colony.workers.push(wid);
+
+    // (25, 1) is adjacent to the Open shaft at (24, 1) — reachable.
+    // (50, 30) is isolated — unreachable. beforeEach reset handles cache.
+    ugSet(underground, 25, 1, UndergroundTileState.Marked);
+    ugSet(underground, 50, 30, UndergroundTileState.Marked);
+
+    tick(world, []);
+
+    expect(colony.computedAllocation.dig).toBe(1);
+    expect(world.ants.task[wid]).toBe(AntTask.Digging);
   });
 
   it('Test 9 (WR-08): all-nurse colony (forage=fight=0) → auto-dig genuinely waits', () => {
