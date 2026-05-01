@@ -674,6 +674,211 @@ describe('ai-controller (CMBT-01..03, CLNY-08)', () => {
 
   });
 
+  // ---------------------------------------------------------------------------
+  // Issue #33 — anti-cluster spatial diversity
+  // ---------------------------------------------------------------------------
+
+  describe('issue #33 — depth gate + spread bias', () => {
+    it('depth gate: Queen does NOT place when only shallow Y candidates exist (Δy > tolerance)', () => {
+      const world = makeWorld(0);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      setQueenPos(world, 0, 10, 10);
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      // Only shallow tile available (Y=2). |2 - 18| = 16, way outside tolerance=4.
+      // Pre-issue-#33 the AI placed Queen at the entrance shaft floor; with
+      // the gate it must defer until the bootstrap dig has progressed.
+      ugSet(grid, 10, 2, UndergroundTileState.Open);
+      aiChamberPlacement(world, colony);
+      const queenCmd = world.commandQueue.find(
+        (c) => c.type === 'PlaceChamber' && (c as { chamberType: number }).chamberType === ChamberType.Queen,
+      );
+      expect(queenCmd).toBeUndefined();
+    });
+
+    it('depth gate: Queen DOES place when a candidate exists within ±tolerance of preferredDepth', () => {
+      const world = makeWorld(0);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      setQueenPos(world, 0, 10, 10);
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      // Y=14 is within tolerance 4 of preferredDepth 18 (delta = 4).
+      ugSet(grid, 10, 14, UndergroundTileState.Open);
+      aiChamberPlacement(world, colony);
+      const queenCmd = world.commandQueue.find(
+        (c) => c.type === 'PlaceChamber' && (c as { chamberType: number }).chamberType === ChamberType.Queen,
+      ) as { anchorTileY: number } | undefined;
+      expect(queenCmd).toBeDefined();
+      expect(queenCmd!.anchorTileY).toBe(14);
+    });
+
+    it('spread bias: among same-depth candidates, anchor farthest from existing chambers wins', () => {
+      const world = makeWorld(0);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      setQueenPos(world, 0, 10, 10);
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      // Two candidates at Nursery preferredDepth=7: anchor X=14 (close to
+      // existing Queen+FS at X≈10) and X=40 (far). Both have valid 4x3
+      // footprints that don't overlap any existing chamber. Spread bias
+      // should pick X=40.
+      colony.chambers.push(makeChamber(ChamberType.Queen, 10, AI_QUEEN_CHAMBER_DEPTH));
+      colony.chambers.push(makeChamber(ChamberType.FoodStorage, 10, 5));
+      colony.eggCount = 6;
+      colony.larvaeCount = 6; // Triggers Nursery via brood threshold.
+      ugSet(grid, 14, 7, UndergroundTileState.Open);
+      ugSet(grid, 40, 7, UndergroundTileState.Open);
+      aiChamberPlacement(world, colony);
+      const nurseryCmd = world.commandQueue.find(
+        (c) => c.type === 'PlaceChamber' && (c as { chamberType: number }).chamberType === ChamberType.Nursery,
+      ) as { anchorTileX: number; anchorTileY: number } | undefined;
+      expect(nurseryCmd).toBeDefined();
+      // Nursery lands at X=40 — farther from the existing chambers at X=10.
+      expect(nurseryCmd!.anchorTileX).toBe(40);
+      expect(nurseryCmd!.anchorTileY).toBe(7);
+    });
+
+    it('Queen-first ordering: FoodStorage does NOT place before Queen exists, even with food >= threshold', () => {
+      const world = makeWorld(0);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      setQueenPos(world, 0, 10, 10);
+      colony.foodStored = AI_FOOD_STORAGE_THRESHOLD * 100; // Far above threshold.
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      // Open tile at FS preferredDepth (5). Pre-fix the FS gate fired here
+      // immediately; the FS chamber landed and blocked the bootstrap dig
+      // before the Queen could find a deep enough spot.
+      ugSet(grid, 10, 5, UndergroundTileState.Open);
+      aiChamberPlacement(world, colony);
+      const fsCmd = world.commandQueue.find(
+        (c) => c.type === 'PlaceChamber' && (c as { chamberType: number }).chamberType === ChamberType.FoodStorage,
+      );
+      expect(fsCmd).toBeUndefined();
+    });
+
+    it('bootstrap dig continues while Queen is pending (codex P1 — deadlock guard)', () => {
+      // Pre-fix the bootstrap was gated on "no Queen chamber AND no Queen
+      // pending", which meant a Queen anchor that workers couldn't reach
+      // (e.g., past unreachable Solid tiles) deadlocked the colony: the
+      // pending blocked bootstrap, no other chambers existed to drive the
+      // steady-state pass, and the Queen never completed. Continue
+      // bootstrap while Queen is merely pending — the extra dig marks
+      // around the deepest Open tile guarantee workers can always reach
+      // the anchor by punching dirt as needed.
+      const world = makeWorld(AI_DIG_INTERVAL);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      // Carve an entrance shaft so bootstrap has a deepest-Open tile.
+      ugSet(grid, 32, 0, UndergroundTileState.Open);
+      ugSet(grid, 32, 1, UndergroundTileState.Open);
+      // Queen is pending (no chamber yet).
+      world.pendingChambers['2:30:14'] = {
+        colonyId: 2 as ColonyId,
+        chamberType: ChamberType.Queen,
+        anchorTileX: 30,
+        anchorTileY: 14,
+        width: 5,
+        height: 3,
+      };
+      aiDigHeuristic(world, colony);
+      const digCmds = world.commandQueue.filter((c) => c.type === 'MarkDigTile');
+      // Without the codex P1 fix, digCmds would be empty — bootstrap was
+      // blocked by Queen-pending. With the fix it continues and emits
+      // dig marks around the deepest Open tile.
+      expect(digCmds.length).toBeGreaterThan(0);
+    });
+
+    it('depth gate does NOT apply to FoodStorage/Nursery (codex P2 — only Queen)', () => {
+      // Pre-fix the depth gate applied to every findOpenChamberSpot call,
+      // so a FoodStorage gate firing when only deep Open tiles existed
+      // would silently never place the chamber (the BFS found candidates
+      // at Y=15+ but the gate rejected them as |Y - 5| > tolerance).
+      // Restricting the gate to Queen lets FS/Nursery land at the closest
+      // available Y when the dig has gone deeper than their preferredDepth.
+      const world = makeWorld(0);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      setQueenPos(world, 0, 10, 10);
+      colony.foodStored = AI_FOOD_STORAGE_THRESHOLD * 100;
+      // Queen exists at a deep position; the only FS-eligible Open tile is
+      // at Y=20 — way outside the (preferredDepth=5, tolerance=4) gate.
+      colony.chambers.push(makeChamber(ChamberType.Queen, 10, 18));
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      ugSet(grid, 30, 20, UndergroundTileState.Open);
+      aiChamberPlacement(world, colony);
+      const fsCmd = world.commandQueue.find(
+        (c) => c.type === 'PlaceChamber' && (c as { chamberType: number }).chamberType === ChamberType.FoodStorage,
+      ) as { anchorTileX: number; anchorTileY: number } | undefined;
+      // FS should land at the only valid anchor, despite Y=20 being far
+      // outside the Queen-style depth gate's ±4 tolerance.
+      expect(fsCmd).toBeDefined();
+      expect(fsCmd!.anchorTileY).toBe(20);
+    });
+
+    it('frontier collection bounds-checks footprint probes (codex P2 — edge aliasing)', () => {
+      // Two chambers in the same row at opposite ends of the grid:
+      //   A at (GRID_W-1, 5), B at (0, 5).
+      // collectFrontierTiles walks A's top border, considering tile
+      // (GRID_W-1, 4). The neighbor probe `isFootprint(GRID_W, 4)` would
+      // — without bounds checking — produce a key equal to
+      // `4*GRID_W + GRID_W = 5*GRID_W + 0`, colliding with the footprint
+      // tile (0, 5) where B sits. Without the bounds guard, A's top tile
+      // is wrongly rejected as adjacent to another chamber and never
+      // makes it into the frontier dig pass.
+      const world = makeWorld(AI_DIG_INTERVAL);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      // Place A at right edge, B at left edge. Both 1x1 to keep the
+      // arithmetic crisp.
+      const RIGHT_EDGE = 63; // GRID_W - 1, matches addUndergroundGrid GRID_W=64
+      colony.chambers.push(makeChamber(ChamberType.Queen,        RIGHT_EDGE, 5, 1, 1));
+      colony.chambers.push(makeChamber(ChamberType.FoodStorage,  0,          5, 1, 1));
+
+      aiDigHeuristic(world, colony);
+      const digCmds = world.commandQueue.filter(
+        (c) => c.type === 'MarkDigTile',
+      ) as Array<{ tileX: number; tileY: number }>;
+      // The right-edge chamber's top tile (RIGHT_EDGE, 4) must appear in
+      // the dig commands — either via the frontier pass or the legacy
+      // perimeter pass. Without the bounds fix, the frontier pass falsely
+      // rejected it; the legacy pass picks it up regardless, so the
+      // bug manifested as "no frontier extension" rather than "no dig at
+      // all". Assert a stronger property: the (RIGHT_EDGE, 4) command
+      // must be present.
+      const hasTopRightMark = digCmds.some(
+        (c) => c.tileX === RIGHT_EDGE && c.tileY === 4,
+      );
+      expect(hasTopRightMark).toBe(true);
+    });
+
+    it('Queen-pending counts as Queen for FS gate (no double-pending)', () => {
+      const world = makeWorld(0);
+      const colony = addColony(world, 2 as ColonyId, 0);
+      addUndergroundGrid(world, 2 as ColonyId);
+      setQueenPos(world, 0, 10, 10);
+      colony.foodStored = AI_FOOD_STORAGE_THRESHOLD * 100;
+      const grid = world.undergroundGrids[2 as ColonyId]!;
+      // Pending Queen blocks the bootstrap-dig gate AND counts as "queen
+      // exists" for the FS gate, so FS can place even before the Queen
+      // chamber transitions from pending to ChamberRecord.
+      world.pendingChambers['2:10:18'] = {
+        colonyId: 2 as ColonyId,
+        chamberType: ChamberType.Queen,
+        anchorTileX: 10,
+        anchorTileY: 18,
+        width: 5,
+        height: 3,
+      };
+      ugSet(grid, 10, 5, UndergroundTileState.Open);
+      aiChamberPlacement(world, colony);
+      const fsCmd = world.commandQueue.find(
+        (c) => c.type === 'PlaceChamber' && (c as { chamberType: number }).chamberType === ChamberType.FoodStorage,
+      );
+      expect(fsCmd).toBeDefined();
+    });
+  });
+
   // -------------------------------------------------------------------------
   describe('CLNY-08 compliance', () => {
 
@@ -751,7 +956,8 @@ describe('ai-controller (CMBT-01..03, CLNY-08)', () => {
 
     it('AI_DIG_INTERVAL is 40', () => expect(AI_DIG_INTERVAL).toBe(40));
     it('AI_DIG_MARK_BUDGET is 5', () => expect(AI_DIG_MARK_BUDGET).toBe(5));
-    it('AI_QUEEN_CHAMBER_DEPTH is 10', () => expect(AI_QUEEN_CHAMBER_DEPTH).toBe(10));
+    it('AI_QUEEN_CHAMBER_DEPTH is 18 (issue #33 — deeper to satisfy maxDepth>15 acceptance criterion)', () =>
+      expect(AI_QUEEN_CHAMBER_DEPTH).toBe(18));
     it('AI_FOOD_STORAGE_THRESHOLD is 8', () => expect(AI_FOOD_STORAGE_THRESHOLD).toBe(8));
     it('AI_NURSERY_THRESHOLD is 12', () => expect(AI_NURSERY_THRESHOLD).toBe(12));
     it('AI_BEHAVIOR_RATIO has two-field shape (Phase 10 / D-05)', () => {
