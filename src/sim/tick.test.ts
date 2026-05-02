@@ -11,6 +11,7 @@ import {
   allocateEntityId,
   LEGACY_SIM_VERSION,
   SIM_VERSION_V5_CHAMBER_ON_MARKED,
+  LATEST_SIM_VERSION,
 } from './types.js';
 import { GameOutcome } from './game-over.js';
 import type { SimCommand } from './commands.js';
@@ -2272,10 +2273,16 @@ describe('PlaceChamber v5 — chamber on Marked tiles (issue #38)', () => {
     expect(world.pendingChambers[`${colonyId}:${entranceX}:10`]).toBeUndefined();
   });
 
-  it('SIM_VERSION_V5_CHAMBER_ON_MARKED is the LATEST_SIM_VERSION', () => {
-    // Sanity: new worlds run on v5 by default.
+  it('new worlds run at LATEST_SIM_VERSION', () => {
+    // Verify createWorldState uses the LATEST_SIM_VERSION constant exactly.
+    // Tracks the constant rather than a hard-coded number so future bumps
+    // don't have to update this assertion, while still proving the factory
+    // is wired to the latest version (not stuck on a stale literal).
     const world = createWorldState(42);
-    expect(world.simVersion).toBe(SIM_VERSION_V5_CHAMBER_ON_MARKED);
+    expect(world.simVersion).toBe(LATEST_SIM_VERSION);
+    // Plus a floor to flag accidental downgrades — the latest must always
+    // be at least v5 (the issue #38 baseline).
+    expect(world.simVersion).toBeGreaterThanOrEqual(SIM_VERSION_V5_CHAMBER_ON_MARKED);
   });
 });
 
