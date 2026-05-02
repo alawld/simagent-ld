@@ -44,11 +44,10 @@ import {
 } from './sprites.js';
 import {
   drawBarrenEarthSubstrate,
-  drawSolidRockTile,
   drawOpenFloorTile,
-  drawTunnelCornerOverlay,
-  drawSolidConvexCornerOverlay,
 } from './terrain-atlas.js';
+import { drawAutotiledUndergroundTile, drawUndergroundRim } from './underground-autotile.js';
+import { gatherUnderground3x3Neighbors, type Neighbors3x3 } from './underground-neighbors.js';
 import type { CameraState } from './camera.js';
 
 // ---------------------------------------------------------------------------
@@ -133,21 +132,15 @@ export function drawUndergroundTerrain(
     }
   }
 
-  // Wall-edge predicate for tunnel corner rounding (issue #40). Strictly
-  // checks for Solid because Marked and BeingDug are visually rendered as
-  // open-floor-with-tint — they read as "tunnel becoming a tunnel", not
-  // wall. Drawing a wall shadow facing a Marked neighbor would falsely
-  // suggest a hard boundary that the player has explicitly queued for
-  // demolition. Out-of-bounds tiles count as walls (the grid edge is the
-  // edge of the world). The ceiling row (ty=0) is wall except at entrance
-  // columns, mirroring the visual rule used a few lines below for the
-  // ceiling-strip rendering.
-  const isWallNeighbor = (nx: number, ny: number): boolean => {
-    if (nx < 0 || ny < 0 || nx >= grid.width || ny >= grid.height) return true;
-    if (ny === 0) return !entranceXSet.has(nx);
-    return ugGet(grid, nx, ny) === UndergroundTileState.Solid;
+  // Reusable neighbor scratch — gatherUnderground3x3Neighbors mutates this
+  // in place so the per-frame tile loop doesn't allocate a fresh
+  // Neighbors3x3 per visible tile. Per codex P2 review: a 200-tile
+  // viewport at 60fps was spawning ~12k short-lived objects/sec.
+  const neighbors: Neighbors3x3 = {
+    nw: 'wall', n: 'wall', ne: 'wall',
+    w:  'wall', c: 'wall', e:  'wall',
+    sw: 'wall', s: 'wall', se: 'wall',
   };
-  const isOpenNeighbor = (nx: number, ny: number): boolean => !isWallNeighbor(nx, ny);
 
   for (let ty = Math.max(top, 0); ty < bottom; ty++) {
     for (let tx = Math.max(left, 0); tx < right; tx++) {
@@ -179,58 +172,27 @@ export function drawUndergroundTerrain(
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
         }
       } else {
+        // Issue #43 — quarter-tile autotiling. The classifier treats Solid
+        // (and OOB / non-entrance ceiling) as wall, and Open / Marked /
+        // BeingDug as open. The tile's substrate plus opposite-kind
+        // chamfer/inner-corner masks together resolve stair-step diagonals
+        // into smooth silhouettes across tile boundaries.
+        gatherUnderground3x3Neighbors(grid, tx, ty, entranceXSet, neighbors);
+        drawAutotiledUndergroundTile(gfx, screenX, screenY, tx, ty, neighbors.c, neighbors);
+        // Rim pass — subtle 2-pixel darker band on the open side of each
+        // wall boundary. The shape is correct without it but the corridor
+        // reads as flat black; the rim is what gives it the "carved out
+        // of packed earth" feel.
+        drawUndergroundRim(gfx, screenX, screenY, tx, ty, neighbors.c, neighbors);
+
+        // Marked / BeingDug tint overlay — applied AFTER autotile so the
+        // tint reads through the dug silhouette. Ensures the player sees
+        // what's queued / in progress without losing the smooth shape.
         const state = ugGet(grid, tx, ty);
-        if (state === UndergroundTileState.Solid) {
-          drawSolidRockTile(gfx, screenX, screenY, tx, ty);
-          // Issue #40 user UAT: round off Solid tile corners that poke
-          // into open space. Combined with the inside-corner darkening
-          // on Open tiles, the diagonal-corridor stair-step pattern
-          // visually resolves into a smooth diagonal wall.
-          drawSolidConvexCornerOverlay(
-            gfx, screenX, screenY,
-            isOpenNeighbor(tx,     ty - 1),
-            isOpenNeighbor(tx + 1, ty - 1),
-            isOpenNeighbor(tx + 1, ty),
-            isOpenNeighbor(tx + 1, ty + 1),
-            isOpenNeighbor(tx,     ty + 1),
-            isOpenNeighbor(tx - 1, ty + 1),
-            isOpenNeighbor(tx - 1, ty),
-            isOpenNeighbor(tx - 1, ty - 1),
-          );
-        } else if (state === UndergroundTileState.Open) {
-          drawOpenFloorTile(gfx, screenX, screenY, tx, ty);
-          // Issue #40 — round inside corners by darkening the edge bands
-          // facing wall neighbors. No-op if the tile is wholly inside an
-          // open chamber (no wall neighbors).
-          drawTunnelCornerOverlay(
-            gfx, screenX, screenY,
-            isWallNeighbor(tx,     ty - 1),
-            isWallNeighbor(tx + 1, ty),
-            isWallNeighbor(tx,     ty + 1),
-            isWallNeighbor(tx - 1, ty),
-          );
-        } else if (state === UndergroundTileState.Marked) {
-          // Open floor base + corner rounding (looks like a tunnel-in-progress)
-          // + blue Marked tint so the player sees what they queued.
-          drawOpenFloorTile(gfx, screenX, screenY, tx, ty);
-          drawTunnelCornerOverlay(
-            gfx, screenX, screenY,
-            isWallNeighbor(tx,     ty - 1),
-            isWallNeighbor(tx + 1, ty),
-            isWallNeighbor(tx,     ty + 1),
-            isWallNeighbor(tx - 1, ty),
-          );
+        if (state === UndergroundTileState.Marked) {
           gfx.fillStyle(COLOR_MARKED_TILE_OVERLAY, 0.55);
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
         } else if (state === UndergroundTileState.BeingDug) {
-          drawOpenFloorTile(gfx, screenX, screenY, tx, ty);
-          drawTunnelCornerOverlay(
-            gfx, screenX, screenY,
-            isWallNeighbor(tx,     ty - 1),
-            isWallNeighbor(tx + 1, ty),
-            isWallNeighbor(tx,     ty + 1),
-            isWallNeighbor(tx - 1, ty),
-          );
           gfx.fillStyle(COLOR_BEING_DUG_OVERLAY, 0.65);
           gfx.fillRect(screenX, screenY, TILE_SIZE_PX, TILE_SIZE_PX);
         }
