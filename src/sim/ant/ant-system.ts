@@ -32,7 +32,20 @@
 // No per-iteration allocations beyond sampleGradient's return object (accepted in Phase 6).
 // world.nextEntityId is the upper bound for entity iteration; alive=0 slots are skipped.
 
-import { SIM_VERSION_V4_DIAGONAL_MOTION, type WorldState } from '../types.js';
+import {
+  SIM_VERSION_V4_DIAGONAL_MOTION,
+  SIM_VERSION_V6_FORAGER_NO_REVISIT,
+  SIM_VERSION_V7_SURFACE_PASSABILITY,
+  SIM_VERSION_V8_LEASH_HYSTERESIS,
+  type WorldState,
+} from '../types.js';
+import {
+  SurfaceMovementEffect,
+  surfaceMovementAt,
+  surfaceMovementAtCached,
+  createSurfaceMovementCache,
+  type SurfaceMovementCache,
+} from '../surface-features.js';
 import type { AntComponents } from './ant-store.js';
 import { isRecentTile, pushRecentTile, clearRecentTiles } from './ant-store.js';
 import type { ColonyRecord, ChamberRecord } from '../colony/colony-store.js';
@@ -48,6 +61,7 @@ import {
   UNDERGROUND_GRID_HEIGHT,
   SEARCH_LEASH_RADII,
   SEARCH_LEASH_MAX_WAVE,
+  LEASH_HYSTERESIS_TILES,
   EXCURSION_HEADING_MIN_TICKS,
   EXCURSION_HEADING_JITTER_TICKS,
   EXCURSION_TURN_PERCENT,
@@ -1944,6 +1958,20 @@ function colonyHasPriorityPile(world: WorldState, colonyId: number): boolean {
  * the boundary pass from overriding meaningful food signals an ant picks up
  * en route home (09 excursion-foraging follow-up, issue 1).
  *
+ * v8+ leash-boundary hysteresis (#44 UAT round 3): the breakout
+ * additionally requires `dist <= SEARCH_LEASH_RADII[wave] -
+ * LEASH_HYSTERESIS_TILES` from the nearest entrance. Without this
+ * asymmetry the signal-only breakout trips the boundary every tick for
+ * ants parked just past the radius next to a steady pheromone trail,
+ * wiping the recent-tiles buffer on each flip and keeping the ant
+ * cycling in a tiny region forever. Pre-v8 saves keep the original
+ * signal-only breakout for byte-identical replay.
+ *
+ * Player-marked priority targets (`colony.priorityFoodPileId`) bypass
+ * the v8 deadband — explicit user intent always wins over an automatic
+ * leash heuristic. The deadband only suppresses *ambient* signals
+ * (scent and pheromone), which are what drove the original flip-flop.
+ *
  * The wave counter is NOT incremented here — that happens on the return
  * side when the ant actually reaches the entrance (see tickAntMovement
  * Surface zone-transition block). An ant that picks up food en route via
@@ -1994,21 +2022,56 @@ export function tickExcursionBoundary(world: WorldState): void {
     if (sub === ForagingSubState.ReturningToNest) {
       // Breakout: a returning ant that now senses food or a trail should go
       // search/follow rather than complete the return leg.
-      if (hasSignal) {
-        ants.subTask[id] = ForagingSubState.SearchingFood;
-        ants.searchHeadingX[id] = 0;
-        ants.searchHeadingY[id] = 0;
-        ants.searchHeadingTicks[id] = 0;
-        ants.searchPrevTileX[id] = -1;
-        ants.searchPrevTileY[id] = -1;
-        // Issue #35 — fresh SearchingFood pass starts with a clean
-        // pause cadence.
-        ants.searchPauseTicks[id] = 0;
-        // Issue #42 fix #3 — flipping ReturningToNest→SearchingFood mid-
-        // route starts a new excursion. The buffer should reset so the
-        // search isn't biased by stale tiles from before the return leg.
-        clearRecentTiles(ants, id);
+      if (!hasSignal) continue;
+
+      // v8+ leash-boundary hysteresis (#44 UAT round 3). The signal-only
+      // breakout was symmetric with the outbound flip's `dist > radius`
+      // gate, which produced a per-tick flip-flop for any ant parked
+      // just past its leash radius next to a steady pheromone trail:
+      // each flip cleared the recent-tiles ring buffer below, so the
+      // issue-#42 no-revisit memory never accumulated and the ant
+      // cycled in a 4-tile region indefinitely. Requiring the ant to
+      // first walk back inside `radius - LEASH_HYSTERESIS_TILES`
+      // forces several ticks of homeward progress between flips, which
+      // both breaks the eddy and lets recent-tiles fill enough to be
+      // useful when the ant later resumes searching.
+      //
+      // Player-marked priority piles bypass the deadband (`!hasPriority`
+      // gate). priorityFoodPileId is explicit user intent — the
+      // deadband only suppresses ambient signals (scent + pheromone)
+      // that drove the original flip-flop, never an explicit "go here"
+      // command from the player.
+      if (world.simVersion >= SIM_VERSION_V8_LEASH_HYSTERESIS && !hasPriority) {
+        // colony.entrances.length >= 1 is guaranteed by the early-
+        // continue at the top of this for-loop, so bestDist is
+        // unconditionally overwritten by a non-negative Manhattan
+        // distance below.
+        let bestDist = Number.MAX_SAFE_INTEGER;
+        for (let e = 0; e < colony.entrances.length; e++) {
+          const ent = colony.entrances[e]!;
+          const d = Math.abs(tileX - ent.surfaceTileX) + Math.abs(tileY - ent.surfaceTileY);
+          if (d < bestDist) bestDist = d;
+        }
+        let wave = ants.searchWave[id]!;
+        if (wave < 0) wave = 0;
+        if (wave > SEARCH_LEASH_MAX_WAVE) wave = SEARCH_LEASH_MAX_WAVE;
+        const radius = SEARCH_LEASH_RADII[wave]!;
+        if (bestDist > radius - LEASH_HYSTERESIS_TILES) continue;
       }
+
+      ants.subTask[id] = ForagingSubState.SearchingFood;
+      ants.searchHeadingX[id] = 0;
+      ants.searchHeadingY[id] = 0;
+      ants.searchHeadingTicks[id] = 0;
+      ants.searchPrevTileX[id] = -1;
+      ants.searchPrevTileY[id] = -1;
+      // Issue #35 — fresh SearchingFood pass starts with a clean
+      // pause cadence.
+      ants.searchPauseTicks[id] = 0;
+      // Issue #42 fix #3 — flipping ReturningToNest→SearchingFood mid-
+      // route starts a new excursion. The buffer should reset so the
+      // search isn't biased by stale tiles from before the return leg.
+      clearRecentTiles(ants, id);
       continue;
     }
 
@@ -2211,6 +2274,196 @@ export function canEnterUndergroundTile(
 }
 
 // ---------------------------------------------------------------------------
+// canEnterSurfaceTile — surface movement passability predicate (issue #44 #4)
+//
+// Surface tiles default to walkable. The selector
+// (`src/sim/surface-features.ts → surfaceMovementAt`) returns the movement
+// effect of any large multi-tile feature covering the tile:
+//   Cosmetic / no feature → walkable (most surface tiles)
+//   SoftCost              → walkable, cost applied separately in step 5
+//   HardBlock             → blocked (boulder, twig-as-log, dead leaf, big leaf)
+//
+// Out-of-bounds tiles are blocked (defensive; the per-tick bounds clamp also
+// handles this).
+//
+// Pure: never mutates `world`. Called from the surface branch of
+// tickAntMovement, moveQueens, and resolveSameColonyOccupancy.
+// ---------------------------------------------------------------------------
+
+export function canEnterSurfaceTile(
+  world: WorldState,
+  tileX: number,
+  tileY: number,
+): boolean {
+  if (tileX < 0 || tileY < 0 || tileX >= SURFACE_GRID_WIDTH || tileY >= SURFACE_GRID_HEIGHT) {
+    return false;
+  }
+  return surfaceMovementAt(world, tileX, tileY) !== SurfaceMovementEffect.HardBlock;
+}
+
+// ---------------------------------------------------------------------------
+// pickSurfaceDetour — deterministic local detour around a hard-block (#44 #4)
+//
+// Called when the preferred surface step from (prevTileX, prevTileY) toward
+// (intendedDx, intendedDy) was blocked by a HardBlock feature. Walks 8
+// adjacent tiles in a fixed probe order and returns the first walkable
+// candidate that minimises Manhattan distance to the intended-destination
+// tile (prevTileX + intendedDx, prevTileY + intendedDy). Returns (0, 0) if
+// no walkable adjacent tile exists — the ant holds for one tick and the
+// next tick's pheromone gradient / flow-field re-pick may produce a
+// different intended direction.
+//
+// Probe order (fixed, deterministic):
+//   1. Cardinal slip on the X axis  (intendedDx, 0)
+//   2. Cardinal slip on the Y axis  (0, intendedDy)
+//   3. Perpendicular sidestep CCW  (-intendedDy, intendedDx)
+//   4. Perpendicular sidestep CW   (intendedDy, -intendedDx)
+//   5. Reverse along X             (-intendedDx, 0)
+//   6. Reverse along Y             (0, -intendedDy)
+//   7. Diagonal away (X reverse)   (-intendedDx, intendedDy)
+//   8. Diagonal away (Y reverse)   (intendedDx, -intendedDy)
+//
+// Tie-break (equal scores): earlier probe wins. The probe order is
+// stable, so two ants in the same situation always pick the same detour.
+//
+// Cost: at most 8 canEnterSurfaceTile calls per blocked move. Each
+// canEnterSurfaceTile call walks the surface-feature selector
+// (~MAX_FOOTPRINT^2 anchor candidates = 16 in step 4). A blocked
+// step is rare (HardBlock features cover ~5–10% of tiles after
+// suppression), so the amortised cost is negligible.
+// ---------------------------------------------------------------------------
+
+// 8 compass directions in N-clockwise order: N, NE, E, SE, S, SW, W, NW.
+// Direction-agnostic — same set probed regardless of caller's intended
+// direction. Order doubles as the deterministic tie-break: at equal
+// Manhattan distance to target, earlier compass direction wins.
+const PROBE_COMPASS_DX = [ 0,  1,  1,  1,  0, -1, -1, -1] as const;
+const PROBE_COMPASS_DY = [-1, -1,  0,  1,  1,  1,  0, -1] as const;
+
+// Module-scratch result object for `pickSurfaceDetour` — reused across
+// every call to avoid per-call literal allocation (AGENTS.md "Hot-loop
+// performance" — invoked once per blocked-step per surface ant per tick).
+// Caller MUST consume the values immediately; the helper does NOT clone.
+const PICK_DETOUR_RESULT = { dx: 0, dy: 0 };
+
+export function pickSurfaceDetour(
+  world: WorldState,
+  prevTileX: number,
+  prevTileY: number,
+  intendedDx: number,
+  intendedDy: number,
+  /**
+   * Optional ant id. When provided (>= 0), the detour SKIPS any candidate
+   * tile that's in this ant's recent-tiles ring buffer (`isRecentTile`).
+   * Fixes the two-tile oscillation pattern observed in the 2026-05-02T15:10
+   * stuck-ant UAT report: ant tries N (blocked by 4×4 boulder); per-axis
+   * revert in the surface guard takes the W-only step → ant moves to the
+   * tile west; next tick tries N again (still blocked), detour picks E
+   * back to the original tile because E and W tied on Manhattan to the
+   * blocked tile and compass tie-break favored E. With recent-tiles
+   * consult, the candidate that would step back to the just-vacated tile
+   * is filtered, breaking the cycle.
+   *
+   * Pass `-1` (or omit) to disable the recent-tiles filter — useful for
+   * unit tests that don't have an ant-id context.
+   */
+  antId: number = -1,
+): { dx: number; dy: number } {
+  // Intended destination tile (where the ant wanted to be).
+  const targetX = prevTileX + intendedDx;
+  const targetY = prevTileY + intendedDy;
+
+  let bestDx = 0;
+  let bestDy = 0;
+  let bestScore = -1;
+  // Recent-tile fallback (Codex P2 on PR #49 round 3): if every walkable
+  // neighbor is in the recent-tiles buffer, returning (0, 0) holds the
+  // ant in place. The recent buffer only advances on tile crossings, so
+  // the buffer never ages out and the ant is permanently deadlocked in
+  // one-way pockets around HardBlock features. Track the best RECENT
+  // candidate separately and fall back to it when no fresh option
+  // exists — backtracking is preferable to permanent stall.
+  let bestRecentDx = 0;
+  let bestRecentDy = 0;
+  let bestRecentScore = -1;
+
+  // Walk all 8 compass directions. Originally this used 8 probes derived
+  // from `intendedDx/intendedDy` (cardinal X slip, perpendicular sidestep,
+  // diagonal-away, etc.) which seemed natural — but Codex flagged P2 on
+  // PR #49: when intendedDx OR intendedDy is zero (cardinal blocked
+  // step), the "diagonal-away" probes collapsed into duplicate cardinal
+  // moves and the picker never considered ANY actual diagonal escape.
+  // Concrete: intent (1, 0) east-blocked → probes generated (1, 0),
+  // (0, 0), (0, 1), (0, -1), (-1, 0), (0, 0), (-1, 0), (1, 0) —
+  // 4 collapsed and the only "off-axis" candidates were the cardinal
+  // sidesteps; no NE/NW/SE/SW probe at all. Result: the ant could pick
+  // a reverse-cardinal step even when a legal diagonal escape was
+  // closer to its target → avoidable jitter/stalling around corners.
+  //
+  // Fix: probe all 8 compass directions unconditionally and score each
+  // by Manhattan distance to the intended-destination tile. The probe
+  // order N→NE→E→SE→S→SW→W→NW doubles as the deterministic tie-break.
+  for (let p = 0; p < 8; p++) {
+    const pdx = PROBE_COMPASS_DX[p]!;
+    const pdy = PROBE_COMPASS_DY[p]!;
+    const cx = prevTileX + pdx;
+    const cy = prevTileY + pdy;
+    if (!canEnterSurfaceTile(world, cx, cy)) continue;
+    // Diagonal corner-cut prevention. For diagonal candidates, require
+    // at least one of the two intermediate cardinal tiles to be walkable.
+    // Otherwise the ant would squeeze through a HardBlock corner between
+    // two boulders/leaves — same failure mode the underground guard
+    // explicitly prevents (see the diagonal block in tickAntMovement and
+    // moveQueens).
+    if (pdx !== 0 && pdy !== 0) {
+      const passXOnly = canEnterSurfaceTile(world, prevTileX + pdx, prevTileY);
+      const passYOnly = canEnterSurfaceTile(world, prevTileX, prevTileY + pdy);
+      if (!passXOnly && !passYOnly) continue;
+    }
+    const score = Math.abs(cx - targetX) + Math.abs(cy - targetY);
+    // Recent-tiles preference (not a hard filter): a Foraging ant whose
+    // direct path is blocked otherwise oscillates between the blocked
+    // tile and a sideways alternate every other tick. We prefer fresh
+    // tiles, but tracking the best recent candidate ensures we always
+    // have a fallback step if no fresh option exists. See the docstring
+    // for the antId param above and the recent-tiles ring buffer in
+    // `pushRecentTile`.
+    const isRecent = antId >= 0 && isRecentTile(world.ants, antId, cx, cy);
+    if (isRecent) {
+      if (bestRecentScore < 0 || score < bestRecentScore) {
+        bestRecentDx = pdx;
+        bestRecentDy = pdy;
+        bestRecentScore = score;
+      }
+      continue;
+    }
+    if (bestScore < 0 || score < bestScore) {
+      bestDx = pdx;
+      bestDy = pdy;
+      bestScore = score;
+    }
+  }
+  // Recent-tile fallback (v8+): only used when no fresh candidate was
+  // found. Backtracking through the recent buffer breaks deadlock
+  // pockets at the cost of one revisited tile — that revisit pushes a
+  // NEW entry into the ring buffer (via the caller's pushRecentTile),
+  // eventually rotating the original blocker out and re-enabling
+  // forward progress. Pre-v8 keeps the original "(0, 0) hold on
+  // exhaustion" behaviour for byte-identical replay (SCEN-06).
+  if (
+    bestScore < 0 &&
+    bestRecentScore >= 0 &&
+    world.simVersion >= SIM_VERSION_V8_LEASH_HYSTERESIS
+  ) {
+    bestDx = bestRecentDx;
+    bestDy = bestRecentDy;
+  }
+  PICK_DETOUR_RESULT.dx = bestDx;
+  PICK_DETOUR_RESULT.dy = bestDy;
+  return PICK_DETOUR_RESULT;
+}
+
+// ---------------------------------------------------------------------------
 // pickNearestHostileUnderground — Phase 09.1 Chunk 3 invasion routing helper
 //
 // Returns the fixed-point target position of the nearest hostile ant that is
@@ -2358,6 +2611,7 @@ function moveQueens(
   queenIds: Set<number> | null,
   entranceFlowFields?: EntranceFlowFields,
   chamberFlowFields?: ChamberFlowFields,
+  surfaceMoveCache?: SurfaceMovementCache,
 ): void {
   void entranceFlowFields; // entrance steering for queens uses Manhattan — no flow-field needed on surface.
   if (queenIds === null || queenIds.size === 0) return;
@@ -2581,7 +2835,26 @@ function moveQueens(
 
     if (dx === 0 && dy === 0) continue;
 
-    const speed = ants.speed[qId]!;
+    const baseSpeed = ants.speed[qId]!;
+    // Surface SoftCost slowdown (issue #44 step 5 — gated on v6). When the
+    // queen's current tile is a SoftCost feature (bush / grass clump),
+    // halve effective speed for this tick. Integer-only; min 1 so a base
+    // speed of 1 doesn't get clamped to zero. Pre-v6 queens move at base
+    // speed regardless. Uses the per-tick cache when available; falls back
+    // to direct compute when called from a test harness without a cache.
+    let speed = baseSpeed;
+    if (
+      world.simVersion >= SIM_VERSION_V7_SURFACE_PASSABILITY &&
+      zone === Zone.Surface
+    ) {
+      const movement = surfaceMoveCache !== undefined
+        ? surfaceMovementAtCached(world, tileX, tileY, surfaceMoveCache)
+        : surfaceMovementAt(world, tileX, tileY);
+      if (movement === SurfaceMovementEffect.SoftCost) {
+        const halved = baseSpeed >> 1;
+        speed = halved < 1 ? 1 : halved;
+      }
+    }
     let posX = prevPosX + dx * speed;
     let posY = prevPosY + dy * speed;
 
@@ -2622,6 +2895,57 @@ function moveQueens(
           if (!canEnterUndergroundTile(underground, tileX, newTileY, AntTask.Idle)) {
             posY = prevPosY;
           }
+        }
+      }
+    }
+
+    // Surface passability guard + detour (issue #44 step 4 — gated on v6).
+    // Mirrors the underground guard above. Pre-v6 queens replay with no
+    // surface passability to keep SCEN-06 byte-identity.
+    if (
+      world.simVersion >= SIM_VERSION_V7_SURFACE_PASSABILITY &&
+      zone === Zone.Surface &&
+      (dx !== 0 || dy !== 0)
+    ) {
+      const newTileX = posX >> FP_SHIFT;
+      const newTileY = posY >> FP_SHIFT;
+      const xCrossed = newTileX !== tileX;
+      const yCrossed = newTileY !== tileY;
+      let blocked = false;
+      if (xCrossed && yCrossed) {
+        const destPassable = canEnterSurfaceTile(world, newTileX, newTileY);
+        const passXOnly    = canEnterSurfaceTile(world, newTileX, tileY);
+        const passYOnly    = canEnterSurfaceTile(world, tileX, newTileY);
+        if (destPassable && (passXOnly || passYOnly)) {
+          // Diagonal allowed.
+        } else if (passXOnly) {
+          posY = prevPosY;
+        } else if (passYOnly) {
+          posX = prevPosX;
+        } else {
+          blocked = true;
+        }
+      } else if (xCrossed && !canEnterSurfaceTile(world, newTileX, tileY)) {
+        blocked = true;
+      } else if (yCrossed && !canEnterSurfaceTile(world, tileX, newTileY)) {
+        blocked = true;
+      }
+      if (blocked) {
+        // Queens don't carry a recent-tiles ring buffer (the buffer is
+        // only populated for surface Foraging ants), so passing qId is
+        // harmless — `isRecentTile` returns false for the unpopulated
+        // sentinel-filled buffer. See pickSurfaceDetour docstring.
+        const detour = pickSurfaceDetour(world, tileX, tileY, dx, dy, qId);
+        if (detour.dx !== 0 || detour.dy !== 0) {
+          // Snap to the detour tile (mirrors the tickAntMovement guard);
+          // queens at half speed would otherwise nudge sub-tile and the
+          // next tick's steering would nudge them back.
+          posX = ((tileX + detour.dx) << FP_SHIFT) + (FP_ONE >> 1);
+          posY = ((tileY + detour.dy) << FP_SHIFT) + (FP_ONE >> 1);
+        } else {
+          // No walkable detour candidate — hold in place.
+          posX = prevPosX;
+          posY = prevPosY;
         }
       }
     }
@@ -2717,12 +3041,20 @@ export function tickAntMovement(
   const undergroundMaxX = (UNDERGROUND_GRID_WIDTH << FP_SHIFT) - 1;
   const undergroundMaxY = (UNDERGROUND_GRID_HEIGHT << FP_SHIFT) - 1;
 
+  // Issue #44 step 5 — per-tick surface movement cache. The SoftCost check
+  // fires for every surface ant on every tick; without memoisation each
+  // call re-walks the surface-feature selector (anchor scan + suppression).
+  // The cache flattens it to O(1) per repeated tile lookup. ~16 KB Uint8Array
+  // allocated once per tickAntMovement, discarded at end. Pre-v6 worlds
+  // never consult it (gate below skips the SoftCost block entirely).
+  const surfaceMoveCache = createSurfaceMovementCache();
+
   // P1 queen-relocation: queens have their own movement path (route to Queen
   // chamber). They must be skipped in the main loop below so the default
   // Idle-task branch (which triggers needsSurface zone-transition) does not
   // yank a relocated queen back to the surface. Collect the ID set up front.
   const queenIds = collectAliveQueenIds(world);
-  moveQueens(world, queenIds, entranceFlowFields, chamberFlowFields);
+  moveQueens(world, queenIds, entranceFlowFields, chamberFlowFields, surfaceMoveCache);
 
   // Same-colony occupancy enforcement is applied as a POST-PASS after the
   // movement loop — see resolveSameColonyOccupancy below. The in-loop
@@ -3258,7 +3590,7 @@ export function tickAntMovement(
     // (dx=dy=0); the buffer-push gate (only on actual tile crossings) keeps
     // pause ticks from polluting history.
     if (
-      world.simVersion >= 6 &&
+      world.simVersion >= SIM_VERSION_V6_FORAGER_NO_REVISIT &&
       zone === Zone.Surface &&
       task === AntTask.Foraging &&
       ants.subTask[id] === ForagingSubState.SearchingFood &&
@@ -3298,9 +3630,28 @@ export function tickAntMovement(
       }
     }
 
-    const speed = ants.speed[id]!;
+    const baseSpeed = ants.speed[id]!;
     const prevPosX = ants.posX[id]!;
     const prevPosY = ants.posY[id]!;
+
+    // Surface SoftCost slowdown (issue #44 step 5 — gated on v6). When the
+    // ant's current tile is a SoftCost feature (bush / grass clump), halve
+    // effective speed for this tick. Integer-only; min 1 so a base speed
+    // of 1 doesn't get clamped to zero. Pre-v6 ants move at base speed.
+    // Underground ants skip the check entirely (zone gate). Per-tick cache
+    // memoises the lookup so repeated same-tile queries are O(1).
+    let speed = baseSpeed;
+    if (
+      world.simVersion >= SIM_VERSION_V7_SURFACE_PASSABILITY &&
+      zone === Zone.Surface
+    ) {
+      const tileX = prevPosX >> FP_SHIFT;
+      const tileY = prevPosY >> FP_SHIFT;
+      if (surfaceMovementAtCached(world, tileX, tileY, surfaceMoveCache) === SurfaceMovementEffect.SoftCost) {
+        const halved = baseSpeed >> 1;
+        speed = halved < 1 ? 1 : halved;
+      }
+    }
     let posX = prevPosX + dx * speed;
     let posY = prevPosY + dy * speed;
 
@@ -3362,6 +3713,77 @@ export function tickAntMovement(
       }
     }
 
+    // Surface passability guard + detour (issue #44 step 4 — gated on v6).
+    // Mirrors the underground guard above. HardBlock features (boulders,
+    // twigs, leaves, big leaves) reject the step; pickSurfaceDetour finds
+    // the best walkable adjacent tile. Pre-v6 saves replay with no surface
+    // passability — same coordinate-only motion they recorded.
+    if (
+      world.simVersion >= SIM_VERSION_V7_SURFACE_PASSABILITY &&
+      zone === Zone.Surface &&
+      (dx !== 0 || dy !== 0)
+    ) {
+      const prevTileX = prevPosX >> FP_SHIFT;
+      const prevTileY = prevPosY >> FP_SHIFT;
+      const newTileX = posX >> FP_SHIFT;
+      const newTileY = posY >> FP_SHIFT;
+      const xCrossed = newTileX !== prevTileX;
+      const yCrossed = newTileY !== prevTileY;
+      let blocked = false;
+      if (xCrossed && yCrossed) {
+        // Diagonal step. Three checks: destination tile passable, both
+        // intermediate cardinals passable. Recent-tiles consult on the
+        // intermediates (per-axis revert) prevents the ant from being
+        // pushed sideways onto a tile it just came from — without that
+        // check the ant ping-pongs west↔east through the same two tiles
+        // when wedged against an obstacle (UAT round 2 stuck-ant repro,
+        // ant 17 in seed 1790811502).
+        const destPassable = canEnterSurfaceTile(world, newTileX, newTileY);
+        const passXOnly    = canEnterSurfaceTile(world, newTileX, prevTileY) &&
+                             !isRecentTile(ants, id, newTileX, prevTileY);
+        const passYOnly    = canEnterSurfaceTile(world, prevTileX, newTileY) &&
+                             !isRecentTile(ants, id, prevTileX, newTileY);
+        if (destPassable && (passXOnly || passYOnly)) {
+          // Diagonal allowed.
+        } else if (passXOnly) {
+          posY = prevPosY;
+        } else if (passYOnly) {
+          posX = prevPosX;
+        } else {
+          blocked = true;
+        }
+      } else if (xCrossed && !canEnterSurfaceTile(world, newTileX, prevTileY)) {
+        blocked = true;
+      } else if (yCrossed && !canEnterSurfaceTile(world, prevTileX, newTileY)) {
+        blocked = true;
+      }
+      if (blocked) {
+        const detour = pickSurfaceDetour(world, prevTileX, prevTileY, dx, dy, id);
+        if (detour.dx !== 0 || detour.dy !== 0) {
+          // Snap-to-tile-boundary instead of `prev + detour * speed`.
+          // Ants at half-speed (e.g. base WORKER_BASE_SPEED = 128 = ½ tile/
+          // tick) would otherwise NOT cross the tile boundary on a single
+          // detour step — they'd nudge sub-tile and the next tick's
+          // steering would nudge them back, producing two-tick sub-tile
+          // oscillation inside the same tile. The snap commits the
+          // detour decision visibly (one-tile jump in the chosen
+          // direction) and pushes the just-vacated tile onto the
+          // recent-tiles ring buffer so subsequent detours skip it.
+          // Visual: a wedged ant takes a slightly larger step on the
+          // tick it detours; only fires when blocked, so rare in
+          // normal play.
+          posX = ((prevTileX + detour.dx) << FP_SHIFT) + (FP_ONE >> 1);
+          posY = ((prevTileY + detour.dy) << FP_SHIFT) + (FP_ONE >> 1);
+        } else {
+          // No walkable detour candidate — hold in place. Next tick the
+          // steering recomputes; if the situation persists, the ant
+          // continues to hold (preferable to oscillation).
+          posX = prevPosX;
+          posY = prevPosY;
+        }
+      }
+    }
+
     // Clamp to zone-appropriate bounds
     if (zone === Zone.Underground) {
       if (posX < 0) posX = 0;
@@ -3387,23 +3809,37 @@ export function tickAntMovement(
     // navigate by scent/target/entrance, not by scalar gradient.
     if (
       zone === Zone.Surface &&
-      task === AntTask.Foraging &&
-      ants.subTask[id] === ForagingSubState.SearchingFood
+      task === AntTask.Foraging
     ) {
+      // Issue #44 UAT round 2 fix: extended from SearchingFood-only to
+      // ALL surface Foraging ants (CarryingFood, ReturningToNest too).
+      // The recent-tiles ring buffer is now consulted by
+      // `pickSurfaceDetour` to skip "step back to where I just came
+      // from" candidates, which fixes the v7-detour two-tile oscillation
+      // observed in the 2026-05-02T15:10 stuck-ant snapshot (ant 17 at
+      // (24/25, 75) bouncing east-west south of a 4×4 boulder). The
+      // SearchingFood-only no-revisit filter (gated below in pickStep
+      // assembly) is unchanged — broadening it would risk pinning
+      // CarryingFood/ReturningToNest ants when their entrance route is
+      // fully encircled by a recent-tiles ring; the detour-only consult
+      // is safer.
+      const isSearching = ants.subTask[id] === ForagingSubState.SearchingFood;
       const preTileX = prevPosX >> FP_SHIFT;
       const preTileY = prevPosY >> FP_SHIFT;
       const newTileX = posX >> FP_SHIFT;
       const newTileY = posY >> FP_SHIFT;
       if (newTileX !== preTileX || newTileY !== preTileY) {
-        ants.searchPrevTileX[id] = preTileX;
-        ants.searchPrevTileY[id] = preTileY;
-        // Issue #42 fix #3 — also push the JUST-VACATED tile onto the
-        // recent-tiles ring buffer. The buffer is consulted next tick by
-        // the no-revisit filter, so pushing the vacated tile makes "step
-        // back to where I just was" the first thing filtered. Pause ticks
-        // (no tile crossing) intentionally do NOT push, so the buffer
-        // tracks distinct moves rather than ticks. v6+ only.
-        if (world.simVersion >= 6) {
+        if (isSearching) {
+          // searchPrevTileX/Y is the SearchingFood anti-backtrack memo;
+          // leave its semantics unchanged.
+          ants.searchPrevTileX[id] = preTileX;
+          ants.searchPrevTileY[id] = preTileY;
+        }
+        // Push the just-vacated tile onto the recent-tiles ring buffer
+        // for ANY surface Foraging ant (v6+). Pause ticks (no tile
+        // crossing) intentionally do NOT push, so the buffer tracks
+        // distinct moves rather than ticks.
+        if (world.simVersion >= SIM_VERSION_V6_FORAGER_NO_REVISIT) {
           pushRecentTile(ants, id, preTileX, preTileY);
         }
       }
@@ -3626,6 +4062,14 @@ function resolveSameColonyOccupancy(world: WorldState): void {
       } else {
         if (nx < 0 || nx >= SURFACE_GRID_WIDTH) continue;
         if (ny < 0 || ny >= SURFACE_GRID_HEIGHT) continue;
+        // Issue #44 step 4 — gated. Don't bump a same-colony collision
+        // into a HardBlock tile. Pre-v6 saves replay with no surface
+        // passability check (matches the pre-#44 behavior where the
+        // resolver only bounds-checked the surface candidate).
+        if (
+          world.simVersion >= SIM_VERSION_V7_SURFACE_PASSABILITY &&
+          !canEnterSurfaceTile(world, nx, ny)
+        ) continue;
       }
       // Exempt adjacent tiles are always "free" — we shift into them and do
       // not claim them (keeping them open for further stacking).

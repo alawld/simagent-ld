@@ -238,6 +238,33 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       expect(w2.ants.currentGridColonyId[enemyQueen]).toBe(ENEMY_COLONY_ID);
       expect(w2.ants.currentGridColonyId[playerInvader]).toBe(ENEMY_COLONY_ID);
     });
+    it('round-trips simVersion (LATEST: v8 leash hysteresis)', async () => {
+      const { LATEST_SIM_VERSION, SIM_VERSION_V7_SURFACE_PASSABILITY } = await import('../sim/types.js');
+      // New worlds default to LATEST_SIM_VERSION. Save/load must preserve
+      // it so any LATEST replay continues to apply the gated behaviour
+      // (currently surface passability, soft cost, and leash hysteresis)
+      // on resume.
+      const w = createScenario(42);
+      expect(w.simVersion).toBe(LATEST_SIM_VERSION);
+      // Sanity-check that LATEST is at least v7 — anything lower would
+      // silently regress the #44 surface-passability behaviour.
+      expect(w.simVersion).toBeGreaterThanOrEqual(SIM_VERSION_V7_SURFACE_PASSABILITY);
+      const s = serializeWorldState(w);
+      const w2 = deserializeWorldState(JSON.parse(JSON.stringify(s)));
+      expect(w2.simVersion).toBe(LATEST_SIM_VERSION);
+    });
+
+    it('preserves a captured v7 save (sticky load → v7 replay path stays available)', async () => {
+      const { SIM_VERSION_V7_SURFACE_PASSABILITY } = await import('../sim/types.js');
+      // Saves recorded under v7 must round-trip as v7 (not auto-upgrade to
+      // LATEST), so v7 replays remain byte-identical on resume even after
+      // newer sim versions land.
+      const w = createScenario(42);
+      w.simVersion = SIM_VERSION_V7_SURFACE_PASSABILITY;
+      const s = serializeWorldState(w);
+      const w2 = deserializeWorldState(JSON.parse(JSON.stringify(s)));
+      expect(w2.simVersion).toBe(SIM_VERSION_V7_SURFACE_PASSABILITY);
+    });
     it('round-trips world.simVersion and ants.waitingDeposit (issue #27)', () => {
       const w = createScenario(42);
       // Simulate a few ants in wait state at distinct ant ids.
@@ -270,6 +297,44 @@ describe('save.ts (SCEN-04 + SCEN-06)', () => {
       // Spot-check: a worker entity is not in wait state by default.
       const someWorker = w.colonies[PLAYER_COLONY_ID]!.workers[0]!;
       expect(w3.ants.waitingDeposit[someWorker]).toBe(0);
+    });
+    it('round-trips world.terrainSeed (issue #44)', () => {
+      const w = createScenario(42);
+      // createWorldState set this from the seed; pin a specific value to
+      // verify the field actually survives save/load (not just "happens to
+      // recompute identically from the seed envelope field").
+      w.terrainSeed = 0xdeadbeef;
+      const s = serializeWorldState(w);
+      const w2 = deserializeWorldState(JSON.parse(JSON.stringify(s)));
+      expect(w2.terrainSeed).toBe(0xdeadbeef);
+    });
+    it('pre-issue-#44 saves (terrainSeed absent) deserialize with terrainSeed=0', async () => {
+      // Pre-#44 saves have no terrainSeed field. Loading them must default
+      // to 0 (which reproduces the legacy coordinate-only layout — no
+      // crashes, just a different decoration set than the recorded run).
+      const w = createScenario(42);
+      const s = serializeWorldState(w);
+      delete (s as { terrainSeed?: number }).terrainSeed;
+      const w2 = deserializeWorldState(s);
+      expect(w2.terrainSeed).toBe(0);
+    });
+    it('rejects non-integer terrainSeed (string, NaN, null, object) → falls back to 0 (issue #44 P2)', () => {
+      const w = createScenario(42);
+      const baseSnapshot = serializeWorldState(w);
+      // Same boundary type-validation as simVersion: a hand-edited or
+      // corrupted save with a non-integer terrainSeed must NOT propagate
+      // into surface-features.tileHash (where it would XOR into the salt
+      // and either NaN-poison or coerce to a surprising integer). Default
+      // to 0 — same as a missing field.
+      const cases: unknown[] = ['42', '', 'rng', null, NaN, {}, [], 1.5, true];
+      for (const bad of cases) {
+        const s = JSON.parse(JSON.stringify(baseSnapshot)) as Record<string, unknown>;
+        s.terrainSeed = bad;
+        const w2 = deserializeWorldState(
+          s as unknown as Parameters<typeof deserializeWorldState>[0],
+        );
+        expect(w2.terrainSeed).toBe(0);
+      }
     });
     it('rejects non-integer simVersion (string, NaN, null, object) → falls back to LEGACY (issue #27 P2)', async () => {
       const { LEGACY_SIM_VERSION } = await import('../sim/types.js');
