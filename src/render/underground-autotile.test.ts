@@ -149,6 +149,23 @@ function countPixels(buf: PixelBuffer, kind: NeighborKind): number {
   return n;
 }
 
+function fillRectCalls(gfx: MockGfx): Array<[number, number, number, number, number, number]> {
+  return gfx.calls
+    .filter(c => c.method === 'fillRect')
+    .map(c => c.args as [number, number, number, number, number, number]);
+}
+
+function rectOverlaps(
+  rect: [number, number, number, number, number, number],
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): boolean {
+  const [rx, ry, rw, rh] = rect;
+  return rx < x + w && rx + rw > x && ry < y + h && ry + rh > y;
+}
+
 // ---------------------------------------------------------------------------
 // Tests — canonical quarter shapes
 // ---------------------------------------------------------------------------
@@ -193,29 +210,15 @@ describe('drawAutotiledUndergroundTile — full quadrants', () => {
     expect(countPixels(buf, 'wall')).toBe(0);
   });
 
-  it('inner-corner only (all cardinals = open, NW diagonal = wall) produces a small wall bite at NW', () => {
-    // sameH=1, sameV=1 in every quadrant. Only NW has sameD=0; the others
-    // have sameD=1 → full → no paint.
+  it('diagonal-only mismatch (all cardinals = open, NW diagonal = wall) leaves substrate intact', () => {
+    // Issue #48: diagonal-only opposite-kind bites read as stray wrong-side
+    // triangles. Only cardinal boundaries are allowed to change silhouette.
     const buf = renderTile(makeNeighbors('open', {
       nw: 'wall',  n: 'open', ne: 'open',
       w:  'open',              e:  'open',
       sw: 'open',  s: 'open', se: 'open',
     }));
-    // Inner-corner bite is a 4-row triangle at the NW corner: row 0 fills
-    // x=0..3 (4 px), row 1 fills x=0..2 (3 px), row 2: 2 px, row 3: 1 px.
-    // Total 4+3+2+1 = 10 pixels.
-    expect(countPixels(buf, 'wall')).toBe(10);
-    // The wall pixels must be in the NW quadrant (0..7, 0..7), not anywhere else.
-    for (let y = 0; y < TILE_SIZE_PX; y++) {
-      for (let x = 0; x < TILE_SIZE_PX; x++) {
-        if (buf.get(x, y) === 'wall') {
-          expect(x).toBeLessThan(8);
-          expect(y).toBeLessThan(8);
-        }
-      }
-    }
-    // Specifically: pixel (0,0) must be wall (the diagonal poke anchor).
-    expect(buf.get(0, 0)).toBe('wall');
+    expect(countPixels(buf, 'wall')).toBe(0);
   });
 });
 
@@ -302,24 +305,15 @@ describe('drawAutotiledUndergroundTile — stair-step diagonal corridor', () => 
     expect(buf.get(15, 15)).toBe('open');
   });
 
-  it('saddle case (cardinals all open, two opposing diagonals = wall) paints two opposite inner-corner bites and no chamfers', () => {
-    // sameH=1, sameV=1 in every quadrant. NW and SE diagonals are wall (sameD=0
-    // → inner-corner bite). NE and SW are open (sameD=1 → full → no paint).
+  it('saddle case (cardinals all open, two opposing diagonals = wall) paints no diagonal-only bites', () => {
+    // Diagonal-only mismatches do not represent a cardinal wall boundary, so
+    // they should not paint isolated opposite-kind triangles.
     const buf = renderTile(makeNeighbors('open', {
       nw: 'wall',  n: 'open',  ne: 'open',
       w:  'open',                e: 'open',
       sw: 'open',  s: 'open',  se: 'wall',
     }));
-    // 2 inner-corner bites = 20 wall pixels total.
-    expect(countPixels(buf, 'wall')).toBe(20);
-    // NW corner bite: pixel (0,0) is wall.
-    expect(buf.get(0, 0)).toBe('wall');
-    // SE corner bite: pixel (15,15) is wall.
-    expect(buf.get(15, 15)).toBe('wall');
-    // NE corner (would be wall if NE diagonal were wall) — open here.
-    expect(buf.get(15, 0)).not.toBe('wall');
-    // SW corner — open.
-    expect(buf.get(0, 15)).not.toBe('wall');
+    expect(countPixels(buf, 'wall')).toBe(0);
   });
 });
 
@@ -423,7 +417,7 @@ describe('drawUndergroundRim', () => {
   it('does nothing on a wall tile (rim only fires on open tiles)', () => {
     const gfx = gfxCalls();
     drawUndergroundRim(gfx, 0, 0, 0, 0, 'wall', makeNeighbors('wall'));
-    expect(gfx.calls.filter(c => c.method === 'fillRect')).toHaveLength(0);
+    expect(fillRectCalls(gfx)).toHaveLength(0);
   });
 
   it('does nothing on an open tile with no wall neighbors', () => {
@@ -433,7 +427,7 @@ describe('drawUndergroundRim', () => {
       w:  'open',             e: 'open',
       sw: 'open', s: 'open', se: 'open',
     }));
-    expect(gfx.calls.filter(c => c.method === 'fillRect')).toHaveLength(0);
+    expect(fillRectCalls(gfx)).toHaveLength(0);
   });
 
   it('emits 2 band fillRects + 1 chip per cardinal wall neighbor', () => {
@@ -444,13 +438,127 @@ describe('drawUndergroundRim', () => {
       ne: 'open', e: 'open', se: 'open', s: 'open', sw: 'open', w: 'open', nw: 'open',
     }));
     // 1 heavy band + 1 light band + 1 chip = 3 fillRects.
-    expect(gfx.calls.filter(c => c.method === 'fillRect')).toHaveLength(3);
+    expect(fillRectCalls(gfx)).toHaveLength(3);
   });
 
-  it('all four cardinal walls → 8 band fillRects + 4 chips = 12', () => {
+  // Rim-clip geometry post-codex-P2: the clip is depth-aware. The heavy
+  // band (rowFromEdge=0) clips a full half-edge (HALF=8 pixels) when an
+  // adjacent corner chamfers. The light band (rowFromEdge=1) clips only
+  // HALF-1=7 pixels because the chamfer's row 1 covers cols 0..6 (not
+  // 0..7). So row 1 col 7 keeps its rim shading even with a NW chamfer.
+
+  it('clips rim bands away from chamfered corner halves — NW chamfer', () => {
+    const gfx = gfxCalls();
+    drawUndergroundRim(gfx, 0, 0, 5, 7, 'open', makeNeighbors('open', {
+      nw: 'wall', n: 'wall', ne: 'open',
+      w:  'wall',             e: 'open',
+      sw: 'open', s: 'open', se: 'open',
+    }));
+    const rects = fillRectCalls(gfx);
+    // Heavy band (row 0): NW chamfer covers cols 0..7 → clipped.
+    // Light band (row 1): NW chamfer covers cols 0..6 → cols 0..6 clipped.
+    for (const rect of rects) {
+      expect(rectOverlaps(rect, 0, 0, 8, 1)).toBe(false); // clip heavy N row 0 cols 0..7
+      expect(rectOverlaps(rect, 0, 1, 7, 1)).toBe(false); // clip light N row 1 cols 0..6
+      expect(rectOverlaps(rect, 0, 0, 1, 8)).toBe(false); // clip heavy W col 0 rows 0..7
+      expect(rectOverlaps(rect, 1, 0, 1, 7)).toBe(false); // clip light W col 1 rows 0..6
+    }
+    // Unclipped portions should be painted somewhere.
+    expect(rects.some(rect => rectOverlaps(rect, 8, 0, 8, 1))).toBe(true);  // heavy N E half
+    expect(rects.some(rect => rectOverlaps(rect, 7, 1, 9, 1))).toBe(true);  // light N from col 7
+    expect(rects.some(rect => rectOverlaps(rect, 0, 8, 1, 8))).toBe(true);  // heavy W S half
+    expect(rects.some(rect => rectOverlaps(rect, 1, 7, 1, 9))).toBe(true);  // light W from row 7
+  });
+
+  it('clips rim bands away from chamfered corner halves — NE chamfer', () => {
+    const gfx = gfxCalls();
+    drawUndergroundRim(gfx, 0, 0, 5, 7, 'open', makeNeighbors('open', {
+      nw: 'open', n: 'wall', ne: 'wall',
+      w:  'open',             e: 'wall',
+      sw: 'open', s: 'open', se: 'open',
+    }));
+    const rects = fillRectCalls(gfx);
+    // NE chamfer at row R covers cols (8+R)..15. So heavy (row 0): cols
+    // 8..15. Light (row 1): cols 9..15. NE on E edge col 15 row R covers
+    // similarly mirrored.
+    for (const rect of rects) {
+      expect(rectOverlaps(rect, 8, 0, 8, 1)).toBe(false);  // clip heavy N row 0 cols 8..15
+      expect(rectOverlaps(rect, 9, 1, 7, 1)).toBe(false);  // clip light N row 1 cols 9..15
+      expect(rectOverlaps(rect, 15, 0, 1, 8)).toBe(false); // clip heavy E col 15 rows 0..7
+      expect(rectOverlaps(rect, 14, 0, 1, 7)).toBe(false); // clip light E col 14 rows 0..6
+    }
+    expect(rects.some(rect => rectOverlaps(rect, 0, 0, 8, 1))).toBe(true);  // heavy N W half
+    expect(rects.some(rect => rectOverlaps(rect, 0, 1, 9, 1))).toBe(true);  // light N up to col 8
+    expect(rects.some(rect => rectOverlaps(rect, 15, 8, 1, 8))).toBe(true); // heavy E S half
+    expect(rects.some(rect => rectOverlaps(rect, 14, 7, 1, 9))).toBe(true); // light E from row 7
+  });
+
+  it('clips rim bands away from chamfered corner halves — SE chamfer', () => {
+    const gfx = gfxCalls();
+    drawUndergroundRim(gfx, 0, 0, 5, 7, 'open', makeNeighbors('open', {
+      nw: 'open', n: 'open', ne: 'open',
+      w:  'open',             e: 'wall',
+      sw: 'open', s: 'wall', se: 'wall',
+    }));
+    const rects = fillRectCalls(gfx);
+    // SE chamfer at row R (R measured from south edge) covers cols
+    // (8+R)..15. On the S edge: heavy (S row 15, rowFromEdge=0): cols
+    // 8..15. Light (S row 14, rowFromEdge=1): cols 9..15.
+    for (const rect of rects) {
+      expect(rectOverlaps(rect, 8, 15, 8, 1)).toBe(false);  // clip heavy S row 15 cols 8..15
+      expect(rectOverlaps(rect, 9, 14, 7, 1)).toBe(false);  // clip light S row 14 cols 9..15
+      expect(rectOverlaps(rect, 15, 8, 1, 8)).toBe(false);  // clip heavy E col 15 rows 8..15
+      expect(rectOverlaps(rect, 14, 9, 1, 7)).toBe(false);  // clip light E col 14 rows 9..15
+    }
+    expect(rects.some(rect => rectOverlaps(rect, 0, 15, 8, 1))).toBe(true);  // heavy S W half
+    expect(rects.some(rect => rectOverlaps(rect, 0, 14, 9, 1))).toBe(true);  // light S up to col 8
+    expect(rects.some(rect => rectOverlaps(rect, 15, 0, 1, 8))).toBe(true);  // heavy E N half
+    expect(rects.some(rect => rectOverlaps(rect, 14, 0, 1, 9))).toBe(true);  // light E up to row 8
+  });
+
+  it('clips rim bands away from chamfered corner halves — SW chamfer', () => {
+    const gfx = gfxCalls();
+    drawUndergroundRim(gfx, 0, 0, 5, 7, 'open', makeNeighbors('open', {
+      nw: 'open', n: 'open', ne: 'open',
+      w:  'wall',             e: 'open',
+      sw: 'wall', s: 'wall', se: 'open',
+    }));
+    const rects = fillRectCalls(gfx);
+    // SW chamfer at row R (from south edge) covers cols 0..(7-R). Heavy
+    // (S row 15): 0..7. Light (S row 14): 0..6. On the W edge, mirrored.
+    for (const rect of rects) {
+      expect(rectOverlaps(rect, 0, 15, 8, 1)).toBe(false); // clip heavy S row 15 cols 0..7
+      expect(rectOverlaps(rect, 0, 14, 7, 1)).toBe(false); // clip light S row 14 cols 0..6
+      expect(rectOverlaps(rect, 0, 8, 1, 8)).toBe(false);  // clip heavy W col 0 rows 8..15
+      expect(rectOverlaps(rect, 1, 9, 1, 7)).toBe(false);  // clip light W col 1 rows 9..15
+    }
+    expect(rects.some(rect => rectOverlaps(rect, 8, 15, 8, 1))).toBe(true); // heavy S E half
+    expect(rects.some(rect => rectOverlaps(rect, 7, 14, 9, 1))).toBe(true); // light S from col 7
+    expect(rects.some(rect => rectOverlaps(rect, 0, 0, 1, 8))).toBe(true);  // heavy W N half
+    expect(rects.some(rect => rectOverlaps(rect, 1, 0, 1, 9))).toBe(true);  // light W up to row 8
+  });
+
+  it('all four cardinal walls — heavy bands fully clipped, light bands paint a 2-pixel center', () => {
+    // Heavy bands at clipPx=8 with both halves clipped → 0 paint per band.
+    // Light bands at clipPx=7 with both halves clipped → cols (or rows)
+    // 7..8 painted (center, 2 pixels). Codex P2 fix: previously the rim
+    // disappeared entirely in dense walls; now a 2-pixel rim line stays
+    // visible at each edge's center even when chamfers cover both halves.
     const gfx = gfxCalls();
     drawUndergroundRim(gfx, 0, 0, 5, 7, 'open', makeNeighbors('open'));
-    expect(gfx.calls.filter(c => c.method === 'fillRect')).toHaveLength(12);
+    const rects = fillRectCalls(gfx);
+    // No heavy band at outermost rows/cols.
+    for (const rect of rects) {
+      expect(rectOverlaps(rect, 0, 0, 16, 1)).toBe(false);  // heavy N
+      expect(rectOverlaps(rect, 0, 15, 16, 1)).toBe(false); // heavy S
+      expect(rectOverlaps(rect, 0, 0, 1, 16)).toBe(false);  // heavy W
+      expect(rectOverlaps(rect, 15, 0, 1, 16)).toBe(false); // heavy E
+    }
+    // Light bands present in the 2-pixel center segments.
+    expect(rects.some(rect => rectOverlaps(rect, 7, 1, 2, 1))).toBe(true);  // light N center
+    expect(rects.some(rect => rectOverlaps(rect, 7, 14, 2, 1))).toBe(true); // light S center
+    expect(rects.some(rect => rectOverlaps(rect, 1, 7, 1, 2))).toBe(true);  // light W center
+    expect(rects.some(rect => rectOverlaps(rect, 14, 7, 1, 2))).toBe(true); // light E center
   });
 });
 

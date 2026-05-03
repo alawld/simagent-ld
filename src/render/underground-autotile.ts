@@ -3,20 +3,19 @@
 // Quarter-tile autotiling for the underground cross-section. Replaces the
 // per-corner overlay path (drawTunnelCornerOverlay + drawSolidConvexCornerOverlay)
 // with a quadrant-based approach where each tile's four 8×8 quadrants pick a
-// canonical shape from a 5-entry catalogue and paint OPPOSITE-kind pixels into
+// canonical shape from a small catalogue and paint OPPOSITE-kind pixels into
 // the quadrant when the silhouette demands it.
 //
-// The five canonical quarter shapes (per quadrant):
+// The canonical quarter shapes (per quadrant):
 //
-//   sameH sameV sameD  shape          paints OPPOSITE kind?
-//   ─────────────────────────────────────────────────────────
-//     0     0     -    chamfer        yes — triangular fill at outer corner
-//     1     0     -    h-edge         no  — substrate is correct
-//     0     1     -    v-edge         no  — substrate is correct
-//     1     1     0    inner-corner   yes — small bite at diagonal corner
-//     1     1     1    full           no  — substrate is correct
+//   sameH sameV  shape          paints OPPOSITE kind?
+//   ───────────────────────────────────────────────────
+//     0     0    chamfer        yes — triangular fill at outer corner
+//     1     0    h-edge         no  — substrate is correct
+//     0     1    v-edge         no  — substrate is correct
+//     1     1    full           no  — substrate is correct
 //
-// where sameH/V/D mean "this neighbor matches the center kind". h-edge/v-edge
+// where sameH/V mean "this cardinal neighbor matches the center kind". h-edge/v-edge
 // represent straight cardinal walls; the rim shading that visually distinguishes
 // them from the open floor is added by a SEPARATE pass (Checkpoint 4) so the
 // shape logic stays orthogonal to the lighting/texture concerns.
@@ -60,8 +59,8 @@ type Quadrant = 'NW' | 'NE' | 'SE' | 'SW';
  * (Marked/BeingDug overlay, ceiling tint, etc.) are applied separately by
  * the caller.
  *
- * Total ops: ~30 (substrate) + up to 4 × 8 (chamfers) + up to 4 × 4
- * (inner-corner bites) ≈ 80 worst case for an isolated open pocket.
+ * Total ops: ~30 (substrate) + up to 4 × 8 (chamfers) ≈ 65 worst case for
+ * an isolated open pocket.
  */
 export function drawAutotiledUndergroundTile(
   gfx: GfxLike,
@@ -82,18 +81,19 @@ export function drawAutotiledUndergroundTile(
 
   // 2. Quarter-tile masks. We paint the OPPOSITE substrate's base color into
   //    the quadrant region the autotile says belongs to the other kind. Solid
-  //    color (no dither) — the chamfer/bite reads as a clean "carved" region
+  //    color (no dither) — the chamfer reads as a clean "carved" region
   //    against the dithered substrate behind it, which is the right contrast
   //    for a hard-pixel-art look. Each helper sets its own fillStyle so the
-  //    chip / inner-corner / chamfer paints don't bleed into one another.
+  //    chip and chamfer paints don't bleed into one another.
   //
-  // For each quadrant, the (h, v, d) classification picks a shape. h is the
+  // For each quadrant, the (h, v) classification picks a shape. h is the
   // cardinal-horizontal neighbor (W for NW/SW, E for NE/SE); v is the
-  // cardinal-vertical neighbor (N for NW/NE, S for SW/SE); d is the diagonal.
-  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'NW', neighbors.w, neighbors.n, neighbors.nw);
-  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'NE', neighbors.e, neighbors.n, neighbors.ne);
-  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'SE', neighbors.e, neighbors.s, neighbors.se);
-  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'SW', neighbors.w, neighbors.s, neighbors.sw);
+  // cardinal-vertical neighbor (N for NW/NE, S for SW/SE). Diagonal-only
+  // mismatches are intentionally ignored after issue #48.
+  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'NW', neighbors.w, neighbors.n);
+  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'NE', neighbors.e, neighbors.n);
+  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'SE', neighbors.e, neighbors.s);
+  drawQuadrantMask(gfx, screenX, screenY, tileX, tileY, centerKind, 'SW', neighbors.w, neighbors.s);
 }
 
 function drawQuadrantMask(
@@ -106,11 +106,9 @@ function drawQuadrantMask(
   quadrant: Quadrant,
   horizKind: NeighborKind,
   vertKind:  NeighborKind,
-  diagKind:  NeighborKind,
 ): void {
   const sameH = horizKind === centerKind;
   const sameV = vertKind  === centerKind;
-  const sameD = diagKind  === centerKind;
 
   const oppositeColor = centerKind === 'wall' ? COLOR_FLOOR_BASE : COLOR_ROCK_BASE;
   if (!sameH && !sameV) {
@@ -123,13 +121,10 @@ function drawQuadrantMask(
     // inclusion. Strictly avoids the sacred edges (row 0 / col 0) and the
     // hypotenuse boundary, so anchor and join contracts hold regardless.
     maybeAddChamferChip(gfx, screenX, screenY, tileX, tileY, quadrant, centerKind);
-  } else if (sameH && sameV && !sameD) {
-    // inner-corner — only the diagonal differs. The opposite kind pokes in
-    // at the far corner of the quadrant. Paint a small bite there.
-    gfx.fillStyle(oppositeColor, 1);
-    fillInnerCornerBite(gfx, screenX, screenY, quadrant);
   }
   // else: full / h-edge / v-edge — substrate is correct, nothing to paint.
+  // Diagonal-only mismatches intentionally do not paint: issue #48 showed
+  // those tiny opposite-kind bites read as stray wrong-side triangles.
 }
 
 /**
@@ -158,34 +153,6 @@ function fillChamferTriangle(
       case 'NE': x = HALF + i;                 y = i;                              break;
       case 'SE': x = HALF + i;                 y = TILE_SIZE_PX - 1 - i;           break;
       case 'SW': x = 0;                        y = TILE_SIZE_PX - 1 - i;           break;
-    }
-    gfx.fillRect(screenX + x, screenY + y, width, 1);
-  }
-}
-
-/**
- * Fill a 4×4 triangular bite at the diagonal corner of the named quadrant —
- * the opposite-kind diagonal neighbor "poking into" an otherwise same-kind
- * area. Smaller than a chamfer so it reads as a peninsula rather than a
- * full rounded corner.
- *
- * 4 fillRect scanline calls per inner-corner bite.
- */
-function fillInnerCornerBite(
-  gfx: GfxLike,
-  screenX: number,
-  screenY: number,
-  quadrant: Quadrant,
-): void {
-  const SIZE = 4;
-  for (let i = 0; i < SIZE; i++) {
-    const width = SIZE - i;
-    let x = 0, y = 0;
-    switch (quadrant) {
-      case 'NW': x = 0;                            y = i;                              break;
-      case 'NE': x = TILE_SIZE_PX - SIZE + i;      y = i;                              break;
-      case 'SE': x = TILE_SIZE_PX - SIZE + i;      y = TILE_SIZE_PX - 1 - i;           break;
-      case 'SW': x = 0;                            y = TILE_SIZE_PX - 1 - i;           break;
     }
     gfx.fillRect(screenX + x, screenY + y, width, 1);
   }
@@ -287,39 +254,132 @@ export function drawUndergroundRim(
   const last = TILE_SIZE_PX - 1;
 
   // Heavy band — outermost pixel row/column on each wall-facing edge.
+  // Clip ONLY the chamfer-occupied portion of the half-edge (codex P2 pass —
+  // the previous "clip whole half" rule over-clipped: at row 1 of the N rim,
+  // the NW chamfer covers cols 0..6 only, so col 7 should still get rim
+  // shading. The depth-aware clip uses HALF - rowFromEdge so each band's
+  // clip width matches the chamfer's actual width at that row.
+  //
+  // rowFromEdge: distance into the tile from the band's outer edge.
+  //   - heavy band (outermost row/col): 0 → clip full HALF width (chamfer
+  //     row 0 covers 0..7).
+  //   - light band (1 inward): 1 → clip HALF-1 = 7 (chamfer row 1 covers
+  //     0..6); the edge pixel at 7 stays visible.
   gfx.fillStyle(COLOR_ROCK_BASE_DARK, 0.55);
-  if (wallN) gfx.fillRect(screenX,            screenY,            TILE_SIZE_PX, 1);
-  if (wallS) gfx.fillRect(screenX,            screenY + last,     TILE_SIZE_PX, 1);
-  if (wallW) gfx.fillRect(screenX,            screenY,            1, TILE_SIZE_PX);
-  if (wallE) gfx.fillRect(screenX + last,     screenY,            1, TILE_SIZE_PX);
+  if (wallN) drawHorizontalRimBand(gfx, screenX, screenY,        0, wallW, wallE);
+  if (wallS) drawHorizontalRimBand(gfx, screenX, screenY + last, 0, wallW, wallE);
+  if (wallW) drawVerticalRimBand(gfx,   screenX, screenY,        0, wallN, wallS);
+  if (wallE) drawVerticalRimBand(gfx,   screenX + last, screenY, 0, wallN, wallS);
 
-  // Light band — second pixel inward, lighter alpha for the fade transition.
+  // Light band — 1 pixel inward, lighter alpha for the fade transition.
   gfx.fillStyle(COLOR_ROCK_BASE_DARK, 0.30);
-  if (wallN) gfx.fillRect(screenX,            screenY + 1,        TILE_SIZE_PX, 1);
-  if (wallS) gfx.fillRect(screenX,            screenY + last - 1, TILE_SIZE_PX, 1);
-  if (wallW) gfx.fillRect(screenX + 1,        screenY,            1, TILE_SIZE_PX);
-  if (wallE) gfx.fillRect(screenX + last - 1, screenY,            1, TILE_SIZE_PX);
+  if (wallN) drawHorizontalRimBand(gfx, screenX, screenY + 1,        1, wallW, wallE);
+  if (wallS) drawHorizontalRimBand(gfx, screenX, screenY + last - 1, 1, wallW, wallE);
+  if (wallW) drawVerticalRimBand(gfx,   screenX + 1, screenY,        1, wallN, wallS);
+  if (wallE) drawVerticalRimBand(gfx,   screenX + last - 1, screenY, 1, wallN, wallS);
 
   // Per-tile rim chips — 1-pixel deterministic dark specks inside each
   // active rim band, breaking the rim's flat appearance. Same alpha as
   // the heavy band so chips read as small "packed soil" grains rather
-  // than sub-rim noise. Position is hash-driven within the band.
+  // than sub-rim noise. Chip lives on the LIGHT band (rowFromEdge=1).
   const h = spatialHash(tileX, tileY, SALT_RIM_CHIP);
   gfx.fillStyle(COLOR_ROCK_BASE_DARK, 0.55);
   if (wallN) {
     const x = (h >>> 0) & 0xf;        // 0..15
-    gfx.fillRect(screenX + x, screenY + 1, 1, 1);
+    if (rimXVisible(x, 1, wallW, wallE)) gfx.fillRect(screenX + x, screenY + 1, 1, 1);
   }
   if (wallS) {
     const x = (h >>> 4) & 0xf;
-    gfx.fillRect(screenX + x, screenY + last - 1, 1, 1);
+    if (rimXVisible(x, 1, wallW, wallE)) gfx.fillRect(screenX + x, screenY + last - 1, 1, 1);
   }
   if (wallW) {
     const y = (h >>> 8) & 0xf;
-    gfx.fillRect(screenX + 1, screenY + y, 1, 1);
+    if (rimYVisible(y, 1, wallN, wallS)) gfx.fillRect(screenX + 1, screenY + y, 1, 1);
   }
   if (wallE) {
     const y = (h >>> 12) & 0xf;
-    gfx.fillRect(screenX + last - 1, screenY + y, 1, 1);
+    if (rimYVisible(y, 1, wallN, wallS)) gfx.fillRect(screenX + last - 1, screenY + y, 1, 1);
   }
+}
+
+/**
+ * Paint a 1-pixel-tall rim band at row `y`, clipping the chamfer-occupied
+ * portion on either end. `rowFromEdge` is the band's depth into the tile
+ * from its outer edge (0 = outermost / heavy, 1 = inner / light). The
+ * clip width on each side matches the chamfer's width at that row, so
+ * pixels outside the chamfer remain visible.
+ */
+function drawHorizontalRimBand(
+  gfx: GfxLike,
+  screenX: number,
+  y: number,
+  rowFromEdge: number,
+  clipWestHalf: boolean,
+  clipEastHalf: boolean,
+): void {
+  const clipPx = HALF - rowFromEdge;
+  // Beyond the chamfer's reach — the row is fully outside any chamfer,
+  // so paint the full edge regardless of clip flags.
+  if (clipPx <= 0) {
+    gfx.fillRect(screenX, y, TILE_SIZE_PX, 1);
+    return;
+  }
+  const start  = clipWestHalf ? clipPx : 0;
+  const endExc = clipEastHalf ? (TILE_SIZE_PX - clipPx) : TILE_SIZE_PX;
+  if (endExc > start) {
+    gfx.fillRect(screenX + start, y, endExc - start, 1);
+  }
+}
+
+/** Vertical mirror of `drawHorizontalRimBand`. */
+function drawVerticalRimBand(
+  gfx: GfxLike,
+  x: number,
+  screenY: number,
+  colFromEdge: number,
+  clipNorthHalf: boolean,
+  clipSouthHalf: boolean,
+): void {
+  const clipPx = HALF - colFromEdge;
+  if (clipPx <= 0) {
+    gfx.fillRect(x, screenY, 1, TILE_SIZE_PX);
+    return;
+  }
+  const start  = clipNorthHalf ? clipPx : 0;
+  const endExc = clipSouthHalf ? (TILE_SIZE_PX - clipPx) : TILE_SIZE_PX;
+  if (endExc > start) {
+    gfx.fillRect(x, screenY + start, 1, endExc - start);
+  }
+}
+
+/**
+ * True iff a chip at column `x` on a horizontal rim band at depth
+ * `rowFromEdge` is outside any chamfered area. Same depth-aware clip
+ * geometry as `drawHorizontalRimBand`.
+ */
+function rimXVisible(
+  x: number,
+  rowFromEdge: number,
+  clipWestHalf: boolean,
+  clipEastHalf: boolean,
+): boolean {
+  const clipPx = HALF - rowFromEdge;
+  if (clipPx <= 0) return true;
+  if (clipWestHalf && x < clipPx) return false;
+  if (clipEastHalf && x >= TILE_SIZE_PX - clipPx) return false;
+  return true;
+}
+
+/** Vertical mirror of `rimXVisible`. */
+function rimYVisible(
+  y: number,
+  colFromEdge: number,
+  clipNorthHalf: boolean,
+  clipSouthHalf: boolean,
+): boolean {
+  const clipPx = HALF - colFromEdge;
+  if (clipPx <= 0) return true;
+  if (clipNorthHalf && y < clipPx) return false;
+  if (clipSouthHalf && y >= TILE_SIZE_PX - clipPx) return false;
+  return true;
 }
