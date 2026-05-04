@@ -12,7 +12,7 @@
 //   6. Version-gated: bumping SAVE_FORMAT_VERSION invalidates old saves (intentional for beta)
 
 import type { WorldState, EntityId } from '../sim/types.js';
-import { LEGACY_SIM_VERSION } from '../sim/types.js';
+import { LEGACY_SIM_VERSION, LATEST_SIM_VERSION } from '../sim/types.js';
 import type { AntComponents } from '../sim/ant/ant-store.js';
 import { createAntComponents } from '../sim/ant/ant-store.js';
 import type {
@@ -51,6 +51,25 @@ export class SaveVersionMismatchError extends Error {
   constructor(public expected: number, public got: number) {
     super(`Save format version mismatch: expected ${expected}, got ${got}`);
     this.name = 'SaveVersionMismatchError';
+  }
+}
+
+/**
+ * Issue #66 — thrown by `deserializeWorldState` when the snapshot's
+ * `simVersion` exceeds `LATEST_SIM_VERSION`. Distinct from the plain
+ * `Error` thrown for tampered-corruption cases (negative simVersion,
+ * out-of-range ants.count, malformed snapshot shape) so callers can
+ * preserve the recoverable case and discard the tampered case.
+ *
+ * "Future-build save loaded by older build" is the canonical scenario:
+ * the envelope is intact and a newer build can load it, but THIS build
+ * doesn't know how to interpret the simVersion. Caller should boot
+ * fresh without deleting; user can recover by upgrading the build.
+ */
+export class FutureSimVersionError extends Error {
+  constructor(public got: number, public latest: number) {
+    super(`Save's simVersion (${got}) is newer than this build's LATEST (${latest})`);
+    this.name = 'FutureSimVersionError';
   }
 }
 
@@ -348,16 +367,23 @@ export function serializeWorldState(world: WorldState): SerializedWorldState {
  * Pure function: no PRNG, no clock, no side effects. Idempotent: applying twice
  * produces the same output as applying once.
  */
-export function migrateBehaviorRatio(
-  legacy: { forage?: number; dig?: number; fight?: number },
-): BehaviorRatio {
+export function migrateBehaviorRatio(legacy: unknown): BehaviorRatio {
+  // Issue #78 — accept `unknown` at runtime: a corrupted snapshot can pass
+  // null / number / string / array here from deserializeColony(s.targetRatio).
+  // Direct property access or `'dig' in legacy` would otherwise throw
+  // TypeError for non-object inputs and propagate out of loadSave as a
+  // swallowed error → total save loss. Treat any non-object input as "no
+  // usable fields" → defaults to DEFAULT_BEHAVIOR_RATIO via the all-zero
+  // malformed snap below.
+  const isObject = legacy !== null && typeof legacy === 'object';
+  const obj = (isObject ? legacy : {}) as { forage?: unknown; fight?: unknown; dig?: unknown };
   // Defensive: reject NaN, +/-Infinity, and negatives. typeof NaN === 'number',
   // so the typeof guard alone allows NaN to propagate into colony.targetRatio
   // and contaminate every downstream allocateWorkers call (WR-01). A negative
   // weight is also rejected to mirror the SetBehaviorRatio command handler in
   // tick.ts step 5 (any negative weight → reject command).
-  const rawForage = legacy.forage;
-  const rawFight  = legacy.fight;
+  const rawForage = obj.forage;
+  const rawFight  = obj.fight;
   const isForageValid = typeof rawForage === 'number' && Number.isFinite(rawForage) && rawForage >= 0;
   const isFightValid  = typeof rawFight  === 'number' && Number.isFinite(rawFight)  && rawFight  >= 0;
   const forage = isForageValid ? rawForage : 0;
@@ -369,12 +395,47 @@ export function migrateBehaviorRatio(
   // command replay) is preserved verbatim — otherwise migrateBehaviorRatio
   // would silently mutate valid two-field zeros and break snapshot-vs-replay
   // determinism for tools that compare them (WR-10).
-  const isLegacy = 'dig' in legacy;
-  const isMalformed = !isForageValid || !isFightValid;
+  const isLegacy = isObject && 'dig' in obj;
+  const isMalformed = !isObject || !isForageValid || !isFightValid;
   if (forage === 0 && fight === 0 && (isLegacy || isMalformed)) {
     return { forage: 10, fight: 0 };
   }
   return { forage, fight };
+}
+
+/**
+ * Issue #66 — validate `simVersion` at the save boundary.
+ *
+ * Returns LEGACY for missing/non-integer (preserves pre-#27 legacy load).
+ * Returns the value verbatim for an integer in [LEGACY, LATEST].
+ *
+ * For out-of-range integers, throws one of two error types so the caller
+ * can differentiate recoverable from definitively-corrupt:
+ *   - simVersion > LATEST → `FutureSimVersionError` (recoverable: a newer
+ *     build wrote this save; older build doesn't know the gate semantics
+ *     but the bytes are intact)
+ *   - simVersion < LEGACY (e.g. 0, 1, negative) → plain `Error` (tampered
+ *     or otherwise definitively corrupt; pre-LEGACY values are not a real
+ *     historical save shape, since LEGACY itself was the original baseline)
+ *
+ * Throws happen at deserialize-time (`deserializeWorldState`) and are
+ * caught by `bootFromSave`'s try/catch in render/game-scene.ts. Note
+ * that `loadSave` does NOT catch — its swallowing try/catch wraps
+ * `parseSaveFile` only, and parseSaveFile doesn't deserialize.
+ *
+ * Rationale: a tampered save with simVersion=-1 makes every `>= SIM_VERSION_VN`
+ * gate evaluate false forever; simVersion=99999 makes them all evaluate
+ * true. Both silently break the sticky-on-load determinism contract.
+ */
+function validateSimVersion(raw: unknown): number {
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) return LEGACY_SIM_VERSION;
+  if (raw > LATEST_SIM_VERSION) {
+    throw new FutureSimVersionError(raw, LATEST_SIM_VERSION);
+  }
+  if (raw < LEGACY_SIM_VERSION) {
+    throw new Error(`Invalid simVersion in save: ${raw} (require integer in [${LEGACY_SIM_VERSION}, ${LATEST_SIM_VERSION}])`);
+  }
+  return raw;
 }
 
 function copyIntoInt32(dst: Int32Array, src: readonly number[]): void {
@@ -540,7 +601,50 @@ function deserializePheromoneGrid(s: SerializedGrid): PheromoneGrid {
 }
 
 export function deserializeWorldState(s: SerializedWorldState): WorldState {
-  const capacity = s.ants.count > 0 ? s.ants.count : MAX_ENTITIES;
+  // Top-level guard — must be a non-null object to read .simVersion.
+  if (s === null || typeof s !== 'object') {
+    throw new Error('Invalid save shape: snapshot is not an object');
+  }
+  // Validate simVersion FIRST — earliest possible, before any other shape
+  // or field-value check. Per codex P1 on PR #88: a future build can
+  // legitimately restructure the snapshot layout (e.g., split `s.ants`
+  // per-colony, raise MAX_ENTITIES, add new top-level fields). Any of those
+  // would otherwise throw plain Error at a downstream guard, and bootFromSave
+  // would deleteSave() — destroying a recoverable forward-version save.
+  // Hoisting the simVersion check ensures any future-version mismatch is
+  // surfaced as FutureSimVersionError (preserved + autosave-suspended)
+  // before the shape mismatch can misclassify it as tampering.
+  const validatedSimVersion = validateSimVersion((s as { simVersion?: unknown }).simVersion);
+  // Issue #65 / #66 — shape guard for `s.ants`. Reaches here only after
+  // validateSimVersion confirmed simVersion <= LATEST, so a non-object
+  // s.ants at this point indicates real corruption (no future build
+  // restructure to worry about, since that would have bumped simVersion).
+  if (s.ants === null || typeof s.ants !== 'object') {
+    throw new Error('Invalid save shape: missing or non-object ants');
+  }
+  // Issue #65 — boundary validation for s.ants.count. Pre-fix code was
+  // `s.ants.count > 0 ? s.ants.count : MAX_ENTITIES`, which silently accepted
+  // 1e9 / Infinity / NaN. A hand-edited or corrupted save with a huge count
+  // flowed straight into createAntComponents(capacity) and allocated ~25
+  // TypedArrays of that length — a memory-DoS vector on load.
+  //
+  // Boundary policy (codex review-confirmed): count is always written by
+  // serializeAnts, so any present-but-invalid value (non-integer / negative /
+  // > MAX_ENTITIES) is treated as corrupt and throws — caught by bootFromSave's
+  // try/catch, which falls through to bootFresh. count === 0 retains the
+  // pre-fix MAX_ENTITIES fallback (was the "no count field" sentinel and is
+  // still safe). Compare with simVersion, where missing/non-integer falls
+  // back to LEGACY (pre-#27 saves omit the field entirely; that path is real).
+  // Reaches here only after validateSimVersion confirmed simVersion <= LATEST,
+  // so a count > MAX_ENTITIES at this point is genuine tampering — a future
+  // build raising MAX_ENTITIES would have bumped simVersion to flag the change.
+  const rawCount = s.ants.count;
+  if (typeof rawCount !== 'number' || !Number.isInteger(rawCount) || rawCount < 0 || rawCount > MAX_ENTITIES) {
+    // Use String() so NaN/Infinity render as their canonical names; JSON.stringify
+    // would coerce them to 'null', which is more confusing than less.
+    throw new Error(`Invalid ants.count in save: ${String(rawCount)} (require integer in [0, ${MAX_ENTITIES}])`);
+  }
+  const capacity = rawCount > 0 ? rawCount : MAX_ENTITIES;
   const colonies: Record<ColonyId, ColonyRecord> = {};
   for (const [cidStr, sc] of Object.entries(s.colonies)) {
     colonies[Number(cidStr) as ColonyId] = deserializeColony(sc);
@@ -568,11 +672,19 @@ export function deserializeWorldState(s: SerializedWorldState): WorldState {
     // hand-edited or corrupted save passing `"3"` / NaN / null / object
     // would otherwise reach `world.simVersion >= 3` comparisons which
     // coerce inconsistently (`"3" >= 3 === true`, `"latest" >= 3 === false`)
-    // and silently land replays on the wrong drain order. Reject anything
-    // that isn't an integer.
-    simVersion: typeof s.simVersion === 'number' && Number.isInteger(s.simVersion)
-      ? s.simVersion
-      : LEGACY_SIM_VERSION,
+    // and silently land replays on the wrong drain order.
+    //
+    // Issue #66 — also reject present-but-out-of-range integers. Pre-fix
+    // code accepted any integer, including 99999 (every gate evaluates true
+    // forever, breaking the sticky-on-load contract for tampered saves) and
+    // negatives (every gate evaluates false). Boundary policy: missing/non-
+    // integer falls back to LEGACY (preserves legacy save-load); present
+    // integer in [LEGACY, LATEST] is used verbatim; integer outside that
+    // band throws (caught by bootFromSave's try/catch in render/game-scene.ts
+    // → bootFresh) rather than silently loading into an undefined gate-state
+    // mode. NB: loadSave does NOT catch this — its try/catch only wraps
+    // parseSaveFile. The simVersion check runs at deserialize-time.
+    simVersion: validatedSimVersion,
     // Issue #44 — pre-#44 saves omit `terrainSeed`; default to 0 on load.
     // Same boundary type-validation as `simVersion`: `??` only guards null/
     // undefined, so a hand-edited save with `"42"` / NaN / object would land
@@ -629,7 +741,18 @@ function buildSaveFile(seed: number, inputLog: readonly SimCommand[], world: Wor
  */
 function migrateInputLogCommand(cmd: SimCommand): SimCommand {
   if (cmd.type !== 'SetBehaviorRatio') return cmd;
-  const ratioRaw = cmd.ratio as unknown as { forage?: number; dig?: number; fight?: number };
+  // Issue #78 — guard against null/primitive ratios before using `'in'`.
+  // Pre-fix code did `'dig' in ratioRaw` directly, which throws TypeError
+  // for null / undefined / number / string / boolean. parseSaveFile is
+  // called from loadSave inside a try/catch that swallows the throw and
+  // returns null; the caller then treats the entire save as corrupt and
+  // calls deleteSave + bootFresh, escalating a recoverable single-command
+  // corruption into total save loss. Defensive shape-check keeps the rest
+  // of the inputLog intact (the malformed command passes through verbatim
+  // — the SetBehaviorRatio handler in tick.ts has its own type guard so
+  // replay drops it cleanly).
+  const ratioRaw: unknown = cmd.ratio;
+  if (ratioRaw === null || typeof ratioRaw !== 'object') return cmd;
   // Already in the two-field form (no `dig` key) — pass through.
   if (!('dig' in ratioRaw)) return cmd;
   const migrated = migrateBehaviorRatio(ratioRaw);

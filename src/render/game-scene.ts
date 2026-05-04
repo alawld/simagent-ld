@@ -28,7 +28,7 @@ import { createScenario } from '../sim/scenario.js';
 import { copyWorldState, type WorldState } from '../sim/types.js';
 import { tick, resetFlowFieldCaches } from '../sim/tick.js';
 import { createGameLoop, type GameLoop, MS_PER_TICK } from '../platform/game-loop.js';
-import { hasSave, loadSave, deleteSave, tickAutosave } from '../platform/save.js';
+import { hasSave, loadSave, deleteSave, tickAutosave, FutureSimVersionError } from '../platform/save.js';
 import { deserializeWorldState } from '../platform/save.js';
 import { runAIController } from './ai-controller.js';
 import { buildDebugSnapshot } from '../platform/debug-snapshot.js';
@@ -152,6 +152,15 @@ export class GameScene extends Phaser.Scene {
   private aiColonyIds: ReturnType<typeof deriveAIColonyIds> = [];
   private readonly inputLog: SimCommand[] = [];
   private lastAutosaveMs: number = 0;
+  /**
+   * Issue #66 — set when bootFromSave catches a deserialize throw and falls
+   * through to bootFresh, indicating an existing localStorage save couldn't
+   * be loaded by this build. Suspends the autosave path in `update()` so
+   * the preserved bytes aren't overwritten by the fresh game state. The
+   * preserved save can be recovered on a future build / reload.
+   * Cleared on resetSessionState so an explicit restartGame re-enables it.
+   */
+  private autosaveSuspended: boolean = false;
   private currentSeed: number = 0;
   private speedMultiplier: number = 1;
 
@@ -330,6 +339,10 @@ export class GameScene extends Phaser.Scene {
     this.lastActiveView = null;
     this.currentOutcome = GameOutcome.None;
     this.speedMultiplier = 1;
+    // Re-enable autosave for the next session. The flag is set only by
+    // bootFromSave's deserialize-throw catch (see issue #66 in the field
+    // doc); a fresh start via restartGame should resume normal autosave.
+    this.autosaveSuspended = false;
     // tick.ts caches entrance/dig/chamber flow-fields at module scope keyed by
     // colonyId. bootFresh/bootFromSave replace `world` but those singletons
     // survive, so a new session with the same colony IDs would otherwise route
@@ -369,8 +382,41 @@ export class GameScene extends Phaser.Scene {
     // instance) would concatenate with loaded.inputLog and break replay truth.
     this.resetSessionState();
     // Plan 04 SaveFile shape: { version, seed, inputLog, snapshot }
+    // Issue #65/#66 — deserializeWorldState throws for two distinct cases:
+    //
+    //   1. FutureSimVersionError — simVersion > LATEST. The save was written
+    //      by a NEWER build (rollback / cached-older-client) and is intact;
+    //      this build just doesn't know the gate semantics. Preserve the
+    //      bytes (don't deleteSave) AND suspend autosave for the session
+    //      so a fresh game's progress doesn't overwrite the preserved save.
+    //      User can recover by reloading on the newer build.
+    //
+    //   2. Plain Error — definitively corrupt (tampered ants.count, malformed
+    //      snapshot/ants shape, simVersion < LEGACY). No future build can
+    //      load this — bytes are gibberish. Delete the save so subsequent
+    //      Continue prompts don't loop the user through forced fresh boots
+    //      with autosave suspended (per codex P1 on PR #88: that loop
+    //      causes silent total progress loss when the tab closes).
+    //
+    // The asymmetry mirrors the null path above (loaded === null → delete:
+    // envelope structurally broken, no recovery possible).
+    let nextWorld: WorldState;
+    try {
+      nextWorld = deserializeWorldState(loaded.snapshot);
+    } catch (err) {
+      if (err instanceof FutureSimVersionError) {
+        this.bootFresh();
+        // Set after bootFresh — resetSessionState clears the flag.
+        this.autosaveSuspended = true;
+        return;
+      }
+      // Genuine corruption: discard so we don't loop the user.
+      deleteSave();
+      this.bootFresh();
+      return;
+    }
     this.currentSeed = loaded.seed;
-    this.world = deserializeWorldState(loaded.snapshot);
+    this.world = nextWorld;
     // SCEN-06 replay truth: restore inputLog completely so the continued session
     // can be replayed byte-for-byte from (seed, inputLog) per Plan 04 Task 1.
     for (const c of loaded.inputLog) this.inputLog.push(c);
@@ -418,10 +464,29 @@ export class GameScene extends Phaser.Scene {
   }
 
   private restartGame(): void {
-    deleteSave();
+    // Issue #66 — capture suspend state BEFORE bootFresh (which clears it
+    // via resetSessionState). Two distinct flows:
+    //
+    //   - autosaveSuspended === false (normal restart): delete the save
+    //     so the new game starts clean; autosave resumes naturally.
+    //   - autosaveSuspended === true (restart inside a future-build
+    //     preserved-save session): do NOT delete — the localStorage bytes
+    //     belong to a save the user can recover by reloading on the newer
+    //     build; restartGame must not destroy them. Re-suspend autosave
+    //     after bootFresh so the new fresh session also can't clobber the
+    //     preserved bytes via tickAutosave. Suspension stays sticky until
+    //     the page reloads (the only path back is reloading on a build
+    //     that knows the simVersion).
+    const wasSuspended = this.autosaveSuspended;
+    if (!wasSuspended) {
+      deleteSave();
+    }
     this.currentOutcome = GameOutcome.None;
     // bootFresh → finishBoot resumes the loop; this is the authoritative restart path.
     this.bootFresh();
+    if (wasSuspended) {
+      this.autosaveSuspended = true;
+    }
     const uiScene = this.scene.get('UIScene') as unknown as UIScenePhase9;
     uiScene.hideGameOverOverlay();
   }
@@ -499,8 +564,11 @@ export class GameScene extends Phaser.Scene {
     }
     this.antSprites.endFrame();
 
-    // Autosave — only while actively Playing
-    if (this.gamePhase === GamePhase.Playing) {
+    // Autosave — only while actively Playing, and not while a preserved
+    // incompatible save is sitting in localStorage waiting for recovery
+    // (issue #66: bootFromSave's deserialize-throw catch suspends autosave
+    // so the preserved bytes aren't overwritten by this fresh session).
+    if (this.gamePhase === GamePhase.Playing && !this.autosaveSuspended) {
       this.lastAutosaveMs = tickAutosave(
         this.currentSeed,
         this.inputLog,
