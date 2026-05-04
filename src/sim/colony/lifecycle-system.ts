@@ -17,7 +17,7 @@
 // array.length > 0, so array[length-1] is always defined.
 
 import type { WorldState } from '../types.js';
-import { allocateEntityId } from '../types.js';
+import { allocateEntityId, SIM_VERSION_V10_VISIBLE_BROOD_CARRY } from '../types.js';
 import { initAnt } from '../ant/ant-store.js';
 import type { ColonyRecord } from './colony-store.js';
 import { AntTask, ChamberType } from '../enums.js';
@@ -302,6 +302,28 @@ export function tickLifecycleTransitions(world: WorldState, colony: ColonyRecord
       ants.speed[id] = WORKER_BASE_SPEED;
       colony.workers.push(id);
       colony.workerCount += 1;
+      // Issue #17 Phase 1 — if a v10+ nurse was carrying this larva when
+      // it matured, drop the carry. The new worker stays at the carrier's
+      // current tile (posX/posY were synced last tick); the carrier
+      // returns to Idle so step 10a re-allocates per ratio.
+      if (world.simVersion >= SIM_VERSION_V10_VISIBLE_BROOD_CARRY) {
+        const carrierId = ants.carriedBy[id]!;
+        if (carrierId !== -1) {
+          // Carrier-side cleanup is gated on the carrier still being alive
+          // AND still carrying THIS entity — guards against state desync
+          // (e.g. carrier already started carrying a different brood).
+          if (ants.alive[carrierId] === 1 && ants.carryingBroodId[carrierId] === id) {
+            ants.carryingBroodId[carrierId] = -1;
+            ants.task[carrierId]    = AntTask.Idle;
+            ants.subTask[carrierId] = 0;
+          }
+          // Always clear the matured worker's `carriedBy` so the new
+          // worker is not flagged as carried, regardless of carrier-side
+          // state. The new worker is now in colony.workers (no longer
+          // brood) and will not be referenced by carry-aware code.
+          ants.carriedBy[id] = -1;
+        }
+      }
     }
   }
 

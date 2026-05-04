@@ -1,6 +1,6 @@
 // src/sim/tick.ts — Phase 9 19-step tick dispatcher.
 import type { WorldState } from './types.js';
-import { allocateEntityId, SIM_VERSION_V5_CHAMBER_ON_MARKED, SIM_VERSION_V9_CANCEL_DROPS_PENDING } from './types.js';
+import { allocateEntityId, SIM_VERSION_V5_CHAMBER_ON_MARKED, SIM_VERSION_V9_CANCEL_DROPS_PENDING, SIM_VERSION_V10_VISIBLE_BROOD_CARRY } from './types.js';
 import { MAX_COMMANDS_PER_TICK, type SimCommand } from './commands.js';
 import { GameOutcome, checkQueenDeath } from './game-over.js';
 import { detectAndResolveCombat } from './combat.js';
@@ -68,10 +68,12 @@ import {
 import type { EntranceFlowFields } from './entrance-flow.js';
 import {
   computeChamberFlowField,
+  computeNursingPickupField,
   ensureChamberFlowFields,
   createChamberFlowFields,
   FOOD_CHAMBER_TYPES,
   NURSING_CHAMBER_TYPES,
+  NURSERY_CHAMBER_TYPES,
   QUEEN_CHAMBER_TYPES,
 } from './chamber-flow.js';
 import type { ChamberFlowFields } from './chamber-flow.js';
@@ -115,10 +117,11 @@ export function resetFlowFieldCaches(): void {
   for (const k in digFlowFields.queues)       delete digFlowFields.queues[k as unknown as ColonyId];
   for (const k in entranceFlowFields.fields)  delete entranceFlowFields.fields[k as unknown as ColonyId];
   for (const k in entranceFlowFields.queues)  delete entranceFlowFields.queues[k as unknown as ColonyId];
-  for (const k in chamberFlowFields.food)     delete chamberFlowFields.food[k as unknown as ColonyId];
-  for (const k in chamberFlowFields.nursing)  delete chamberFlowFields.nursing[k as unknown as ColonyId];
-  for (const k in chamberFlowFields.queen)    delete chamberFlowFields.queen[k as unknown as ColonyId];
-  for (const k in chamberFlowFields.queues)   delete chamberFlowFields.queues[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.food)         delete chamberFlowFields.food[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.nursing)      delete chamberFlowFields.nursing[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.queen)        delete chamberFlowFields.queen[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.nurseDeposit) delete chamberFlowFields.nurseDeposit[k as unknown as ColonyId];
+  for (const k in chamberFlowFields.queues)       delete chamberFlowFields.queues[k as unknown as ColonyId];
 }
 
 // Suppress unused-import TS error for PendingChamber (used in PlaceChamber case shape)
@@ -687,9 +690,46 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
       chamberBufs.queen,
       chamberBufs.queue,
     );
+    // Issue #17 Phase 1 — Nursery-only deposit field for v10+ carrying nurses.
+    // Pre-v10 the field is allocated but unread; computed alongside the other
+    // chamber fields for code symmetry — no measurable cost.
+    computeChamberFlowField(
+      underground,
+      colony.chambers,
+      NURSERY_CHAMBER_TYPES,
+      chamberBufs.nurseDeposit,
+      chamberBufs.queue,
+    );
 
     colony.digFlowFieldDirty = false;
     colony.foodFlowFieldDirty = false;
+  }
+
+  // Issue #17 Phase 1 — under v10+, the `nursing` chamber-flow field is
+  // re-seeded from Queen Open tiles AND any uncarried-brood-entity tile
+  // outside Nursery (the v10 pickup field). Brood positions move with their
+  // carriers each tick, so the field MUST recompute every tick (not just
+  // on dirty signal) to stay in sync. Overwrites the buffer that the
+  // dirty-gated block above filled with the legacy NURSING_CHAMBER_TYPES
+  // seeding — pre-v10 worlds keep the legacy seeding (Queen+Nursery).
+  if (world.simVersion >= SIM_VERSION_V10_VISIBLE_BROOD_CARRY) {
+    for (const key in world.colonies) {
+      if (!Object.hasOwn(world.colonies, key)) continue;
+      const colony = world.colonies[key as unknown as ColonyId]!;
+      const underground = world.undergroundGrids[colony.colonyId];
+      if (!underground) continue;
+      const gridSize = underground.width * underground.height;
+      const chamberBufs = ensureChamberFlowFields(chamberFlowFields, colony.colonyId, gridSize);
+      computeNursingPickupField(
+        underground,
+        colony.chambers,
+        world.ants,
+        colony.eggs,
+        colony.larvae,
+        chamberBufs.nursing,
+        chamberBufs.queue,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
