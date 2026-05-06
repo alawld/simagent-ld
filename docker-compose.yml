@@ -1,0 +1,36 @@
+# Subterrans in Docker (no local Node install required).
+#
+# Production build (static files, nginx) — open http://localhost:8080
+#   docker compose up --build web
+#
+# Dev server with hot reload — open http://localhost:5173
+#   docker compose up --build dev
+#
+# After dependency changes, refresh the dev volume:
+#   docker compose run --rm dev sh -c "rm -f node_modules/.docker-install-stamp" && docker compose up dev
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - dev_node_modules:/app/node_modules
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+    stdin_open: true
+    tty: true
+
+volumes:
+  dev_node_modules:

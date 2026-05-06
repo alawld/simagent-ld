@@ -1101,7 +1101,8 @@ export function tick(world: WorldState, commands: readonly SimCommand[]): GameOu
 // the cost is amortized to near-zero.
 // ---------------------------------------------------------------------------
 
-function isFootprintReachableAfterDigs(
+/** Exported for `command-applicability.ts` — keep logic identical to the PlaceChamber gate in `tick`. */
+export function isFootprintReachableAfterDigs(
   world: WorldState,
   colony: ColonyRecord,
   anchorTileX: number,
