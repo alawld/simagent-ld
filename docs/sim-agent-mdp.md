@@ -18,7 +18,11 @@ Single-page summary for RL / planners: how **`SimAgentHarness`** exposes a Marko
 
 ## Transition
 
-One **`step`** advances one or more **simulation ticks** (`repeatTicks`). Ordering matches **`GameScene`**: optional **`runAIController`** per enemy colony, then player stamp + **`tick(world, drained)`**. Dynamics are **deterministic** given **`seed`**, **`scenarioId`**, and the command stream.
+One **`step`** advances one or more **simulation ticks** via **`repeatTicks`** (default **1**): the same **`commands`** batch is applied only on the **first** tick of the batch; remaining ticks run with **no** additional player commands (useful for cheap “wait” / batched self-play). Ordering matches **`GameScene`**: optional **`runAIController`** per enemy colony, then player stamp + **`tick(world, drained)`**. Dynamics are **deterministic** given **`seed`**, **`scenarioId`**, and the command stream.
+
+## Remote control (JSONL)
+
+**`npm run sim:jsonl-session`** reads **stdin** one JSON object per line and prints one JSON response per line (`dispatchJsonlRequest` in **`jsonl-session.ts`**). Operations: **`session`** (replace harness), **`reset`**, **`step`** (optional **`repeatTicks`**), **`observe`** ( **`getObservation()`** without ticking ), **`ping`**. Same observation schema as **`step`** responses.
 
 ## Reward
 

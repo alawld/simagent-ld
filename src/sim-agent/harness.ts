@@ -153,6 +153,11 @@ export class SimAgentHarness {
     return evaluateCommandApplicability(this.world, stamped);
   }
 
+  /** Current observation without advancing (same shape as `step` result). */
+  getObservation(): SimAgentObservation {
+    return buildObservation(this.world, this.scenarioId, this.playerColonyId, this.aiColonyIds);
+  }
+
   /** SCEN-06-style log of all drained commands (AI + player), in tick drain order. */
   getInputLog(): readonly SimCommand[] {
     return this.inputLog;

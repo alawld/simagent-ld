@@ -33,6 +33,10 @@ When **`evaluateCommandApplicability`** is false, **`tick`** does not apply that
 - **`observationVersion: 3`** — `scalars` (B1), **`affordances`** (marked dig / food piles / entrances), **`taskZone`** (B2: `taskByKind`, `zoneByKind` for alive player-colony ants), **`opponent`** (B4: enemy colony count, queen alive, worker sum, fighting-ant sum — uses all non-player colonies in the world), **`spatial`** (B3: row-major 4×4 **`surfaceTiles4x4`** and **`undergroundTiles4x4`** around rally → entrance → PRD start, and queen-underground → else shaft focal; raw terrain state bytes). **Not included yet:** pheromone slices, larger/downsampled maps.
 - Builders: `src/sim-agent/observation-channels.ts`.
 
+## JSONL session (stdin/stdout)
+
+Line-delimited JSON RPC over **`npm run sim:jsonl-session`** — see **`src/sim-agent/jsonl-session.ts`** and **`docs/sim-agent-mdp.md`**. Request **`op`**: **`session`**, **`reset`**, **`step`**, **`observe`**, **`ping`**.
+
 ## Session recording (imitation / replay)
 
 - **`SimAgentSessionRecording`** (`schema: sim-agent-session/1`) — JSON bundle: `seed`, `scenarioId`, `opponentMode`, `playerColonyId`, **`finalTick`** (`world.tick` after the run), **`inputLog`** (full drained stream). Built with **`buildSessionRecording(harness)`** after **`step`** / **`runEpisode`**.
