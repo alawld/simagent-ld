@@ -85,6 +85,7 @@ Do not treat eval-grid cells as a substitute for episode-level LD attribution โ€
 
 ## Related
 
+- Human checklist (LD keys, orchestrator, ops): **`docs/Human-to-do.md`**  
 - Roadmap: **`SimAgentPlan.md`** ยง11  
 - MDP / harness: **`docs/sim-agent-mdp.md`**  
 - Metric keys (machine-readable): **`src/sim-agent/episode-metrics-catalog.ts`**
