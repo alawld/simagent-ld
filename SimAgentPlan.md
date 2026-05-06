@@ -175,8 +175,8 @@ Define **reward modules per curriculum** in the harness (not inside `src/sim/`):
 | **D — Curriculum** | **Partial** | `createTrainingWorld` + ids + **`scenarioExtras`** + **`evaluateScenarioPass`**. Missing: more isolated tracks (§5), multi-scenario **scheduler**. |
 | **E — Imitation** | **Baseline** | Session **`sim-agent-session/1`** + **`replaySessionRecording`** + export CLI; harness parity tests (`none` + **`ai`**). Per-row BC tables optional. |
 | **F — Rewards** | Not started | Keep outside `src/sim/`. |
-| **G — Hardening** | **Partial** | Property + RNG fuzz tests; **`docs/sim-agent-mdp.md`**; **`jsonl-session`**. Open: HTTP, heavier RNG coverage, `loadSnapshot`. |
+| **G — Hardening** | **Partial** | Property + RNG fuzz tests; **`docs/sim-agent-mdp.md`**; **`jsonl-session`** (`loadSnapshot` / pause in §11). Open: HTTP, heavier RNG coverage; CI runs **`verify`** + **`sim:eval-grid`** (`.github/workflows/ci.yml`). |
 
 **Quick links:** `src/sim-agent/harness.ts` · `src/sim-agent/types.ts` · `src/sim-agent/jsonl-session.ts` · `src/sim-agent/observation-channels.ts` · `src/sim-agent/session-recording.ts` · `src/sim-agent/replay-input-log.ts` · `src/sim/command-applicability.ts` · `docs/sim-agent-commands.md` · `docs/sim-agent-mdp.md` · `src/sim-agent/episode-metrics.ts` · `src/sim-agent/policies.ts` · `src/sim-agent/scenario-thresholds.ts` · `src/sim-agent/eval-grid.ts` · `src/sim/training-scenarios.ts` · tests · `scripts/run-agent-episode.ts` · `scripts/export-agent-session.ts` · `scripts/sim-agent-jsonl.ts` · `scripts/run-eval-grid.ts`
 
-**Follow-ups:** LD bridge / CI wiring to **`sim:eval-grid`** JSON; **replay with `opponentMode: 'ai'`** (extra harness test optional); more **§5** factories; tighten **thresholds** per scenario as design locks; `export` from `src/main.ts` if needed.
+**Follow-ups:** LD bridge consuming **`sim:eval-grid`** / episode JSON lines (outside repo); more **§5** factories; tighten **thresholds** per scenario as design locks; **`scripted` opponent** + HTTP transport (Phase A); `export` from `src/main.ts` if needed.
