@@ -1,8 +1,10 @@
 // scripts/run-agent-episode.ts
-// One JSON line per invocation (stdout) — episode metrics for CI / experimentation sinks (e.g. LaunchDarkly).
+// One JSON line per episode on stdout (NDJSON when --repeat N>1 or --seeds a,b,c).
 //
 // Run:
 //   node --experimental-strip-types scripts/run-agent-episode.ts -- --seed 42 --max-ticks 2000
+//   node --experimental-strip-types scripts/run-agent-episode.ts -- --repeat 20 --seed 1 --max-ticks 500
+//   node --experimental-strip-types scripts/run-agent-episode.ts -- --seeds 1,2,3,4,5 --max-ticks 300
 //   node --experimental-strip-types scripts/run-agent-episode.ts -- --seed 1 --scenario-id invasion_probe --policy heuristic
 //   node --experimental-strip-types scripts/run-agent-episode.ts -- --commands-file ./my-ticks.jsonl
 //
@@ -47,6 +49,8 @@ const { createNoOpPolicy, createHeuristicRatioPolicy, createCommandsFilePolicy }
 
 const args = parseArgs(process.argv.slice(2));
 const seed = Number(args['seed'] ?? '1');
+const repeat = Number(args['repeat'] ?? '1');
+const seedsCsv = args['seeds'];
 const maxTicks = Number(args['max-ticks'] ?? '500');
 const scenarioId = args['scenario-id'] ?? 'default';
 const opponentMode = args['opponent'] === 'none' ? 'none' : 'ai';
@@ -56,10 +60,32 @@ const ldExperiment = args['ld-experiment'];
 const ldVariation = args['ld-variation'];
 const ldIteration = args['ld-iteration'];
 
-if (!Number.isFinite(seed) || !Number.isFinite(maxTicks) || maxTicks < 0) {
+let seeds: number[];
+if (seedsCsv !== undefined) {
+  seeds = seedsCsv
+    .split(',')
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n));
+  if (seeds.length === 0) {
+    console.error('--seeds must list at least one finite number (comma-separated).');
+    process.exit(1);
+  }
+} else {
+  if (!Number.isFinite(repeat) || repeat < 1 || !Number.isInteger(repeat)) {
+    console.error('--repeat must be a positive integer.');
+    process.exit(1);
+  }
+  if (!Number.isFinite(seed)) {
+    console.error('--seed must be finite when using --repeat.');
+    process.exit(1);
+  }
+  seeds = Array.from({ length: repeat }, (_, i) => seed + i);
+}
+
+if (!Number.isFinite(maxTicks) || maxTicks < 0) {
   console.error(
     'Usage: node --experimental-strip-types scripts/run-agent-episode.ts -- ' +
-      '[--seed N] [--max-ticks N] [--scenario-id ID] [--opponent ai|none] ' +
+      '[--seed N] [--repeat N] [--seeds a,b,c] [--max-ticks N] [--scenario-id ID] [--opponent ai|none] ' +
       '[--policy noop|heuristic] [--commands-file PATH] ' +
       '[--ld-experiment K] [--ld-variation K] [--ld-iteration K]',
   );
@@ -70,13 +96,6 @@ if (commandsFile !== undefined && policyName !== 'noop' && policyName !== '') {
   console.error('Use either --commands-file or --policy, not both.');
   process.exit(1);
 }
-
-const harness = new SimAgentHarness({
-  seed,
-  scenarioId,
-  opponentMode,
-  recordInputLog: true,
-});
 
 const getCommands =
   commandsFile !== undefined
@@ -94,10 +113,20 @@ const launchDarkly =
       }
     : undefined;
 
-const episode = harness.runEpisode({
-  maxTicks,
-  getCommands,
-  ...(launchDarkly !== undefined ? { launchDarkly } : {}),
-});
+for (let i = 0; i < seeds.length; i++) {
+  const episodeSeed = seeds[i]!;
+  const harness = new SimAgentHarness({
+    seed: episodeSeed,
+    scenarioId,
+    opponentMode,
+    recordInputLog: true,
+  });
 
-console.log(JSON.stringify(episode));
+  const episode = harness.runEpisode({
+    maxTicks,
+    getCommands,
+    ...(launchDarkly !== undefined ? { launchDarkly } : {}),
+  });
+
+  console.log(JSON.stringify(episode));
+}

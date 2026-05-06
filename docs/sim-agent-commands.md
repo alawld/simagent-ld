@@ -37,6 +37,10 @@ When **`evaluateCommandApplicability`** is false, **`tick`** does not apply that
 
 Line-delimited JSON RPC over **`npm run sim:jsonl-session`** — see **`src/sim-agent/jsonl-session.ts`** and **`docs/sim-agent-mdp.md`**. Request **`op`**: **`session`**, **`reset`**, **`step`**, **`observe`**, **`ping`**, **`pause`**, **`resume`**, **`loadSnapshot`** (body: **`snapshot`**: serialized world), **`exportSnapshot`**.
 
+## Episode metrics CLI (`npm run sim:episode`)
+
+One JSON object per episode on stdout; **`--repeat N`** or **`--seeds a,b,c`** prints **NDJSON**. Optional **`--ld-experiment`**, **`--ld-variation`**, **`--ld-iteration`** echo on every line for external experimentation sinks — see **`docs/sim-agent-launchdarkly-bridge.md`**.
+
 ## Session recording (imitation / replay)
 
 - **`SimAgentSessionRecording`** (`schema: sim-agent-session/1`) — JSON bundle: `seed`, `scenarioId`, `opponentMode`, `playerColonyId`, **`finalTick`** (`world.tick` after the run), **`inputLog`** (full drained stream). Built with **`buildSessionRecording(harness)`** after **`step`** / **`runEpisode`**.

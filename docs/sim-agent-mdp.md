@@ -47,4 +47,5 @@ One **`step`** advances one or more **simulation ticks** via **`repeatTicks`** (
 ## Related
 
 - Command shapes & legality: **`docs/sim-agent-commands.md`**
+- LaunchDarkly / experimentation bridge (orchestrator outside repo): **`docs/sim-agent-launchdarkly-bridge.md`**
 - Roadmap: **`SimAgentPlan.md`**
