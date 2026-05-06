@@ -114,10 +114,10 @@ Define **reward modules per curriculum** in the harness (not inside `src/sim/`):
 
 ## 8. Phase G — Hardening
 
-- Fuzz / property tests: random valid command streams do not crash; determinism holds.  
+- Fuzz / property tests: random valid command streams do not crash; determinism holds. **Progress:** deterministic **`harness-property.test.ts`** (16 seeds × `runEpisode`, all **`TRAINING_SCENARIO_IDS`** × seeds, alternating **`NoOp`/`SetBehaviorRatio`** ×150 steps, **`opponentMode: ai`** ×80). Not yet: RNG-guided random **`SimCommand`** streams.  
 - Performance: optional batched stepping for self-play.  
 - Transport: stdio JSONL first → optional HTTP for remote trainers. **Progress:** one JSON line per episode to stdout (`sim:episode`); not a full bidirectional JSONL agent protocol yet.  
-- **Agent MDP spec** (single doc or section): obs shapes, action JSON schema, scenarios, terminal rules.
+- **Agent MDP spec** (single doc or section): obs shapes, action JSON schema, scenarios, terminal rules. **Done:** **`docs/sim-agent-mdp.md`** (reference MDP contract + links).
 
 ---
 
@@ -174,8 +174,8 @@ Define **reward modules per curriculum** in the harness (not inside `src/sim/`):
 | **D — Curriculum** | **Partial** | `createTrainingWorld` + ids + **`scenarioExtras`** + **`evaluateScenarioPass`**. Missing: more isolated tracks (§5), multi-scenario **scheduler**. |
 | **E — Imitation** | **Baseline** | Session **`sim-agent-session/1`** + **`replaySessionRecording`** + export CLI; harness parity tests (`none` + **`ai`**). Per-row BC tables optional. |
 | **F — Rewards** | Not started | Keep outside `src/sim/`. |
-| **G — Hardening** | Partial | `sim:episode` + **`sim:eval-grid`** (CI-friendly exit code); fuzz / MDP spec / full JSONL still open. |
+| **G — Hardening** | **Partial** | Property **`harness-property.test.ts`** + **`docs/sim-agent-mdp.md`**. Open: RNG fuzz, full JSONL transport, batched stepping. |
 
-**Quick links:** `src/sim-agent/harness.ts` · `src/sim-agent/types.ts` · `src/sim-agent/observation-channels.ts` · `src/sim-agent/session-recording.ts` · `src/sim-agent/replay-input-log.ts` · `src/sim/command-applicability.ts` · `docs/sim-agent-commands.md` · `src/sim-agent/episode-metrics.ts` · `src/sim-agent/policies.ts` · `src/sim-agent/scenario-thresholds.ts` · `src/sim-agent/eval-grid.ts` · `src/sim/training-scenarios.ts` · tests · `scripts/run-agent-episode.ts` · `scripts/export-agent-session.ts` · `scripts/run-eval-grid.ts`
+**Quick links:** `src/sim-agent/harness.ts` · `src/sim-agent/types.ts` · `src/sim-agent/observation-channels.ts` · `src/sim-agent/session-recording.ts` · `src/sim-agent/replay-input-log.ts` · `src/sim/command-applicability.ts` · `docs/sim-agent-commands.md` · `docs/sim-agent-mdp.md` · `src/sim-agent/episode-metrics.ts` · `src/sim-agent/policies.ts` · `src/sim-agent/scenario-thresholds.ts` · `src/sim-agent/eval-grid.ts` · `src/sim/training-scenarios.ts` · tests · `scripts/run-agent-episode.ts` · `scripts/export-agent-session.ts` · `scripts/run-eval-grid.ts`
 
 **Follow-ups:** LD bridge / CI wiring to **`sim:eval-grid`** JSON; **replay with `opponentMode: 'ai'`**; more **§5** factories; tighten **thresholds** per scenario as design locks; full **stdio JSONL** session; `export` from `src/main.ts` if needed; `loadSnapshot` / pause.

@@ -39,6 +39,10 @@ When **`evaluateCommandApplicability`** is false, **`tick`** does not apply that
 - **`replaySessionRecording`** (`src/sim-agent/replay-input-log.ts`) — **`resetFlowFieldCaches`**, **`createTrainingWorld`**, then **`tick(world, cmds[t])`** for `t ∈ [0, finalTick)`. Does not re-run AI; opponent behavior is already encoded in **`inputLog`** when you recorded with **`opponentMode: 'ai'`**.
 - **CLI:** **`npm run sim:export-session`** — same policy wiring as **`npm run sim:episode`** (`--policy`, `--commands-file`, `--opponent`, …); prints **one JSON line** suitable for datasets or offline replay validation.
 
+## MDP reference
+
+See **`docs/sim-agent-mdp.md`** for state / action / transition / terminal semantics.
+
 ## Related types
 
 - **`SimCommand`** / **`MAX_COMMANDS_PER_TICK`** — `src/sim/commands.ts`
