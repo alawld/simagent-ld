@@ -22,7 +22,11 @@ One **`step`** advances one or more **simulation ticks** via **`repeatTicks`** (
 
 ## Remote control (JSONL)
 
-**`npm run sim:jsonl-session`** reads **stdin** one JSON object per line and prints one JSON response per line (`dispatchJsonlRequest` in **`jsonl-session.ts`**). Operations: **`session`** (replace harness), **`reset`**, **`step`** (optional **`repeatTicks`**), **`observe`** ( **`getObservation()`** without ticking ), **`ping`**. Same observation schema as **`step`** responses.
+**`npm run sim:jsonl-session`** reads **stdin** one JSON object per line and prints one JSON response per line (`dispatchJsonlRequest` in **`jsonl-session.ts`**). Operations: **`session`** (replace harness), **`reset`**, **`step`** (optional **`repeatTicks`**), **`observe`** ( **`getObservation()`** without ticking ), **`ping`**, **`pause`** / **`resume`**, **`loadSnapshot`** ( **`SerializedWorldState`** from **`platform/save.ts`** ), **`exportSnapshot`**. Same observation schema as **`step`** responses.
+
+## Pause & snapshots
+
+**`setPaused(true)`** makes **`step`** a no-op (observation only); **`runEpisode`** throws until **`resume`**. **`loadSnapshot(serialized)`** replaces **`world`** from **`serializeWorldState` / `deserializeWorldState`** (clears input log, recomputes **`terminal`** via **`checkQueenDeath`**). **`getSerializedWorldState()`** exports the current world JSON shape.
 
 ## Reward
 

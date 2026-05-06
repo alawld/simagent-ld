@@ -1,5 +1,6 @@
 // Bidirectional JSONL session on stdin/stdout — one JSON request per line, one JSON response per line.
-// Protocol: `src/sim-agent/jsonl-session.ts` (`op`: session | reset | step | observe | ping).
+// Protocol: `src/sim-agent/jsonl-session.ts` — ops: session, reset, step, observe, ping, pause, resume,
+// loadSnapshot, exportSnapshot.
 //
 //   npm run sim:jsonl-session
 //   echo '{"op":"ping"}' | npm run sim:jsonl-session

@@ -35,7 +35,7 @@ When **`evaluateCommandApplicability`** is false, **`tick`** does not apply that
 
 ## JSONL session (stdin/stdout)
 
-Line-delimited JSON RPC over **`npm run sim:jsonl-session`** — see **`src/sim-agent/jsonl-session.ts`** and **`docs/sim-agent-mdp.md`**. Request **`op`**: **`session`**, **`reset`**, **`step`**, **`observe`**, **`ping`**.
+Line-delimited JSON RPC over **`npm run sim:jsonl-session`** — see **`src/sim-agent/jsonl-session.ts`** and **`docs/sim-agent-mdp.md`**. Request **`op`**: **`session`**, **`reset`**, **`step`**, **`observe`**, **`ping`**, **`pause`**, **`resume`**, **`loadSnapshot`** (body: **`snapshot`**: serialized world), **`exportSnapshot`**.
 
 ## Session recording (imitation / replay)
 

@@ -7,7 +7,8 @@
 import type { WorldState } from '../sim/types.js';
 import { createTrainingWorld } from '../sim/training-scenarios.js';
 import { tick, resetFlowFieldCaches } from '../sim/tick.js';
-import { GameOutcome } from '../sim/game-over.js';
+import { GameOutcome, checkQueenDeath } from '../sim/game-over.js';
+import { deserializeWorldState, serializeWorldState, type SerializedWorldState } from '../platform/save.js';
 import type { SimCommand } from '../sim/commands.js';
 import { MAX_COMMANDS_PER_TICK } from '../sim/commands.js';
 import { PLAYER_COLONY_ID } from '../sim/constants.js';
@@ -107,6 +108,8 @@ export class SimAgentHarness {
   private aiColonyIds: ColonyId[] = [];
   private readonly inputLog: SimCommand[] = [];
   private terminal = false;
+  /** When true, `step` / `runEpisode` do not advance simulation (`step` returns frozen observation). */
+  private paused = false;
   private lastDrainedCommands: readonly SimCommand[] = [];
   private currentSeed: number;
 
@@ -175,7 +178,47 @@ export class SimAgentHarness {
     this.aiColonyIds = deriveAIColonyIds(this.world, this.playerColonyId);
     this.inputLog.length = 0;
     this.terminal = false;
+    this.paused = false;
     this.lastDrainedCommands = [];
+  }
+
+  /** Freeze simulation: `step` returns without calling `tick`; `runEpisode` throws until resumed. */
+  setPaused(value: boolean): void {
+    this.paused = value;
+  }
+
+  isPaused(): boolean {
+    return this.paused;
+  }
+
+  pause(): void {
+    this.setPaused(true);
+  }
+
+  resume(): void {
+    this.setPaused(false);
+  }
+
+  /**
+   * Replace the live world from a **`serializeWorldState`** snapshot (save/debug shape).
+   * Clears input log, clears pause, refreshes AI colony ids, sets **`terminal`** from **`checkQueenDeath`**,
+   * and sets **`getSeed()`** to **`world.terrainSeed`** (world identity).
+   */
+  loadSnapshot(snapshot: SerializedWorldState): void {
+    resetFlowFieldCaches();
+    this.world = deserializeWorldState(snapshot);
+    this.aiColonyIds = deriveAIColonyIds(this.world, this.playerColonyId);
+    this.inputLog.length = 0;
+    this.lastDrainedCommands = [];
+    this.paused = false;
+    const outcome = checkQueenDeath(this.world, this.playerColonyId);
+    this.terminal = outcome !== GameOutcome.None;
+    this.currentSeed = this.world.terrainSeed;
+  }
+
+  /** Same JSON shape as autosave / replay (`platform/save.ts`). */
+  getSerializedWorldState(): SerializedWorldState {
+    return serializeWorldState(this.world);
   }
 
   /**
@@ -183,6 +226,11 @@ export class SimAgentHarness {
    * Stops early on terminal `GameOutcome`. Builds **episode metrics** for experimentation / LD sinks.
    */
   runEpisode(options: SimAgentRunEpisodeOptions): SimAgentEpisodeResult {
+    if (this.paused) {
+      throw new Error(
+        'sim-agent harness: runEpisode — session is paused. Call setPaused(false) before runEpisode.',
+      );
+    }
     const wallStart = Date.now();
     if (options.seed !== undefined) {
       this.reset(options.seed);
@@ -263,6 +311,16 @@ export class SimAgentHarness {
         tick: this.world.tick,
         outcome: lastOutcome,
         terminal: true,
+        observation: buildObservation(this.world, this.scenarioId, this.playerColonyId, this.aiColonyIds),
+        lastDrainedCommands: [],
+      };
+    }
+
+    if (this.paused) {
+      return {
+        tick: this.world.tick,
+        outcome: GameOutcome.None,
+        terminal: this.terminal,
         observation: buildObservation(this.world, this.scenarioId, this.playerColonyId, this.aiColonyIds),
         lastDrainedCommands: [],
       };

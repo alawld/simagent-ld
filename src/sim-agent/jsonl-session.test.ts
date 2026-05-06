@@ -38,7 +38,9 @@ describe('jsonl-session dispatch', () => {
     const r = dispatchJsonlRequest(cell, { op: 'observe' });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.tick).toBe(0);
+    if (r.op === 'observe') {
+      expect(r.tick).toBe(0);
+    }
     expect(cell.harness.getWorld().tick).toBe(0);
   });
 
@@ -47,11 +49,46 @@ describe('jsonl-session dispatch', () => {
     const r = dispatchJsonlRequest(cell, { op: 'step', commands: [{ type: 'NoOp' }], repeatTicks: 5 });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.tick).toBe(5);
+    if (r.op === 'step') {
+      expect(r.tick).toBe(5);
+    }
   });
 
   it('parse rejects invalid op', () => {
     const p = parseJsonlRequest({ op: 'nope' });
     expect('ok' in p && p.ok === false).toBe(true);
+  });
+
+  it('exportSnapshot + loadSnapshot round-trip', () => {
+    const cell = { harness: new SimAgentHarness({ seed: 5, opponentMode: 'none', recordInputLog: false }) };
+    dispatchJsonlRequest(cell, { op: 'step', commands: [{ type: 'NoOp' }] });
+    const ex = dispatchJsonlRequest(cell, { op: 'exportSnapshot' });
+    expect(ex.ok).toBe(true);
+    if (!ex.ok) return;
+    expect(ex.op).toBe('exportSnapshot');
+    if (ex.op !== 'exportSnapshot') return;
+
+    const cell2 = {
+      harness: new SimAgentHarness({ seed: 0, opponentMode: 'none', recordInputLog: false }),
+    };
+    const ld = dispatchJsonlRequest(cell2, { op: 'loadSnapshot', snapshot: ex.snapshot });
+    expect(ld.ok).toBe(true);
+    if (!ld.ok) return;
+    expect(ld.op).toBe('loadSnapshot');
+    if (ld.op === 'loadSnapshot') {
+      expect(ld.tick).toBe(1);
+    }
+  });
+
+  it('pause prevents tick advance on step', () => {
+    const cell = { harness: new SimAgentHarness({ seed: 6, opponentMode: 'none', recordInputLog: false }) };
+    dispatchJsonlRequest(cell, { op: 'pause' });
+    const st = dispatchJsonlRequest(cell, { op: 'step', commands: [{ type: 'NoOp' }] });
+    expect(st.ok).toBe(true);
+    if (!st.ok) return;
+    expect(st.op).toBe('step');
+    if (st.op === 'step') {
+      expect(st.tick).toBe(0);
+    }
   });
 });

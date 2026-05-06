@@ -12,7 +12,7 @@ Build for all three; they stack.
 
 | Layer | Meaning | API surface |
 |--------|---------|-------------|
-| **Session** | Not playing vs playing vs terminal episode | **`SimAgentHarness`:** `reset`, `step`, **`runEpisode`** (bounded tick loop + episode metrics). Terminal short-circuit when `GameOutcome` ≠ `None`. *Not yet:* `loadSnapshot`, `pause`. |
+| **Session** | Not playing vs playing vs terminal episode | **`SimAgentHarness`:** `reset`, `step`, **`runEpisode`**, **`loadSnapshot`** / **`getSerializedWorldState`**, **`setPaused`** / **`pause`** / **`resume`**. Terminal short-circuit when `GameOutcome` ≠ `None` or loaded snapshot already terminal. |
 | **World / MDP** | What the agent sees after each step | **`observationVersion` 3** — B1 **`scalars`**, **`affordances`**, B2 **`taskZone`**, B3 **`spatial`** (4×4 terrain patches), B4 **`opponent`** (see §3 + `observation-channels.ts`). *Not yet:* full `legalActions` bitmask; optional B3 pheromone slices. |
 | **Curriculum** | Which scenario family (skill) is active | **`scenarioId`** selects a **`createTrainingWorld(scenarioId, seed)`** factory in `src/sim/training-scenarios.ts` (falls back to vanilla `createScenario` for unknown ids). Labels still work for LD without a named factory. |
 
@@ -35,7 +35,7 @@ Teaching the full game is teaching **skills across curriculum states** with one 
 
 **Deliverable:** Typed request/response schema with `observationVersion`, `scenarioId`, `tick`, `outcome`.
 
-**Implemented (code):** `SimAgentHarness` in `src/sim-agent/harness.ts` — `step()` returns `SimAgentStepResult` (`tick`, `outcome`, `terminal`, `observation`, `lastDrainedCommands`). Opponent modes: **`none`** | **`ai`** (runs `runAIController` for every non-player colony from `deriveAIColonyIds`, same order as `GameScene`). **Command cap:** if `world.commandQueue.length` would exceed **64** after the AI hook and stamped player commands, the harness **throws** (stricter than `tick`, which silently truncates); callers must split work across ticks — especially when `opponentMode: 'ai'` burns part of the budget. **Still open for Phase A:** HTTP transport, scripted opponent, `loadSnapshot`, pause. **Partial:** bidirectional **stdio JSONL** session via **`npm run sim:jsonl-session`** (`jsonl-session.ts` — `session` / `reset` / `step` / `observe` / `ping`); one-line **NDJSON episode export** via `npm run sim:episode` (see §11).
+**Implemented (code):** `SimAgentHarness` in `src/sim-agent/harness.ts` — `step()` returns `SimAgentStepResult` (`tick`, `outcome`, `terminal`, `observation`, `lastDrainedCommands`). Opponent modes: **`none`** | **`ai`** (runs `runAIController` for every non-player colony from `deriveAIColonyIds`, same order as `GameScene`). **Command cap:** if `world.commandQueue.length` would exceed **64** after the AI hook and stamped player commands, the harness **throws** (stricter than `tick`, which silently truncates); callers must split work across ticks — especially when `opponentMode: 'ai'` burns part of the budget. **Still open for Phase A:** HTTP transport, scripted opponent. **Partial:** bidirectional **stdio JSONL** (`jsonl-session.ts` — adds **`pause`** / **`resume`**, **`loadSnapshot`**, **`exportSnapshot`**); one-line **NDJSON episode export** via `npm run sim:episode` (see §11).
 
 **Architecture note:** The harness lives under `src/sim-agent/` (not `src/sim/`) and imports **`src/render/ai-controller.ts`** for `runAIController` plus **`src/render/game-scene-logic.ts`** for `deriveAIColonyIds` / `appendInputLog`. That keeps `tick` single-sourced in sim while reusing the shipped AI; a future split could inject a `beforeTick` callback if we ever need a render-free Node binary.
 
@@ -168,7 +168,7 @@ Define **reward modules per curriculum** in the harness (not inside `src/sim/`):
 
 | Phase | State | Notes |
 |-------|--------|--------|
-| **A — Harness** | **Landed** | `SimAgentHarness`: `reset`, `step`, **`runEpisode`**, `getSeed`, `opponentMode`, command cap, `getInputLog`, … |
+| **A — Harness** | **Landed** | `SimAgentHarness`: `reset`, `step`, **`runEpisode`**, **`loadSnapshot`**, **`getSerializedWorldState`**, **`pause`/`resume`**, `getObservation`, … |
 | **A — Transport** | **Partial** | **`sim:jsonl-session`** bidirectional stdin/stdout; **`sim:episode`** NDJSON. HTTP not started. |
 | **B — Observation** | **v3 B1+B2+B3+B4 + affordances; episode metrics v2** | Per-step **`scalars`**, **`affordances`**, **`taskZone`**, **`spatial`**, **`opponent`**; **B5** episode `metrics` + **`scenarioExtras`**. Optional B3 pheromone / multi-scale spatial: not done. |
 | **C — Actions** | **Legality preview** | Full `SimCommand` / **`AgentSimCommand`**; **`peekApplicability`** + `command-applicability.ts` aligned to `tick` step 1. |
@@ -179,4 +179,4 @@ Define **reward modules per curriculum** in the harness (not inside `src/sim/`):
 
 **Quick links:** `src/sim-agent/harness.ts` · `src/sim-agent/types.ts` · `src/sim-agent/jsonl-session.ts` · `src/sim-agent/observation-channels.ts` · `src/sim-agent/session-recording.ts` · `src/sim-agent/replay-input-log.ts` · `src/sim/command-applicability.ts` · `docs/sim-agent-commands.md` · `docs/sim-agent-mdp.md` · `src/sim-agent/episode-metrics.ts` · `src/sim-agent/policies.ts` · `src/sim-agent/scenario-thresholds.ts` · `src/sim-agent/eval-grid.ts` · `src/sim/training-scenarios.ts` · tests · `scripts/run-agent-episode.ts` · `scripts/export-agent-session.ts` · `scripts/sim-agent-jsonl.ts` · `scripts/run-eval-grid.ts`
 
-**Follow-ups:** LD bridge / CI wiring to **`sim:eval-grid`** JSON; **replay with `opponentMode: 'ai'`**; more **§5** factories; tighten **thresholds** per scenario as design locks; full **stdio JSONL** session; `export` from `src/main.ts` if needed; `loadSnapshot` / pause.
+**Follow-ups:** LD bridge / CI wiring to **`sim:eval-grid`** JSON; **replay with `opponentMode: 'ai'`** (extra harness test optional); more **§5** factories; tighten **thresholds** per scenario as design locks; `export` from `src/main.ts` if needed.
